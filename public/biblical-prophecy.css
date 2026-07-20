@@ -1,0 +1,82 @@
+.biblical-study-hero { min-height: min(700px, calc(100vh - 94px)); padding: clamp(4rem, 9vw, 8rem) 0; display: grid; grid-template-columns: 44px minmax(0, 980px); gap: clamp(1.5rem, 4vw, 4rem); align-items: center; }
+.biblical-study-hero h1 { max-width: 1080px; font-size: clamp(48px, 7vw, 100px); }
+.biblical-study-hero .lede { max-width: 900px; }
+.study-boundary, .study-measure-note, .study-exclusion { max-width: 960px; margin-top: 1.5rem; padding: 1rem 1.15rem; border-left: 3px solid var(--cyan); background: #52e0f012; }
+.study-overview, .study-elements, .study-method, .study-examples { border-top: 1px solid var(--line); }
+.study-section-heading { margin-bottom: clamp(2rem, 5vw, 4rem); display: grid; grid-template-columns: minmax(0, 1.25fr) minmax(280px, 0.75fr); gap: clamp(2rem, 6vw, 6rem); align-items: end; }
+.study-section-heading > p { font-size: var(--secondary-size); }
+.scriptural-test-list { border-top: 2px solid var(--cyan); }
+.scriptural-test { min-height: 180px; display: grid; grid-template-columns: 76px minmax(0, 1fr); border-bottom: 1px solid var(--line); background: linear-gradient(110deg, #102228, #081116); }
+.scriptural-test > span { padding: 1.5rem 1rem; border-right: 1px solid var(--line); }
+.scriptural-test > div { padding: clamp(1.25rem, 3vw, 2rem); }
+.scriptural-test h3 { font-size: clamp(27px, 3vw, 40px); }
+.scriptural-test nav { margin: 0.9rem 0; display: flex; gap: 0.6rem; flex-wrap: wrap; }
+.scriptural-test a { min-height: 44px; padding: 0.55rem 0.7rem; display: inline-flex; align-items: center; border: 1px solid var(--cyan); font-weight: 900; text-decoration: none; }
+.scriptural-test p { max-width: 900px; margin: 0; }
+.study-status-grid { margin: 0; display: grid; grid-template-columns: repeat(4, 1fr); border: 1px solid var(--line); background: #081116; }
+.study-status-grid > div { min-height: 180px; padding: 1.2rem; display: flex; flex-direction: column; border: 1px solid var(--line); }
+.study-status-grid dt, .element-matrix dt { font: 800 var(--label-size)/1.45 var(--mono); letter-spacing: 0.06em; text-transform: uppercase; }
+.study-status-grid dd { margin: auto 0 0.6rem; font: 700 clamp(26px, 3vw, 42px)/1.08 var(--serif); }
+.study-status-grid small { font-size: var(--label-size); }
+.element-matrix { margin: 0; border-top: 2px solid var(--cyan); }
+.element-matrix > div { min-height: 92px; padding: 1rem; display: grid; grid-template-columns: minmax(140px, 0.35fr) minmax(0, 1fr) minmax(130px, auto); gap: 1rem; align-items: center; border-bottom: 1px solid var(--line); background: linear-gradient(90deg, #102228, #081116); }
+.element-matrix dd { margin: 0; }
+.element-matrix span, .study-method-label { font: 900 var(--label-size)/1.4 var(--mono); letter-spacing: 0.05em; text-transform: uppercase; }
+.element-matrix span { padding: 0.45rem 0.65rem; border: 1px solid var(--amber); text-align: center; }
+.study-metric-rules { margin-top: 1rem; display: grid; grid-template-columns: repeat(3, 1fr); gap: 1rem; }
+.study-metric-rules article { padding: 1rem; border: 1px solid var(--line); background: #08151a; }
+.study-metric-rules strong { font: 800 var(--label-size)/1.4 var(--mono); text-transform: uppercase; }
+.study-metric-rules p { margin: 0.5rem 0 0; font-size: var(--secondary-size); }
+.pair-flow { display: grid; grid-template-columns: repeat(9, auto); gap: 0.65rem; align-items: center; }
+.pair-flow span { min-height: 74px; padding: 0.8rem; display: grid; place-items: center; border: 1px solid var(--cyan); background: #08151a; font-size: var(--secondary-size); font-weight: 800; text-align: center; }
+.pair-flow i { font-style: normal; font-size: 24px; text-align: center; }
+.linkage-grid { margin-top: 2rem; display: grid; grid-template-columns: repeat(3, 1fr); gap: 1px; background: var(--line); border: 1px solid var(--line); }
+.linkage-grid article { min-height: 190px; padding: 1.25rem; background: var(--panel); }
+.linkage-grid h3 { font-size: clamp(23px, 2.4vw, 31px); }
+.linkage-grid p { margin: 0; font-size: var(--secondary-size); }
+.study-exclusion { border-color: var(--amber); background: #f0a86f12; }
+.study-example-list { border-top: 2px solid var(--cyan); }
+.study-example { display: grid; grid-template-columns: 76px minmax(0, 1fr); border-bottom: 1px solid var(--line); background: linear-gradient(110deg, #102228, #081116); }
+.study-example-number { padding: 1.5rem 1rem; border-right: 1px solid var(--line); font: 800 var(--label-size) var(--mono); }
+.study-example > div:last-child { padding: clamp(1.25rem, 3vw, 2.25rem); }
+.study-method-label { margin-bottom: 0.7rem; }
+.study-example h3 { font-size: clamp(28px, 3.5vw, 46px); }
+.passage-pair { margin: 1rem 0; display: flex; align-items: center; gap: 0.75rem 1rem; flex-wrap: wrap; }
+.passage-pair a { min-height: 44px; padding: 0.6rem 0.8rem; display: inline-flex; align-items: center; border: 1px solid var(--cyan); font-weight: 900; text-decoration: none; }
+.criteria-fields { margin: 1.25rem 0; display: grid; grid-template-columns: 1fr 1fr; border: 1px solid var(--line); }
+.criteria-fields > div { min-height: 118px; padding: 1rem; border: 1px solid var(--line); background: #081116; }
+.criteria-fields dt { font: 900 var(--label-size)/1.4 var(--mono); letter-spacing: 0.05em; text-transform: uppercase; }
+.criteria-fields dd { margin: 0.45rem 0 0; }
+.criteria-conclusion { max-width: 960px; margin: 0; padding: 1rem 1.1rem; border-left: 3px solid var(--cyan); background: #52e0f012; font-weight: 800; }
+.study-review-boundary { display: grid; grid-template-columns: repeat(3, 1fr); gap: 1rem; }
+.study-review-boundary article { padding: 1.25rem; border: 1px solid var(--line); background: #081116; }
+.study-review-boundary h3 { font-size: clamp(24px, 2.5vw, 32px); }
+.study-review-boundary p { margin: 0; }
+
+@media (max-width: 980px) {
+  .biblical-study-hero { grid-template-columns: 36px minmax(0, 1fr); }
+  .study-status-grid { grid-template-columns: 1fr 1fr; }
+  .pair-flow { grid-template-columns: 1fr; }
+  .pair-flow i { transform: rotate(90deg); }
+  .linkage-grid { grid-template-columns: 1fr 1fr; }
+}
+
+@media (max-width: 800px) {
+  .study-section-heading, .study-metric-rules, .study-review-boundary { grid-template-columns: 1fr; }
+}
+
+@media (max-width: 520px) {
+  .site-header nav .reviewer-entry { grid-column: auto; }
+  .biblical-study-hero { min-height: auto; width: min(100% - 1.25rem, var(--max)); padding: 4rem 0; grid-template-columns: 1fr; }
+  .biblical-study-hero .case-rail { display: none; }
+  .biblical-study-hero h1 { font-size: clamp(44px, 13.5vw, 60px); }
+  .study-status-grid, .linkage-grid { grid-template-columns: 1fr; }
+  .study-status-grid > div { min-height: 145px; }
+  .element-matrix > div { grid-template-columns: 1fr; gap: 0.45rem; }
+  .element-matrix span { justify-self: start; }
+  .study-example { grid-template-columns: 1fr; }
+  .study-example-number { padding: 0.8rem 1rem; border-right: 0; border-bottom: 1px solid var(--line); }
+  .scriptural-test { grid-template-columns: 1fr; }
+  .scriptural-test > span { padding: 0.8rem 1rem; border-right: 0; border-bottom: 1px solid var(--line); }
+  .criteria-fields { grid-template-columns: 1fr; }
+}

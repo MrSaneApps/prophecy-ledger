@@ -1,0 +1,31 @@
+{
+  "person": {
+    "slug": "troy-black",
+    "displayName": "Troy Black",
+    "corpusLabel": "Provisional pilot — selected records, not a complete catalogue"
+  },
+  "records": [
+    {
+      "id": "southeast-asia-oil-2021",
+      "videoUrl": "https://www.youtube.com/watch?v=ZidiIdg3U4M",
+      "sourceDate": "2020-09-10",
+      "quote": "I heard this second phrase... It said, 'But there's going to be an oil boom in Southeast Asia next year.'",
+      "state": "deadline_passed_awaiting_review",
+      "public": false,
+      "warning": "Original-video timestamp and full transcript context have not been verified."
+    },
+    {
+      "id": "russia-spring-2022",
+      "videoUrl": "https://www.youtube.com/watch?v=iyijrK-MvQo",
+      "sourceDate": "2021-12-07",
+      "quote": "I heard Russia is going to declare war in the springtime. And I heard in full shift by July.",
+      "state": "in_review",
+      "public": false,
+      "warning": "Original-video timestamp and full transcript context are unverified; atomic split required."
+    }
+  ],
+  "archive": {
+    "url": "https://troyblackvideos.com/prophecy-archive-all/",
+    "role": "speaker-authored retrospective, not independent proof"
+  }
+}

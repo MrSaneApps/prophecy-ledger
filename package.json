@@ -1,0 +1,25 @@
+{
+  "name": "prophecy-ledger",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Neutral, evidence-first claim ledger MVP",
+  "scripts": {
+    "test": "node --test 'test/**/*.test.mjs'",
+    "check:imports": "find public functions scanner/src -name '*.js' -print0 | xargs -0 -n1 node --check",
+    "check": "npm test && npm run check:imports",
+    "dev": "wrangler pages dev public --persist-to .wrangler/state",
+    "dev:review": "wrangler pages dev public --persist-to .wrangler/state --binding REVIEW_DEMO_MODE=1",
+    "deploy:pages": "wrangler pages deploy public --project-name=prophecy-ledger --commit-dirty=true"
+  },
+  "devDependencies": {
+    "wrangler": "4.104.0"
+  },
+  "engines": {
+    "node": ">=24"
+  },
+  "license": "AGPL-3.0-or-later",
+  "dependencies": {
+    "pdf-lib": "1.17.1"
+  }
+}

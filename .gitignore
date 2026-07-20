@@ -1,0 +1,36 @@
+node_modules/
+.wrangler/
+.dev.vars
+.env*
+.DS_Store
+npm-debug.log*
+*.log
+.playwright-cli/
+output/
+/outputs/
+tmp/
+
+# Maintainer-only operational state
+/.codex/
+/SESSION_HANDOFF.md
+
+# Private or generated evidence artifacts
+/artifacts/
+/database-dumps/
+/model-output/
+/private/
+/reviewer-records/
+/transcripts/
+*.db
+*.db-shm
+*.db-wal
+*.dump
+*.har
+*.jsonl
+*.sqlite
+*.sqlite3
+
+# Credentials and signing material
+*.key
+*.p8
+*.pem

@@ -1,0 +1,49 @@
+name = "prophecy-ledger-scanner"
+main = "src/index.js"
+compatibility_date = "2026-07-19"
+
+[vars]
+SCAN_ENABLED = "0"
+TRANSCRIPT_BATCH_ENABLED = "0"
+GEMINI_TRANSCRIPT_MODEL = "gemini-3.1-flash-lite"
+GEMINI_DAILY_MEDIA_SECONDS = "28800"
+TRANSCRIPT_CHUNK_SECONDS = "300"
+TRANSCRIPT_OVERLAP_SECONDS = "0"
+GEMINI_TRANSCRIPT_TIMEOUT_MS = "120000"
+PARSER_VERSION = "official-site-v1"
+AI_MODEL = "@cf/meta/llama-3.1-8b-instruct-fast"
+AI_FALLBACK_MODEL = "@cf/meta/llama-3.1-8b-instruct"
+AI_TIMEOUT_MS = "45000"
+GEMINI_PRIMARY_MODEL = "gemini-3.5-flash"
+GEMINI_VERIFIER_MODEL = "gemini-3.1-pro-preview"
+GEMINI_TIEBREAKER_MODEL = "gemini-3.1-flash-lite"
+GEMINI_TIMEOUT_MS = "90000"
+AI_GATEWAY_ACCOUNT_ID = "2c267ab06352ba2522114c3081a8c5fa"
+AI_GATEWAY_ID = "prophecy-ledger"
+AI_GATEWAY_BYOK = "1"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "prophecy-ledger"
+database_id = "48bae920-b741-4214-a1e0-de1410d9223e"
+
+[[r2_buckets]]
+binding = "ARTIFACTS"
+bucket_name = "prophecy-ledger-artifacts"
+
+[ai]
+binding = "AI"
+
+[[queues.producers]]
+binding = "INGESTION_QUEUE"
+queue = "prophecy-ledger-ingestion"
+
+[[queues.consumers]]
+queue = "prophecy-ledger-ingestion"
+max_batch_size = 5
+max_concurrency = 5
+max_retries = 3
+dead_letter_queue = "prophecy-ledger-ingestion-dlq"
+
+[triggers]
+crons = ["17 5 * * *"]
