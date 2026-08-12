@@ -4,15 +4,17 @@ compatibility_date = "2026-07-19"
 
 [vars]
 SCAN_ENABLED = "0"
-TRANSCRIPT_BATCH_ENABLED = "0"
+TRANSCRIPT_BATCH_ENABLED = "1"
 GEMINI_TRANSCRIPT_MODEL = "gemini-3.1-flash-lite"
-GEMINI_DAILY_MEDIA_SECONDS = "28800"
+GEMINI_DAILY_MEDIA_SECONDS = "86400"
 TRANSCRIPT_CHUNK_SECONDS = "300"
 TRANSCRIPT_OVERLAP_SECONDS = "0"
 GEMINI_TRANSCRIPT_TIMEOUT_MS = "120000"
 PARSER_VERSION = "official-site-v1"
 AI_MODEL = "@cf/meta/llama-3.1-8b-instruct-fast"
-AI_FALLBACK_MODEL = "@cf/meta/llama-3.1-8b-instruct"
+AI_FALLBACK_MODEL = "@cf/meta/llama-3.3-70b-instruct-fp8-fast"
+GEMINI_ANALYSIS_MODEL = "gemini-3.5-flash"
+GEMINI_ANALYSIS_FALLBACK_MODEL = "gemini-3.1-flash-lite"
 AI_TIMEOUT_MS = "45000"
 GEMINI_PRIMARY_MODEL = "gemini-3.5-flash"
 GEMINI_VERIFIER_MODEL = "gemini-3.1-pro-preview"
@@ -38,6 +40,18 @@ binding = "AI"
 binding = "INGESTION_QUEUE"
 queue = "prophecy-ledger-ingestion"
 
+[[queues.producers]]
+binding = "ANALYSIS_QUEUE"
+queue = "prophecy-ledger-analysis"
+
+[[queues.producers]]
+binding = "INGESTION_DLQ"
+queue = "prophecy-ledger-ingestion-dlq"
+
+[[queues.producers]]
+binding = "ANALYSIS_DLQ"
+queue = "prophecy-ledger-analysis-dlq"
+
 [[queues.consumers]]
 queue = "prophecy-ledger-ingestion"
 max_batch_size = 5
@@ -45,5 +59,15 @@ max_concurrency = 5
 max_retries = 3
 dead_letter_queue = "prophecy-ledger-ingestion-dlq"
 
+[[queues.consumers]]
+queue = "prophecy-ledger-analysis"
+max_batch_size = 1
+max_concurrency = 1
+max_retries = 3
+retry_delay = 60
+dead_letter_queue = "prophecy-ledger-analysis-dlq"
+
 [triggers]
-crons = ["17 5 * * *"]
+# Hourly: resumeScheduledTranscriptBatch must wake soon after daily_media_cap resume_after (00:00:05Z),
+# not wait until 05:17Z. Cheap no-op when running / resume_not_ready.
+crons = ["0 * * * *"]

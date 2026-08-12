@@ -15,9 +15,16 @@ async function unblindedClaimBundle(db, claimId) {
   if (!claim) return null;
   const evidence = await all(db.prepare("SELECT * FROM evidence WHERE claim_id=?1").bind(claimId));
   const receipts = await all(db.prepare("SELECT * FROM prior_information_receipts WHERE claim_id=?1").bind(claimId));
-  const reviews = await all(db.prepare(
-    "SELECT * FROM moderator_reviews WHERE claim_id=?1 ORDER BY created_at,review_id"
-  ).bind(claimId));
+  const latestDraft = await db.prepare(
+    "SELECT created_at FROM ai_draft_decisions WHERE claim_id=?1 ORDER BY revision DESC LIMIT 1"
+  ).bind(claimId).first();
+  const reviews = latestDraft?.created_at
+    ? await all(db.prepare(
+      "SELECT * FROM moderator_reviews WHERE claim_id=?1 AND created_at>=?2 ORDER BY created_at,review_id"
+    ).bind(claimId, latestDraft.created_at))
+    : await all(db.prepare(
+      "SELECT * FROM moderator_reviews WHERE claim_id=?1 ORDER BY created_at,review_id"
+    ).bind(claimId));
   return { claim, evidence, receipts, reviews };
 }
 

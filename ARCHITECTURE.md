@@ -1,5 +1,44 @@
 # Architecture
 
+## Current operational contract (2026-08-03)
+
+The state machine is phase-separated and preservation-first:
+
+1. Acquisition creates a private, hash-bound transcript artifact and advances
+   the frozen batch independently of downstream AI availability.
+2. Analysis runs on its own Queue/DLQ and may yield ready, failed, or manual
+   work without rewriting acquisition truth. Reprocessing is committed through
+   an append-preserving outbox before dispatch.
+3. Human review operates only on source-bound candidate work and retains
+   append-only assignments, decisions, revisions, and audit events.
+4. Publication occurs only after two distinct matching authenticated reviews;
+   no acquisition, model, research, or conveyor receipt is a verdict.
+
+Pending unavailable sources are represented by append-only dispositions and an
+effective `quarantined_source_unavailable` projection. The frozen source item is
+not deleted or counted as completed, and prior completed counts, transcript
+artifacts, reviewer records, and publication history cannot be changed by that
+operation. Gemini's 86,400-second daily boundary is charged per physical request
+before fetch; split and retry calls consume their own reservations, while a
+single cutover debit accounts for unknown legacy physical usage.
+
+Structured text-analysis calls write a durable `started` receipt before
+invocation and exactly one terminal `completed` or `failed` receipt afterward,
+including neutral description triage. The watchdog tracks current versus recovered incidents as
+append-only events. Only a current error-level incident generates an owner
+email. Provider acceptance creates a pending opening notice: `sent`, queued,
+delayed, or temporarily unreadable delivery state is nonblocking but not
+delivered; confirmed delivery closes the notice, while bounced/failed opening
+delivery remains a persistent blocker. Recovery is recorded and receipted in D1
+without sending another email or blocking the recovered pipeline.
+
+Canonical analysis reconciliation, research, machine-conveyor, and deployment
+runners emit one item/claim final per discovered unit, a counted summary, and a
+terminal exit receipt. Deployment completion additionally requires exact Worker
+and Pages IDs, artifact hashes, migration and queue read-backs, deployment-URL
+and stable-alias asset parity, public-route parity, and reviewer smoke parity.
+HTTP acceptance, an exit code alone, or a partial receipt never proves success.
+
 ## 1. Shape
 
 The MVP keeps the public application on Cloudflare Pages and runs background
@@ -13,11 +52,15 @@ secret-gated scanner admin / disabled cron
               -> prophecy-ledger-ingestion Queue
                        -> prophecy-ledger-scanner Worker
                             |-> bounded public fetcher
-                            |-> Workers AI description triage
+                            |-> abortable Gemini description triage
                             |-> direct Gemini transcript acquisition
-                            |-> Workers AI exact-quote extraction
                             |-> private R2 transcript artifacts
-                            `-> Queue retry / DLQ
+                            `-> ingestion retry / DLQ
+
+              -> prophecy-ledger-analysis Queue
+                       -> prophecy-ledger-scanner Worker
+                            |-> abortable Gemini exact-quote extraction
+                            `-> analysis retry / DLQ
 ```
 
 The `prophecy-ledger` Pages project and shared D1 serve a noindex preview. The
@@ -89,6 +132,24 @@ evaluated.
 Reviews, receipts, events, public research revisions, and publication revisions
 are append-only. A database trigger requires the immutable publication revision
 before a claim can become public and prevents later mutation or deletion.
+
+A `source_supported` archive observation enters the ordinary candidate lane only
+through the archive conveyor. At bridge time it re-hashes the private transcript,
+resolves each required 5W1H source basis to an exact bounded support span, and
+binds atomic readiness to the source's person, platform, platform item, canonical
+URL, transcript, section, offsets, and gate version. Missing or mismatched support
+returns a non-bridged result; it cannot create reviewable candidate work. The
+archive decision, observation, conveyor records, assignment submission, and work
+completion are prepared before mutation and committed in one D1 batch. The
+readiness trigger independently requires the section to belong to the same
+completed extraction run as the candidate, preventing a stale section identity
+from becoming reviewable.
+
+Machine-conveyor discovery excludes candidates with an existing human decision.
+A rejection is terminal reviewer-completed work, while a promotion writes its
+decision and promotion atomically; neither may be rediscovered, requeued, or
+reported as a pending promotion. Existing ready work without a human decision
+remains recoverable when an earlier conveyor receipt is missing.
 
 ## 5. Scoring
 
@@ -180,12 +241,36 @@ run jobs, source identities, revisions, and candidates have deterministic or
 unique identities. Retry exhaustion goes to `prophecy-ledger-ingestion-dlq` and
 cannot make a run appear cleanly complete.
 
-Workers AI uses structured output to triage first-party title/description text.
+Gemini uses structured output to triage first-party title/description text.
 It may write a neutral possible-claim lead. Exact quotation extraction requires
 a private quality-labeled transcript artifact. Every retained quote must occur
 exactly once in that artifact; deterministic code corrects model offset arithmetic
 or rejects missing/ambiguous quotes. AI cannot populate an outcome or bypass the
 two-human publication gate.
+
+Production structured calls use Gemini Interactions through the existing
+authenticated Cloudflare AI Gateway BYOK transport. The JSON Schema is sent as a
+text response format, cache and hidden retries are disabled, and gateway payload
+logging is disabled. Gemini may reject that schema with a generic HTTP 400 body
+that names no safe provider code. Schema mode therefore permits exactly one
+same-model request with the schema field omitted; plain mode cannot recurse.
+The schema failure remains `unknown_provider_error` but its receipt truthfully
+marks that bounded fallback as eligible. Plain output may be fenced, but must
+parse and pass the complete deterministic shape and grounding gates before a
+completed receipt. Invalid JSON or a wrong-shaped payload may then advance to
+the configured model fallback; it never becomes an empty successful extraction
+implicitly.
+
+Every structured invocation is paired with append-only attempt receipts: a
+durable `started` row precedes the network call, and one terminal row records
+completion or a safe failure cause. Migration 0054 keeps the deployed Workers-AI
+ledger immutable while adding exact provider identity and confirmed gateway
+aborts; migrations 0055–0056 register new append-only generations rather than
+replaying their terminal predecessors. The provider-native fetch is client-abortable
+and carries a slightly earlier gateway timeout. A cancelled or gateway-timed call
+is therefore `ai_timeout_confirmed` and may safely use the next model; the legacy
+binding path remains `ai_timeout_unconfirmed` and stops without overlap. This
+applies to description triage as well as transcript-section analysis.
 
 Migration 0007 preserves the earlier experimental primary, verifier, and
 tie-breaker video-analysis
@@ -245,10 +330,24 @@ interrupted dispatches without creating a second active video. Quota exhaustion,
 Gemini rate limits, duration failures, and terminal errors pause the batch rather
 than advancing. Scheduled execution may resume an already approved batch only
 when `TRANSCRIPT_BATCH_ENABLED=1`; it never discovers sources or creates a batch.
-The Worker atomically reserves no more than 28,800 media seconds per UTC day
-before any Gemini request.
+The Worker atomically reserves no more than 86,400 media seconds per UTC day
+before any Gemini request. Migration 0045 makes that physical: each root, split,
+or retry call owns an immutable request reservation and terminal result. The
+day-debit ledger carries the one-time legacy cutover charge; logical chunk
+reservations are planning records and are not the physical usage total.
 
-The video is divided into non-overlapping clips of at most 300 seconds. Each job
+Migration 0043 preserves an unavailable pending batch item and appends one
+source disposition tied to the observed error, expected transition, and exact
+successor. The public/effective phase may say `quarantined_source_unavailable`,
+but the original pending row, completed count, and all artifact/reviewer/
+publication history remain unchanged.
+
+The video is divided into deterministic balanced clips of at most 300 seconds.
+The `balanced-integer-v2` plan distributes the duration across the minimum
+number of clips, so durations such as 901 seconds cannot produce a one-second
+tail. Run scopes, job keys, Queue payloads, reusable chunk checks, and stitch
+manifests bind the plan version and exact boundaries; legacy chunks are never
+silently mixed into a v2 stitch. Each job
 calls Google's live `v1beta/models/gemini-3.1-flash-lite:generateContent` endpoint
 directly with the public video URL and `videoMetadata` clip bounds. The response
 must finish normally and contain plain transcript text. Chunks are immutable and
@@ -256,15 +355,23 @@ resumable; the stitched private R2 artifact labels each section
 `GEMINI-GENERATED, NEEDS HUMAN CHECK`. Clip boundaries are approximate source
 locators, not word-level timestamps.
 
-Workers AI analyzes the private transcript and ignores encouragement, prayer,
+Gemini analyzes the private transcript through the abortable gateway path and ignores encouragement, prayer,
 exhortation, symbolism, theology, personal interpretation, and vague or unbounded
 prophecy. Retained types are `testable_prediction`,
 `present_or_past_factual_claim`, and `conditional_prediction`; future and
 conditional candidates require a bounded deadline. Structured JSON mode is tried
-first, followed by an explicit plain-JSON contract on the same model because the
-provider documents that JSON Mode may not always be met. Bad individual
+first, followed by at most one explicit schema-free JSON contract on the same
+model. A generic schema-mode HTTP 400 is eligible for that single attempt; a
+plain-mode HTTP 400 is terminal for the model. Bad individual
 suggestions are rejected without discarding good candidates, and all rejection
 and correction counts remain append-only.
+
+Acquisition and analysis have distinct Queue/DLQ bindings. Migration 0048 adds
+the durable `analysis_reprocess_dispatch_outbox`: the database first binds a
+retryable failed section and job to one action, then the analysis producer
+claims and dispatches that action idempotently. A missing analysis Queue,
+non-empty DLQ, unavailable queue metric, failed analysis debt, or incomplete
+outbox dispatch blocks operational advancement without undoing acquisition.
 
 The public surface exposes safe counts only; transcript bodies and chunks,
 private object keys, raw AI output, and reviewer identities remain private. No

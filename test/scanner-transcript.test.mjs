@@ -2,14 +2,16 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { makeEnv } from "./helpers/d1.mjs";
 import { processEnvelope, scannerStatus, startTranscriptCanary, validateEnvelope } from "../scanner/src/jobs.js";
-import { createRun, registerJob, reserveGeminiMedia, upsertSourceItem } from "../scanner/src/repository.js";
+import { createRun, registerJob, reserveGeminiMedia, reserveGeminiPhysicalRequest, upsertSourceItem } from "../scanner/src/repository.js";
 import { makeEnvelope } from "../scanner/src/jobs.js";
 import { fetchHandler } from "../scanner/src/index.js";
 import { sha256 } from "../scanner/src/hash.js";
 import {
   extractTranscriptSection, fetchYouTubeDataApiDuration, fetchYouTubeDuration,
-  parseYouTubeDataApiDuration, requestTranscriptChunk, stitchTranscript,
-  transcriptPlan, transcriptSections,
+  parseYouTubeDataApiDuration, requestTranscriptChunk, requestTranscriptChunkWithSplit,
+  MIN_TRANSCRIPT_WINDOW_SECONDS, SHORT_WINDOW_PLACEHOLDER, POLICY_BLOCKED_FINISH_REASONS,
+  policyBlockedPlaceholder, stitchTranscript,
+  TRANSCRIPT_PLAN_VERSION, transcriptPlan, transcriptSections,
 } from "../scanner/src/transcript.js";
 
 const durationFetcher = (seconds) => async () => new Response(`<html><script>{"lengthSeconds":"${seconds}"}</script></html>`, { status: 200 });
@@ -52,6 +54,48 @@ test("five-minute transcript planning never exceeds five minutes and stitching l
   assert.match(result.text, /\[CLIP 00:05:00-00:10:00 \| GEMINI-GENERATED, NEEDS HUMAN CHECK\]/);
   assert.match(result.text, /Opening words[\s\S]*Second-window words/);
   assert.equal(result.cueCount, 0);
+});
+
+test("balanced transcript planning covers modulo-one durations without one-second tails", () => {
+  assert.deepEqual(transcriptPlan(301).map(({ requestStart, requestEnd }) => [requestStart, requestEnd]),
+    [[0, 151], [151, 301]]);
+  assert.deepEqual(transcriptPlan(601).map(({ requestStart, requestEnd }) => [requestStart, requestEnd]),
+    [[0, 201], [201, 401], [401, 601]]);
+  assert.deepEqual(transcriptPlan(901).map(({ requestStart, requestEnd }) => [requestStart, requestEnd]),
+    [[0, 226], [226, 451], [451, 676], [676, 901]]);
+});
+
+test("balanced transcript plans are deterministic, bounded, and gapless across chunk boundaries", () => {
+  for (const durationSeconds of [
+    ...Array.from({ length: 7 }, (_, index) => 297 + index),
+    ...Array.from({ length: 7 }, (_, index) => 597 + index),
+    ...Array.from({ length: 7 }, (_, index) => 897 + index),
+    43_200,
+  ]) {
+    const first = transcriptPlan(durationSeconds);
+    assert.deepEqual(transcriptPlan(durationSeconds), first);
+    assert.equal(first[0].requestStart, 0);
+    assert.equal(first.at(-1).requestEnd, durationSeconds);
+    assert.equal(first.every((window) => window.requestEnd - window.requestStart <= 300), true);
+    assert.equal(first.every((window, index) => index === 0 ||
+      first[index - 1].requestEnd === window.requestStart), true);
+    const lengths = first.map((window) => window.requestEnd - window.requestStart);
+    assert.ok(Math.max(...lengths) - Math.min(...lengths) <= 1);
+    if (durationSeconds > 300) assert.ok(Math.min(...lengths) > 1);
+  }
+});
+
+test("balanced transcript overlap stays exact without exceeding the request limit", () => {
+  for (let durationSeconds = 270; durationSeconds <= 910; durationSeconds += 1) {
+    const plan = transcriptPlan(durationSeconds, { chunkSeconds: 300, overlapSeconds: 30 });
+    assert.equal(plan[0].requestStart, 0);
+    assert.equal(plan.at(-1).requestEnd, durationSeconds);
+    assert.equal(plan.every((window) => window.requestEnd - window.requestStart <= 300), true);
+    assert.equal(plan.every((window, index) => index === 0 ||
+      plan[index - 1].requestEnd - window.requestStart === 30), true);
+    assert.equal(plan.every((window, index) => index === 0 ||
+      plan[index - 1].canonicalEnd === window.canonicalStart), true);
+  }
 });
 
 test("one candidate rejected by persistence is audited without losing a valid sibling", async () => {
@@ -108,16 +152,129 @@ test("Gemini transcript request uses the documented clipping metadata and reject
   const result = await requestTranscriptChunk({ apiKey: "secret", videoUrl: "https://www.youtube.com/watch?v=c3vf85nk1O0", window, fetcher });
   assert.equal(calls.length, 1);
   assert.match(calls[0].url, /gemini-3\.1-flash-lite:generateContent$/);
-  assert.deepEqual(calls[0].body.contents[0].parts[0].videoMetadata, { startOffset: "300s", endOffset: "360s" });
+  assert.deepEqual(calls[0].body.contents[0].parts[0].videoMetadata, { startOffset: "180s", endOffset: "360s" });
+  assert.deepEqual(calls[0].body.generationConfig.thinkingConfig, { thinkingLevel: "minimal" });
   assert.match(calls[0].body.contents[0].parts[1].text, /plain text/i);
   assert.match(calls[0].body.contents[0].parts[1].text, /do not include timestamps/i);
   assert.equal(calls[0].init.headers["x-goog-api-key"], "secret");
   assert.equal(result.finishReason, "STOP");
   assert.equal(result.text, "Exact words from the supplied clip.");
 
-  await assert.rejects(() => requestTranscriptChunk({ apiKey: "secret", videoUrl: "https://www.youtube.com/watch?v=c3vf85nk1O0", window,
-    fetcher: async () => new Response(JSON.stringify({ candidates: [{ finishReason: "MAX_TOKENS", content: { parts: [{ text: "WEBVTT" }] } }] }), { status: 200 }) }),
-  /gemini_output_truncated/);
+  let truncated = null;
+  try {
+    await requestTranscriptChunk({ apiKey: "secret", videoUrl: "https://www.youtube.com/watch?v=c3vf85nk1O0", window,
+      fetcher: async () => new Response(JSON.stringify({ candidates: [{ finishReason: "MAX_TOKENS", content: { parts: [{ text: "WEBVTT" }] } }] }), { status: 200 }) });
+  } catch (error) {
+    truncated = error;
+  }
+  assert.equal(truncated?.message, "gemini_output_truncated");
+  assert.equal(truncated?.retryable, true);
+
+  let incomplete = null;
+  try {
+    await requestTranscriptChunk({ apiKey: "secret", videoUrl: "https://www.youtube.com/watch?v=c3vf85nk1O0", window,
+      fetcher: async () => new Response(JSON.stringify({ candidates: [{ finishReason: "OTHER", content: { parts: [{ text: "" }] } }] }), { status: 200 }) });
+  } catch (error) {
+    incomplete = error;
+  }
+  assert.equal(incomplete?.message, "gemini_incomplete_response");
+  assert.equal(incomplete?.retryable, true);
+});
+
+
+test("truncated/incomplete transcript windows split instead of accepting runaway text", async () => {
+  const calls = [];
+  const reservations = []; const results = [];
+  const fetcher = async (_url, init) => {
+    const body = JSON.parse(init.body);
+    const start = body.contents[0].parts[0].videoMetadata.startOffset;
+    const end = body.contents[0].parts[0].videoMetadata.endOffset;
+    calls.push({ start, end });
+    // Full 0-300 window: runaway MAX_TOKENS (mirrors KMr0tGfmvZs canary).
+    if (start === "0s" && end === "300s") {
+      return new Response(JSON.stringify({
+        candidates: [{ finishReason: "MAX_TOKENS", content: { parts: [{ text: "loop ".repeat(5000) }] } }],
+        usageMetadata: { promptTokenCount: 25000, candidatesTokenCount: 16380 },
+      }), { status: 200 });
+    }
+    return new Response(JSON.stringify({
+      candidates: [{ finishReason: "STOP", content: { parts: [{ text: `Spoken words for ${start}-${end}.` }] } }],
+      usageMetadata: { promptTokenCount: 12000, candidatesTokenCount: 40 },
+    }), { status: 200 });
+  };
+  const result = await requestTranscriptChunkWithSplit({
+    apiKey: "secret",
+    videoUrl: "https://www.youtube.com/watch?v=KMr0tGfmvZs",
+    window: { requestStart: 0, requestEnd: 300 },
+    fetcher,
+    beforePhysicalRequest: async ({ splitPath, window }) => {
+      reservations.push({ splitPath, start: window.requestStart, end: window.requestEnd });
+      return `physical_${splitPath}`;
+    },
+    afterPhysicalRequest: async (receipt) => results.push(receipt),
+  });
+  assert.equal(calls.length, 3); // 1 failed full + 2 half successes
+  assert.deepEqual(calls.map((c) => [c.start, c.end]), [["0s", "300s"], ["0s", "150s"], ["150s", "300s"]]);
+  assert.match(result.text, /Spoken words for 0s-150s/);
+  assert.match(result.text, /Spoken words for 150s-300s/);
+  assert.equal(result.splitCount, 1);
+  assert.equal(result.finishReason, "STOP");
+  assert.deepEqual(reservations.map((item) => item.splitPath), ["root", "L", "R"]);
+  assert.deepEqual(results.map((item) => [item.splitPath, item.status, item.safeCauseCode || null]), [
+    ["root", "failed", "gemini_output_truncated"],
+    ["L", "completed", null],
+    ["R", "completed", null],
+  ]);
+});
+
+
+test("RECITATION/SAFETY policy blocks return marked placeholders instead of failing the chunk", async () => {
+  assert.equal(POLICY_BLOCKED_FINISH_REASONS.has("RECITATION"), true);
+  let calls = 0;
+  const result = await requestTranscriptChunk({
+    apiKey: "secret",
+    videoUrl: "https://www.youtube.com/watch?v=mjQd35WtGRs",
+    window: { requestStart: 265, requestEnd: 530 },
+    fetcher: async () => {
+      calls += 1;
+      return new Response(JSON.stringify({
+        candidates: [{ finishReason: "RECITATION", finishMessage: "blocked", content: { parts: [] } }],
+        usageMetadata: { promptTokenCount: 24139 },
+      }), { status: 200 });
+    },
+  });
+  assert.equal(calls, 1);
+  assert.equal(result.finishReason, "STOP");
+  assert.equal(result.blockedReason, "RECITATION");
+  assert.equal(result.policyBlocked, true);
+  assert.equal(result.text, policyBlockedPlaceholder("RECITATION", { requestStart: 265, requestEnd: 530 }));
+  const split = await requestTranscriptChunkWithSplit({
+    apiKey: "secret",
+    videoUrl: "https://www.youtube.com/watch?v=mjQd35WtGRs",
+    window: { requestStart: 265, requestEnd: 530 },
+    fetcher: async () => new Response(JSON.stringify({
+      candidates: [{ finishReason: "RECITATION", content: { parts: [] } }],
+    }), { status: 200 }),
+  });
+  assert.equal(split.policyBlocked, true);
+  assert.equal(split.splitCount, 0);
+});
+
+test("windows shorter than MIN_TRANSCRIPT_WINDOW_SECONDS skip Gemini and do not call the API", async () => {
+  let calls = 0; let reservations = 0;
+  const result = await requestTranscriptChunk({
+    apiKey: "secret",
+    videoUrl: "https://www.youtube.com/watch?v=KsZHrXYp4LY",
+    window: { requestStart: 900, requestEnd: 901 },
+    fetcher: async () => { calls += 1; throw new Error("should_not_fetch"); },
+    beforePhysicalRequest: async () => { reservations += 1; },
+  });
+  assert.equal(calls, 0);
+  assert.equal(reservations, 0);
+  assert.equal(result.text, SHORT_WINDOW_PLACEHOLDER);
+  assert.equal(result.finishReason, "STOP");
+  assert.equal(result.blockedReason, "SHORT_WINDOW_SKIPPED");
+  assert.ok(MIN_TRANSCRIPT_WINDOW_SECONDS >= 15);
 });
 
 test("YouTube duration lookup follows only bounded same-host HTTPS redirects", async () => {
@@ -177,6 +334,12 @@ test("transcript canary prefers YouTube Data API and stores only safe duration p
   assert.equal(started.started, true);
   assert.equal(started.durationSeconds, 60);
   assert.equal(started.durationProvenance, "youtube_data_api_v3_content_details");
+  assert.equal(env.sent[0].payload.planVersion, TRANSCRIPT_PLAN_VERSION);
+  assert.equal(env.sent[0].stableKey,
+    `youtube:c3vf85nk1O0:transcript:${TRANSCRIPT_PLAN_VERSION}:chunk:0`);
+  const unversioned = structuredClone(env.sent[0]);
+  delete unversioned.payload.planVersion;
+  assert.throws(() => validateEnvelope(unversioned), /invalid_transcript_plan_version/);
   const receipt = env.DB.db.prepare("SELECT * FROM source_media_metadata WHERE source_item_id=?").get(source.source_item_id);
   assert.equal(receipt.method, "youtube_data_api_v3_content_details");
   assert.doesNotMatch(JSON.stringify(receipt), /bound-youtube-secret|googleapis\.com/);
@@ -216,10 +379,53 @@ test("the D1 trigger atomically refuses media reservations above the configured 
   ]);
   assert.deepEqual(results.sort(), [false, true]);
   assert.equal(env.DB.db.prepare("SELECT SUM(reserved_seconds) total FROM gemini_media_reservations").get().total, 80);
+  const logical = env.DB.db.prepare("SELECT * FROM gemini_media_reservations").get();
+  const physicalBase = { logicalReservationId: logical.reservation_id, mediaDay: logical.media_day,
+    runId: logical.run_id, jobId: logical.job_id, sourceItemId: logical.source_item_id,
+    chunkIndex: Number(logical.chunk_index), jobAttempt: Number(logical.job_attempt),
+    budgetLimitSeconds: 100, createdAt: logical.created_at };
+  assert.equal(await reserveGeminiPhysicalRequest(env.DB, { ...physicalBase,
+    physicalRequestId: "physical_root", splitPath: "root", startSeconds: 0, endSeconds: 80 }), true);
+  assert.equal(await reserveGeminiPhysicalRequest(env.DB, { ...physicalBase,
+    physicalRequestId: "physical_left", splitPath: "L", startSeconds: 0, endSeconds: 40 }), false);
+  assert.equal(env.DB.db.prepare("SELECT SUM(reserved_seconds) total FROM gemini_physical_request_reservations").get().total, 80);
+});
+
+test("recursive physical transcript calls meter the UTC day observed at each fetch across midnight", async () => {
+  const env = makeEnv(); env.sent = [];
+  env.INGESTION_QUEUE = { send: async (body) => env.sent.push(body) };
+  env.ARTIFACTS = r2Memory(); env.GEMINI_API_KEY = "gemini-secret";
+  await upsertSourceItem(env.DB, { personId: "person_troy_black", platform: "youtube",
+    platformItemId: "Midnight001", canonicalUrl: "https://www.youtube.com/watch?v=Midnight001" });
+  const started = await startTranscriptCanary(env, { youtubeId: "Midnight001",
+    expectedDurationSeconds: 60, durationFetcher: durationFetcher(60) });
+  assert.equal(started.started, true);
+  let providerCalls = 0;
+  const geminiFetcher = async () => {
+    providerCalls += 1;
+    if (providerCalls === 1) {
+      return new Response(JSON.stringify({ responseId: "root", candidates: [{ finishReason: "MAX_TOKENS",
+        content: { parts: [{ text: "partial must not be accepted" }] } }],
+        usageMetadata: { promptTokenCount: 10, candidatesTokenCount: 20 } }), { status: 200 });
+    }
+    return new Response(JSON.stringify({ responseId: `child-${providerCalls}`,
+      candidates: [{ finishReason: "STOP", content: { parts: [{ text: `Child ${providerCalls} exact words.` }] } }],
+      usageMetadata: { promptTokenCount: 10, candidatesTokenCount: 5 } }), { status: 200 });
+  };
+  const physicalTimes = ["2026-08-03T23:59:59.900Z", "2026-08-04T00:00:01.000Z",
+    "2026-08-04T00:00:02.000Z"];
+  await processEnvelope(env, env.sent.shift(), { geminiFetcher,
+    at: "2026-08-03T23:59:58.000Z", physicalNow: () => physicalTimes.shift() });
+  assert.equal(providerCalls, 3);
+  assert.deepEqual(env.DB.db.prepare(`SELECT split_path,media_day FROM gemini_physical_request_reservations
+    ORDER BY created_at`).all().map((row) => [row.split_path, row.media_day]), [
+    ["root", "2026-08-03"], ["L", "2026-08-04"], ["R", "2026-08-04"],
+  ]);
 });
 
 test("generic transcript canary acquires private chunks, stitches one artifact, and uses only in-house AI for claim analysis", async () => {
   const env = makeEnv(); env.sent = []; env.INGESTION_QUEUE = { send: async (body) => env.sent.push(body) };
+  env.ANALYSIS_QUEUE = { send: async (body) => env.sent.push(body) };
   env.ARTIFACTS = r2Memory(); env.GEMINI_API_KEY = "gemini-secret"; env.AI_MODEL = "local-model";
   env.AI_FALLBACK_MODEL = "local-fallback"; env.AI = { run: async (_model, input) => {
     const transcript = input.messages[1].content;
@@ -251,10 +457,14 @@ test("generic transcript canary acquires private chunks, stitches one artifact, 
   while (env.sent.length) await processEnvelope(env, env.sent.shift(), { geminiFetcher });
   assert.equal(geminiCalls, 2);
   assert.equal(env.DB.db.prepare("SELECT count(*) count FROM transcript_chunk_attempts WHERE status='completed'").get().count, 2);
+  assert.equal(env.DB.db.prepare("SELECT count(*) count FROM gemini_physical_request_reservations").get().count, 2);
+  assert.equal(env.DB.db.prepare("SELECT count(*) count FROM gemini_physical_request_results WHERE status='completed'").get().count, 2);
   assert.equal(env.DB.db.prepare("SELECT count(*) count FROM transcript_artifacts WHERE source_item_id=?").get(source.source_item_id).count, 1);
   assert.equal(env.DB.db.prepare("SELECT count(*) count FROM transcript_stitch_receipts").get().count, 1);
   assert.equal(env.DB.db.prepare("SELECT count(*) count FROM extraction_runs WHERE input_kind='verified_transcript'").get().count, 2);
   assert.equal(env.DB.db.prepare("SELECT count(*) count FROM extraction_runs WHERE transcript_quality='gemini_generated_needs_human_check'").get().count, 2);
+  assert.equal(env.DB.db.prepare("SELECT count(*) count FROM text_ai_attempt_receipt_history WHERE status='completed'").get().count, 2);
+  assert.equal(env.DB.db.prepare("SELECT count(*) count FROM text_ai_attempt_receipt_history WHERE status='started'").get().count, 2);
   assert.equal(env.DB.db.prepare("SELECT count(*) count FROM candidate_admissibility_assessments WHERE decision='eligible'").get().count, 1);
   assert.equal(env.DB.db.prepare("SELECT status FROM transcript_attempts WHERE method='gemini_public_youtube_clipped'").get().status, "needs_human_check");
   const candidate = env.DB.db.prepare("SELECT exact_quote,quote_start,quote_end,source_timestamp_seconds FROM claim_candidates WHERE source_item_id=?").get(source.source_item_id);

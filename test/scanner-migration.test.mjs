@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import { readFileSync, readdirSync } from "node:fs";
 import { join } from "node:path";
 import { D1Shim, makeEnv, ROOT } from "./helpers/d1.mjs";
+import { analysisDiscoverySql } from "../scripts/analysis-reconciler.mjs";
 
 test("ingestion migration creates operational, inventory, transcript, and candidate tables", () => {
   const env = makeEnv();
@@ -289,4 +290,293 @@ test("future eligible assessments require structured grounding and exact support
   insert.run("assessment_good_ground", fields[0], "gate-good", ...fields.slice(1),
     grounding, "[]", "system:test", "2026-07-20T10:00:01Z");
   assert.equal(db.prepare("SELECT decision FROM candidate_admissibility_assessments WHERE assessment_id='assessment_good_ground'").get().decision, "eligible");
+});
+
+test("0043 adds source dispositions without rewriting transcript or reviewer history", () => {
+  const store = new D1Shim();
+  for (const file of readdirSync(join(ROOT, "migrations"))
+    .filter((name) => /^\d{4}_.*\.sql$/.test(name) && Number(name.slice(0, 4)) <= 42).sort()) {
+    store.exec(readFileSync(join(ROOT, "migrations", file), "utf8"));
+  }
+  const db = store.db;
+  db.prepare(`INSERT INTO source_items
+    (source_item_id,person_id,platform,platform_item_id,canonical_url,
+     first_discovered_at,last_seen_at,availability)
+    VALUES ('source_preserved_0043','person_troy_black','youtube','Preserve043',
+      'https://www.youtube.com/watch?v=Preserve043','2026-08-03T00:00:00Z',
+      '2026-08-03T00:00:00Z','unknown')`).run();
+  const source = { source_item_id: "source_preserved_0043" };
+  db.prepare(`INSERT INTO transcript_artifacts
+    (transcript_id,source_item_id,r2_key,content_sha256,byte_count,language,has_timing,
+     provenance,created_at)
+    VALUES ('tx_preserved_0043',?,'private/preserved-0043.txt',?,42,'en',0,
+      'authorized_transcript','2026-08-03T00:00:00Z')`).run(source.source_item_id, "a".repeat(64));
+  db.prepare(`INSERT INTO ingestion_runs
+    (run_id,person_id,trigger_type,scope,status,created_at)
+    VALUES ('run_preserved_0043','person_troy_black','manual','preservation:0043',
+      'complete','2026-08-03T00:00:00Z')`).run();
+  db.prepare(`INSERT INTO transcript_analysis_runs
+    (analysis_run_id,ingestion_run_id,transcript_id,source_item_id,transcript_sha256,
+     prompt_version,section_count,completed_section_count,failed_section_count,status,
+     created_at,completed_at)
+    VALUES ('analysis_preserved_0043','run_preserved_0043','tx_preserved_0043',?,?,'test-v1',
+      1,1,0,'completed','2026-08-03T00:00:00Z','2026-08-03T00:01:00Z')`)
+    .run(source.source_item_id, "a".repeat(64));
+  const preservedTables = [
+    "source_items", "source_item_revisions", "transcript_artifacts",
+    "transcript_analysis_runs", "claims", "evidence", "review_work_items",
+    "review_assignments", "moderator_reviews", "claim_revisions",
+    "publication_evaluations", "claim_events", "review_audit_events",
+  ];
+  const snapshot = () => Object.fromEntries(preservedTables.map((name) =>
+    [name, db.prepare(`SELECT * FROM ${name} ORDER BY rowid`).all()]));
+  const before = snapshot();
+  store.exec(readFileSync(join(ROOT, "migrations/0043_transcript_batch_source_dispositions.sql"), "utf8"));
+  assert.deepEqual(snapshot(), before);
+  assert.equal(db.prepare("SELECT COUNT(*) count FROM transcript_batch_item_dispositions").get().count, 0);
+  assert.deepEqual(db.prepare("PRAGMA foreign_key_check").all(), []);
+});
+
+test("0050-0056 keep a completed disposition bound across a later prompt generation", () => {
+  const env = { DB: new D1Shim() };
+  for (const file of readdirSync(join(ROOT, "migrations"))
+    .filter((name) => /^\d{4}_.*\.sql$/.test(name) && Number(name.slice(0, 4)) <= 55)
+    .sort()) {
+    env.DB.exec(readFileSync(join(ROOT, "migrations", file), "utf8"));
+  }
+  const db = env.DB.db;
+  const sourcePrompt = "transcript-claims-v5-grounded-5w1h-offset-repair";
+  const targetPrompt = "transcript-claims-v12-gemini-gateway-plain-fallback";
+  const sha = "d".repeat(64); const inputSha = "e".repeat(64);
+  db.prepare(`INSERT INTO source_items
+    (source_item_id,person_id,platform,platform_item_id,canonical_url,
+     first_discovered_at,last_seen_at,availability)
+    VALUES ('source_lineage','person_troy_black','youtube','Lineage0050',
+      'https://www.youtube.com/watch?v=Lineage0050','2026-08-04','2026-08-04','available')`).run();
+  db.prepare(`INSERT INTO transcript_artifacts
+    (transcript_id,source_item_id,r2_key,content_sha256,byte_count,language,has_timing,
+     provenance,created_at)
+    VALUES ('tx_lineage','source_lineage','private/lineage.txt',?,80,'en',1,
+      'authorized_transcript','2026-08-04')`).run(sha);
+  for (const [runId, status] of [["run_lineage_old", "failed"], ["run_lineage_new", "running"]]) {
+    db.prepare(`INSERT INTO ingestion_runs
+      (run_id,person_id,trigger_type,scope,status,created_at)
+      VALUES (?,'person_troy_black','manual',?,?,'2026-08-04')`)
+      .run(runId, `lineage:${runId}`, status);
+  }
+  db.prepare(`INSERT INTO ingestion_jobs
+    (job_id,run_id,job_type,stable_key,payload_json,status,attempt_count,completed_at,error_code)
+    VALUES ('job_lineage_old','run_lineage_old','transcript_extract','old',?,
+      'failed',2,'2026-08-04','model_unavailable')`)
+    .run(JSON.stringify({ phase: "analyze", analysisSectionId: "section_lineage_old" }));
+  db.prepare(`INSERT INTO ingestion_jobs
+    (job_id,run_id,job_type,stable_key,payload_json,status,attempt_count)
+    VALUES ('job_lineage_new','run_lineage_new','transcript_extract','new',?,'queued',0)`)
+    .run(JSON.stringify({ phase: "analyze", analysisSectionId: "section_lineage_new" }));
+  db.prepare(`INSERT INTO transcript_analysis_runs
+    (analysis_run_id,ingestion_run_id,transcript_id,source_item_id,transcript_sha256,
+     prompt_version,section_count,failed_section_count,status,created_at,completed_at)
+    VALUES ('analysis_lineage_old','run_lineage_old','tx_lineage','source_lineage',?, ?,
+      1,1,'failed','2026-08-04','2026-08-04')`).run(sha, sourcePrompt);
+  db.prepare(`INSERT INTO transcript_analysis_runs
+    (analysis_run_id,ingestion_run_id,transcript_id,source_item_id,transcript_sha256,
+     prompt_version,section_count,status,created_at)
+    VALUES ('analysis_lineage_new','run_lineage_new','tx_lineage','source_lineage',?, ?,
+      1,'queued','2026-08-04')`).run(sha, targetPrompt);
+  db.prepare(`INSERT INTO transcript_analysis_sections
+    (analysis_section_id,analysis_run_id,section_index,input_sha256,base_offset,
+     approximate_timestamp_seconds,status,attempt_count,error_code,completed_at,created_at)
+    VALUES ('section_lineage_old','analysis_lineage_old',0,?,10,30,'failed',2,
+      'model_unavailable','2026-08-04','2026-08-04')`).run(inputSha);
+  db.prepare(`INSERT INTO transcript_analysis_sections
+    (analysis_section_id,analysis_run_id,section_index,input_sha256,base_offset,
+     approximate_timestamp_seconds,status,attempt_count,created_at)
+    VALUES ('section_lineage_new','analysis_lineage_new',0,?,10,30,'queued',0,'2026-08-04')`)
+    .run(inputSha);
+
+  assert.equal(db.prepare(`SELECT debt_state FROM analysis_section_lineage_v2
+    WHERE analysis_section_id='section_lineage_old'`).get().debt_state, "successor_pending");
+  assert.throws(() => db.prepare(`INSERT INTO analysis_section_successor_links
+    (link_id,predecessor_section_id,successor_section_id,predecessor_prompt_version,
+     successor_prompt_version,action_id,created_at)
+    VALUES ('link_bad','section_lineage_old','section_lineage_new',?,?,'action_bad','2026-08-04')`)
+    .run("transcript-claims-v4-grounded-5w1h", targetPrompt), /binding mismatch/);
+  db.prepare(`INSERT INTO analysis_section_successor_links
+    (link_id,predecessor_section_id,successor_section_id,predecessor_prompt_version,
+     successor_prompt_version,action_id,created_at)
+    VALUES ('link_lineage','section_lineage_old','section_lineage_new',?,?,'action_lineage','2026-08-04')`)
+    .run(sourcePrompt, targetPrompt);
+  assert.throws(() => db.exec(`INSERT INTO analysis_section_dispositions
+    VALUES ('disposition_early','section_lineage_old','section_lineage_new','link_lineage',
+      'superseded_by_completed_successor','action_lineage','2026-08-04')`), /binding mismatch/);
+
+  const extractionInsert = db.prepare(`INSERT INTO extraction_runs
+    (extraction_run_id,source_item_id,transcript_id,input_kind,input_sha256,prompt_version,
+     model_family,status,started_at,completed_at)
+    VALUES (?,'source_lineage','tx_lineage','verified_transcript',?,?,
+      'workers_ai','completed','2026-08-04','2026-08-04')`);
+  extractionInsert.run("extract_lineage_wrong_input", "9".repeat(64), targetPrompt);
+  extractionInsert.run("extract_lineage_wrong_prompt", inputSha, sourcePrompt);
+  extractionInsert.run("extract_lineage_new", inputSha, targetPrompt);
+  const dispositionSql = `INSERT INTO analysis_section_dispositions VALUES
+    ('disposition_lineage','section_lineage_old','section_lineage_new','link_lineage',
+      'superseded_by_completed_successor','action_lineage','2026-08-04')`;
+  db.exec(`UPDATE transcript_analysis_sections SET status='failed',attempt_count=1,
+    error_code='invalid_json',completed_at='2026-08-04'
+    WHERE analysis_section_id='section_lineage_new';
+    UPDATE ingestion_jobs SET status='failed',attempt_count=1,completed_at='2026-08-04',
+      error_code='invalid_json' WHERE job_id='job_lineage_new';
+    UPDATE transcript_analysis_runs SET status='failed',completed_section_count=0,
+      failed_section_count=1,completed_at='2026-08-04'
+      WHERE analysis_run_id='analysis_lineage_new';`);
+
+  db.exec("BEGIN");
+  db.prepare(`INSERT INTO analysis_reconciliation_item_receipts
+    (item_receipt_id,run_id,analysis_section_id,outcome,safe_reason_code,before_status,
+     after_status,readback_at,created_at,source_prompt_version,target_prompt_version)
+    VALUES ('receipt_old_manual','reconcile_old_manual','section_lineage_old','manual_required',
+      'legacy_manual_gate','failed','failed','2026-08-04','2026-08-04',?,?)`)
+    .run(sourcePrompt, targetPrompt);
+  db.prepare(`INSERT INTO analysis_reconciliation_runs
+    (run_id,idempotency_sha256,limit_count,discovered_count,completed_count,
+     manual_required_count,failed_count,status,started_at,completed_at)
+    VALUES ('reconcile_old_manual',?,25,1,0,1,0,'completed','2026-08-04','2026-08-04')`)
+    .run("f".repeat(64));
+  db.exec("COMMIT");
+  assert.equal(db.prepare(`SELECT debt_state FROM analysis_section_lineage_v2
+    WHERE analysis_section_id='section_lineage_old'`).get().debt_state, "manual_required");
+
+  db.exec(`UPDATE transcript_analysis_sections SET status='completed',attempt_count=2,
+    extraction_run_id='extract_lineage_wrong_input',error_code=NULL,completed_at='2026-08-04'
+    WHERE analysis_section_id='section_lineage_new';
+    UPDATE ingestion_jobs SET status='completed',attempt_count=2,completed_at='2026-08-04',
+      error_code=NULL WHERE job_id='job_lineage_new';
+    UPDATE transcript_analysis_runs SET status='completed',completed_section_count=1,
+      failed_section_count=0,completed_at='2026-08-04'
+      WHERE analysis_run_id='analysis_lineage_new';`);
+  assert.throws(() => db.exec(dispositionSql), /binding mismatch/);
+  db.exec(`UPDATE transcript_analysis_sections
+    SET extraction_run_id='extract_lineage_wrong_prompt'
+    WHERE analysis_section_id='section_lineage_new'`);
+  assert.throws(() => db.exec(dispositionSql), /binding mismatch/);
+  db.exec(`UPDATE transcript_analysis_sections SET extraction_run_id='extract_lineage_new'
+    WHERE analysis_section_id='section_lineage_new'`);
+  assert.equal(db.prepare(`SELECT debt_state FROM analysis_section_lineage_v2
+    WHERE analysis_section_id='section_lineage_old'`).get().debt_state, "finalization_pending");
+
+  db.exec(dispositionSql);
+  assert.throws(() => db.exec("UPDATE analysis_section_dispositions SET created_at='later'"),
+    /append-only/);
+  assert.throws(() => db.exec("DELETE FROM analysis_section_dispositions"), /append-only/);
+  assert.equal(db.prepare(`SELECT status FROM transcript_analysis_sections
+    WHERE analysis_section_id='section_lineage_old'`).get().status, "failed");
+  assert.equal(db.prepare(`SELECT debt_state FROM analysis_section_lineage_v2
+    WHERE analysis_section_id='section_lineage_old'`).get().debt_state, "superseded");
+
+  db.exec("BEGIN");
+  assert.throws(() => db.prepare(`INSERT INTO analysis_reconciliation_item_receipts
+    (item_receipt_id,run_id,analysis_section_id,job_id,outcome,safe_reason_code,before_status,
+     after_status,readback_at,created_at,source_prompt_version,target_prompt_version,
+     successor_analysis_run_id,successor_analysis_section_id,successor_job_id,disposition_id)
+    VALUES ('receipt_bad_binding','reconcile_bad','section_lineage_old','job_lineage_old',
+      'completed','historical_section_superseded','failed','completed','2026-08-04','2026-08-04',
+      ?,?,'analysis_lineage_new','section_lineage_new','job_lineage_old','disposition_lineage')`)
+    .run(sourcePrompt, targetPrompt), /successor receipt mismatch/);
+  db.exec("ROLLBACK");
+  db.exec("BEGIN");
+  db.prepare(`INSERT INTO analysis_reconciliation_item_receipts
+    (item_receipt_id,run_id,analysis_section_id,job_id,outcome,safe_reason_code,before_status,
+     after_status,readback_at,created_at,source_prompt_version,target_prompt_version,
+     successor_analysis_run_id,successor_analysis_section_id,successor_job_id,disposition_id)
+    VALUES ('receipt_lineage','reconcile_lineage','section_lineage_old','job_lineage_new',
+      'completed','historical_section_superseded','failed','completed','2026-08-04','2026-08-04',
+      ?,?,'analysis_lineage_new','section_lineage_new','job_lineage_new','disposition_lineage')`)
+    .run(sourcePrompt, targetPrompt);
+  db.prepare(`INSERT INTO analysis_reconciliation_runs
+    (run_id,idempotency_sha256,limit_count,discovered_count,completed_count,
+     manual_required_count,failed_count,status,started_at,completed_at)
+    VALUES ('reconcile_lineage',?,25,1,1,0,0,'completed','2026-08-04','2026-08-04')`)
+    .run("1".repeat(64));
+  db.exec("COMMIT");
+  env.DB.exec(readFileSync(join(ROOT,
+    "migrations/0056_gemini_schema_http400_fallback_generation.sql"), "utf8"));
+  const disposedAfterBump = db.prepare(`SELECT target_prompt_version,target_prompt_generation,
+      successor_analysis_run_id,successor_analysis_section_id,successor_job_id,
+      successor_status,successor_job_status,disposition_id,debt_state
+    FROM analysis_section_lineage_v2
+    WHERE analysis_section_id='section_lineage_old'`).get();
+  assert.deepEqual({ ...disposedAfterBump }, {
+    target_prompt_version: targetPrompt,
+    target_prompt_generation: 12,
+    successor_analysis_run_id: "analysis_lineage_new",
+    successor_analysis_section_id: "section_lineage_new",
+    successor_job_id: "job_lineage_new",
+    successor_status: "completed",
+    successor_job_status: "completed",
+    disposition_id: "disposition_lineage",
+    debt_state: "superseded",
+  });
+  assert.equal(db.prepare(analysisDiscoverySql(25)).all()
+    .some((row) => row.analysis_section_id === "section_lineage_old"), false);
+  assert.deepEqual(db.prepare("PRAGMA foreign_key_check").all(), []);
+});
+
+test("0056 exposes exhausted v12 manual debt as an immutable v13 successor requirement", () => {
+  const env = makeEnv(); const db = env.DB.db;
+  const prompt = "transcript-claims-v12-gemini-gateway-plain-fallback";
+  const sha = "2".repeat(64);
+  db.exec(`INSERT INTO source_items
+    (source_item_id,person_id,platform,platform_item_id,canonical_url,
+     first_discovered_at,last_seen_at,availability)
+    VALUES ('source_current_manual','person_troy_black','youtube','Manual0050',
+      'https://www.youtube.com/watch?v=Manual0050','2026-08-04','2026-08-04','available');
+    INSERT INTO transcript_artifacts
+    (transcript_id,source_item_id,r2_key,content_sha256,byte_count,provenance,created_at)
+    VALUES ('tx_current_manual','source_current_manual','private/manual.txt','${sha}',10,
+      'authorized_transcript','2026-08-04');
+    INSERT INTO ingestion_runs
+    (run_id,person_id,trigger_type,scope,status,created_at)
+    VALUES ('run_current_manual','person_troy_black','manual','manual-current','failed','2026-08-04');`);
+  db.prepare(`INSERT INTO ingestion_jobs
+    (job_id,run_id,job_type,stable_key,payload_json,status,attempt_count,completed_at,error_code)
+    VALUES ('job_current_manual','run_current_manual','transcript_extract','manual',?,
+      'failed',1,'2026-08-04','manual_gate')`)
+    .run(JSON.stringify({ phase: "analyze", analysisSectionId: "section_current_manual" }));
+  db.prepare(`INSERT INTO transcript_analysis_runs
+    (analysis_run_id,ingestion_run_id,transcript_id,source_item_id,transcript_sha256,
+     prompt_version,section_count,failed_section_count,status,created_at,completed_at)
+    VALUES ('analysis_current_manual','run_current_manual','tx_current_manual',
+      'source_current_manual',?,?,1,1,'failed','2026-08-04','2026-08-04')`).run(sha, prompt);
+  db.prepare(`INSERT INTO transcript_analysis_sections
+    (analysis_section_id,analysis_run_id,section_index,input_sha256,base_offset,
+     approximate_timestamp_seconds,status,attempt_count,error_code,completed_at,created_at)
+    VALUES ('section_current_manual','analysis_current_manual',0,?,0,0,'failed',1,
+      'manual_gate','2026-08-04','2026-08-04')`).run("3".repeat(64));
+  db.exec("BEGIN");
+  db.prepare(`INSERT INTO analysis_reconciliation_item_receipts
+    (item_receipt_id,run_id,analysis_section_id,outcome,safe_reason_code,before_status,
+     created_at,source_prompt_version,target_prompt_version)
+    VALUES ('receipt_current_manual','reconcile_current_manual','section_current_manual',
+      'manual_required','successor_manual_required','failed','2026-08-04',?,?)`)
+    .run(prompt, prompt);
+  db.prepare(`INSERT INTO analysis_reconciliation_runs
+    (run_id,idempotency_sha256,limit_count,discovered_count,completed_count,
+     manual_required_count,failed_count,status,started_at,completed_at)
+    VALUES ('reconcile_current_manual',?,25,1,0,1,0,'completed','2026-08-04','2026-08-04')`)
+    .run("4".repeat(64));
+  db.exec("COMMIT");
+  const lineage = db.prepare(`SELECT debt_state,target_prompt_version,source_prompt_version,
+      source_attempt_count,source_error_code FROM analysis_section_lineage_v2
+    WHERE analysis_section_id='section_current_manual'`).get();
+  assert.deepEqual({ ...lineage }, {
+    debt_state: "successor_required",
+    target_prompt_version: "transcript-claims-v13-gemini-schema-http400-fallback",
+    source_prompt_version: prompt,
+    source_attempt_count: 1,
+    source_error_code: "manual_gate",
+  });
+  assert.deepEqual({ ...db.prepare(`SELECT status,attempt_count,error_code FROM transcript_analysis_sections
+    WHERE analysis_section_id='section_current_manual'`).get() }, {
+    status: "failed", attempt_count: 1, error_code: "manual_gate",
+  });
 });

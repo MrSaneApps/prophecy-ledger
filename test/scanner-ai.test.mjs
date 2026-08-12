@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import {
-  compareVideoClaims, extractPublicVideoClaims, extractTranscriptClaims, triageDescription,
+  compareVideoClaims, createGeminiGatewayTextRunner, extractPublicVideoClaims, extractTranscriptClaims, triageDescription,
   primaryVideoPrompt, verifyPublicVideoClaims,
 } from "../scanner/src/ai.js";
 
@@ -45,6 +45,11 @@ test("description triage produces only a neutral lead and never an exact quote o
   assert.equal("exactQuote" in result, false);
   assert.equal("outcome" in result, false);
   assert.equal(fake.calls[0].input.response_format.type, "json_schema");
+  assert.equal(fake.calls[0].input.max_tokens, 16_384);
+  assert.equal(fake.calls[0].input.response_format.json_schema.type, "object");
+  assert.deepEqual(fake.calls[0].input.response_format.json_schema.required,
+    ["category", "neutralParaphrase"]);
+  assert.equal("schema" in fake.calls[0].input.response_format.json_schema, false);
 });
 
 test("missing first-party description is honestly not enough information without calling AI", async () => {
@@ -60,6 +65,7 @@ test("verified transcript extraction requires exact quotes and offsets and remov
   const result = await extractTranscriptClaims(ai([{ candidates: [candidate, candidate] }]), { transcript, models: ["primary"] });
   assert.equal(result.candidates.length, 1);
   assert.equal(result.candidates[0].quote, quote);
+  assert.equal(result.model, "primary");
 });
 
 test("a unique exact quote gets deterministic offsets when the model's offset arithmetic is wrong", async () => {
@@ -211,17 +217,118 @@ test("model availability failure uses one configured fallback and total loss sta
   await assert.rejects(() => triageDescription(ai([unavailable, unavailable]), { title: "x", description: "y", models: ["a", "b"] }), /ai_unavailable/);
 });
 
+test("schema and plain invalid JSON fall through to the next model and remain retryable", async () => {
+  const fallback = ai([
+    "primary schema is not json", "primary plain is still not json",
+    { category: "not_enough_information", neutralParaphrase: null },
+  ]);
+  const receipts = [];
+  const result = await triageDescription(fallback, {
+    title: "x", description: "y", models: ["primary", "fallback"],
+    onAttempt: async (receipt) => receipts.push(receipt),
+  });
+  assert.equal(result.model, "fallback");
+  assert.deepEqual(fallback.calls.map((call) => call.model), ["primary", "primary", "fallback"]);
+  assert.deepEqual(receipts.filter((receipt) => receipt.status === "failed")
+    .map((receipt) => [receipt.modelName, receipt.mode, receipt.safeCauseCode,
+      receipt.fallbackEligible]), [
+    ["primary", "json_schema", "invalid_json", true],
+    ["primary", "plain_json", "invalid_json", true],
+  ]);
+
+  const failed = ai(["bad", "bad", "bad", "bad"]);
+  await assert.rejects(() => triageDescription(failed, {
+    title: "x", description: "y", models: ["primary", "fallback"],
+  }), (error) => error.message === "ai_unavailable" && error.code === "invalid_json"
+    && error.retryable === true);
+  assert.deepEqual(failed.calls.map((call) => call.model),
+    ["primary", "primary", "fallback", "fallback"]);
+});
+
+test("wrong-shaped transcript payload retries plain JSON before advancing and never records false completion", async () => {
+  const fake = ai([
+    "primary schema is not json",
+    "primary plain is still not json",
+    { answer: [] },
+    { candidates: [] },
+  ]);
+  const receipts = [];
+  const result = await extractTranscriptClaims(fake, {
+    transcript: "No concrete prediction here.", models: ["primary", "fallback"],
+    onAttempt: async (receipt) => receipts.push(receipt),
+  });
+  assert.equal(result.model, "fallback");
+  assert.deepEqual(result.candidates, []);
+  assert.deepEqual(fake.calls.map((call) => [call.model,
+    call.input.response_format?.type || "plain_json"]), [
+    ["primary", "json_schema"],
+    ["primary", "plain_json"],
+    ["fallback", "json_schema"],
+    ["fallback", "plain_json"],
+  ]);
+  assert.deepEqual(receipts.filter((receipt) => receipt.status !== "started")
+    .map((receipt) => [receipt.modelName, receipt.mode, receipt.status,
+      receipt.safeCauseCode, receipt.fallbackEligible]), [
+    ["primary", "json_schema", "failed", "invalid_json", true],
+    ["primary", "plain_json", "failed", "invalid_json", true],
+    ["fallback", "json_schema", "failed", "invalid_payload", true],
+    ["fallback", "plain_json", "completed", null, false],
+  ]);
+  assert.equal(receipts.filter((receipt) => receipt.status === "completed").length, 1);
+});
+
 test("JSON Mode refusal retries the same Workers AI model with an explicit plain-JSON contract", async () => {
   const fake = ai([new Error("JSON Mode couldn't be met"), { candidates: [] }]);
-  const result = await extractTranscriptClaims(fake, { transcript: "No concrete prediction here.", models: ["primary"] });
+  const receipts = [];
+  const result = await extractTranscriptClaims(fake, { transcript: "No concrete prediction here.",
+    models: ["primary"], onAttempt: async (receipt) => receipts.push(receipt) });
   assert.equal(result.model, "primary");
   assert.equal(result.candidates.length, 0);
   assert.equal(fake.calls.length, 2);
   assert.equal(fake.calls[0].input.response_format.type, "json_schema");
   assert.equal("response_format" in fake.calls[1].input, false);
+  assert.deepEqual(receipts.map((receipt) => [receipt.mode, receipt.status, receipt.safeCauseCode]), [
+    ["json_schema", "started", null],
+    ["json_schema", "failed", "json_schema_unsupported"],
+    ["plain_json", "started", null],
+    ["plain_json", "completed", null],
+  ]);
 });
 
-test("a never-resolving primary model times out per model and falls back", async () => {
+test("Workers AI emits a durable-start event before an in-flight call has any terminal result", async () => {
+  let resolveRun;
+  const receipts = [];
+  const pending = {
+    run: () => new Promise((resolve) => { resolveRun = resolve; }),
+  };
+  const operation = extractTranscriptClaims(pending, {
+    transcript: "No concrete prediction here.", models: ["primary"], timeoutMs: 1_000,
+    onAttempt: async (receipt) => receipts.push(receipt),
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(receipts.map((receipt) => receipt.status), ["started"]);
+  assert.equal(receipts[0].completedAt, null);
+  resolveRun({ response: JSON.stringify({ candidates: [] }) });
+  await operation;
+  assert.deepEqual(receipts.map((receipt) => receipt.status), ["started", "completed"]);
+});
+
+test("Workers AI warning logs expose only safe cause metadata", async () => {
+  const originalWarn = console.warn;
+  const warnings = [];
+  console.warn = (...values) => warnings.push(values);
+  try {
+    const providerError = Object.assign(new Error("private transcript phrase must not leak"), { status: 503 });
+    await assert.rejects(() => triageDescription(ai([providerError]), {
+      title: "Title", description: "Private description", models: ["primary"],
+    }), /ai_unavailable/);
+  } finally { console.warn = originalWarn; }
+  const rendered = JSON.stringify(warnings);
+  assert.doesNotMatch(rendered, /private transcript phrase|Private description/);
+  assert.match(rendered, /provider_5xx/);
+});
+
+test("a never-resolving Workers AI call records an unconfirmed timeout and never starts fallback", async () => {
   const fake = {
     calls: [],
     run(model) {
@@ -230,11 +337,112 @@ test("a never-resolving primary model times out per model and falls back", async
       return Promise.resolve({ response: JSON.stringify({ category: "not_enough_information", neutralParaphrase: null }) });
     },
   };
-  const result = await triageDescription(fake, {
+  await assert.rejects(() => triageDescription(fake, {
     title: "Title", description: "Description", models: ["primary", "fallback"], timeoutMs: 5,
+  }), (error) => error.code === "ai_timeout_unconfirmed" && error.retryable === true);
+  assert.deepEqual(fake.calls, ["primary"]);
+});
+
+test("abortable Gemini text analysis records a confirmed timeout and safely completes fallback", async () => {
+  const calls = []; const receipts = [];
+  const runner = createGeminiGatewayTextRunner({
+    gatewayAccountId: "2c267ab06352ba2522114c3081a8c5fa", gatewayId: "default",
+    gatewayToken: "gateway-secret", useByok: true,
+    fetcher: async (_url, options) => {
+      const body = JSON.parse(options.body); calls.push({ body, headers: options.headers });
+      if (body.model === "slow-model") {
+        return new Promise((_resolve, reject) => options.signal.addEventListener("abort", () => {
+          reject(Object.assign(new Error("aborted"), { name: "AbortError" }));
+        }, { once: true }));
+      }
+      return geminiResponse({ category: "not_enough_information", neutralParaphrase: null }, "fast-model");
+    },
   });
-  assert.equal(result.model, "fallback");
-  assert.deepEqual(fake.calls, ["primary", "fallback"]);
+  const result = await triageDescription(runner, {
+    title: "Title", description: "Description", models: ["slow-model", "fast-model"], timeoutMs: 5,
+    onAttempt: async (receipt) => receipts.push(receipt),
+  });
+  assert.equal(result.provider, "gemini-ai-gateway");
+  assert.deepEqual(calls.map((call) => call.body.model), ["slow-model", "fast-model"]);
+  assert.deepEqual(receipts.map(({ status, safeCauseCode, fallbackEligible }) =>
+    ({ status, safeCauseCode, fallbackEligible })), [
+    { status: "started", safeCauseCode: null, fallbackEligible: false },
+    { status: "failed", safeCauseCode: "ai_timeout_confirmed", fallbackEligible: true },
+    { status: "started", safeCauseCode: null, fallbackEligible: false },
+    { status: "completed", safeCauseCode: null, fallbackEligible: false },
+  ]);
+  assert.equal(calls[1].headers["cf-aig-authorization"], "Bearer gateway-secret");
+  assert.equal(calls[1].headers["cf-aig-collect-log-payload"], "false");
+  assert.equal(calls[1].headers["x-goog-api-key"], undefined);
+  assert.match(calls[1].body.system_instruction, /Classify only the supplied/);
+  assert.match(calls[1].body.input, /Description/);
+  assert.equal(calls[1].body.store, false);
+});
+
+test("Gemini generic schema HTTP 400 falls back once to schema-free JSON", async () => {
+  const calls = []; const receipts = [];
+  const runner = createGeminiGatewayTextRunner({
+    gatewayAccountId: "2c267ab06352ba2522114c3081a8c5fa", gatewayId: "default",
+    gatewayToken: "gateway-secret", useByok: true,
+    fetcher: async (_url, options) => {
+      const body = JSON.parse(options.body); calls.push(body);
+      if (body.response_format?.[0]?.schema) {
+        return new Response(JSON.stringify({ error: {
+          message: "Request contains an invalid argument." } }), {
+          status: 400, headers: { "content-type": "application/json" },
+        });
+      }
+      return geminiTextResponse("```json\n{\"candidates\":[]}\n```");
+    },
+  });
+  const result = await extractTranscriptClaims(runner, {
+    transcript: "There is no bounded prediction in this test sentence.",
+    models: ["gemini-test"], onAttempt: async (receipt) => receipts.push(receipt),
+  });
+  assert.equal(result.candidates.length, 0);
+  assert.equal(calls.length, 2);
+  assert.ok(calls[0].response_format[0].schema);
+  assert.equal(calls[1].response_format[0].mime_type, "application/json");
+  assert.equal("schema" in calls[1].response_format[0], false);
+  assert.deepEqual(receipts.map(({ status, safeCauseCode, fallbackEligible, mode }) =>
+    ({ status, safeCauseCode, fallbackEligible, mode })), [
+    { status: "started", safeCauseCode: null, fallbackEligible: false, mode: "json_schema" },
+    { status: "failed", safeCauseCode: "unknown_provider_error", fallbackEligible: true,
+      mode: "json_schema" },
+    { status: "started", safeCauseCode: null, fallbackEligible: false, mode: "plain_json" },
+    { status: "completed", safeCauseCode: null, fallbackEligible: false, mode: "plain_json" },
+  ]);
+});
+
+test("unrelated Gemini HTTP 400 gets one bounded plain attempt then stays fail-closed", async () => {
+  const calls = []; const receipts = [];
+  const runner = createGeminiGatewayTextRunner({
+    gatewayAccountId: "2c267ab06352ba2522114c3081a8c5fa", gatewayId: "default",
+    gatewayToken: "gateway-secret", useByok: true,
+    fetcher: async (_url, options) => {
+      calls.push(JSON.parse(options.body));
+      return new Response(JSON.stringify({ error: { code: 400, status: "INVALID_ARGUMENT",
+        message: "Request contains an invalid model parameter." } }), {
+        status: 400, headers: { "content-type": "application/json" },
+      });
+    },
+  });
+  await assert.rejects(() => extractTranscriptClaims(runner, {
+    transcript: "No concrete prediction here.", models: ["gemini-test"],
+    onAttempt: async (receipt) => receipts.push(receipt),
+  }), (error) => error.message === "ai_unavailable" && error.code === "unknown_provider_error");
+  assert.equal(calls.length, 2);
+  assert.ok(calls[0].response_format[0].schema);
+  assert.equal("schema" in calls[1].response_format[0], false);
+  assert.deepEqual(receipts.map(({ status, safeCauseCode, fallbackEligible, mode }) =>
+    ({ status, safeCauseCode, fallbackEligible, mode })), [
+    { status: "started", safeCauseCode: null, fallbackEligible: false, mode: "json_schema" },
+    { status: "failed", safeCauseCode: "unknown_provider_error", fallbackEligible: true,
+      mode: "json_schema" },
+    { status: "started", safeCauseCode: null, fallbackEligible: false, mode: "plain_json" },
+    { status: "failed", safeCauseCode: "unknown_provider_error", fallbackEligible: false,
+      mode: "plain_json" },
+  ]);
 });
 
 const videoClaim = (overrides = {}) => ({
@@ -254,6 +462,13 @@ function geminiResponse(structured, model = "gemini-test") {
   return new Response(JSON.stringify({
     id: "interaction-1", model, status: "completed",
     steps: [{ type: "model_output", content: [{ type: "text", text: JSON.stringify(structured) }] }],
+  }), { status: 200, headers: { "content-type": "application/json" } });
+}
+
+function geminiTextResponse(text, model = "gemini-test") {
+  return new Response(JSON.stringify({
+    id: "interaction-plain", model, status: "completed",
+    steps: [{ type: "model_output", content: [{ type: "text", text }] }],
   }), { status: 200, headers: { "content-type": "application/json" } });
 }
 

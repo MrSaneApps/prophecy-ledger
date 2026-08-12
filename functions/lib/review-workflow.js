@@ -17,6 +17,13 @@ export class ReviewWorkflowError extends Error {
   constructor(code, message, status = 409) { super(message); this.code = code; this.status = status; }
 }
 
+function parseJsonArrayOfStrings(value) {
+  try {
+    const parsed = JSON.parse(value || "[]");
+    return Array.isArray(parsed) ? parsed.map(String) : [];
+  } catch { return []; }
+}
+
 async function all(statement) {
   const result = await statement.all();
   return result.results || [];
@@ -82,9 +89,26 @@ async function candidateWorkItems(db, reviewerId, now) {
                  (newer.created_at=assessment.created_at AND newer.assessment_id>assessment.assessment_id)))))
        AND NOT EXISTS (SELECT 1 FROM review_assignments own
          WHERE own.work_item_id=work.work_item_id AND own.reviewer_id=?1
-           AND own.status IN ('submitted','released'))
+           AND own.status='submitted'
+           AND (
+             work.work_type<>'claim_adjudication'
+             OR NOT EXISTS (
+               SELECT 1 FROM ai_draft_decisions draft
+               WHERE draft.claim_id=work.claim_id
+                 AND draft.created_at > COALESCE((
+                   SELECT MAX(review.created_at) FROM moderator_reviews review
+                   WHERE review.claim_id=work.claim_id AND review.reviewer_id=?1
+                 ), '')
+             )
+           ))
        AND NOT EXISTS (SELECT 1 FROM moderator_reviews review
-         WHERE work.claim_id IS NOT NULL AND review.claim_id=work.claim_id AND review.reviewer_id=?1)
+         WHERE work.claim_id IS NOT NULL AND review.claim_id=work.claim_id AND review.reviewer_id=?1
+           AND (
+             NOT EXISTS (SELECT 1 FROM ai_draft_decisions d WHERE d.claim_id=work.claim_id)
+             OR review.created_at >= (
+               SELECT MAX(d.created_at) FROM ai_draft_decisions d WHERE d.claim_id=work.claim_id
+             )
+           ))
        AND NOT EXISTS (SELECT 1 FROM candidate_review_decisions decision
          WHERE work.candidate_id IS NOT NULL AND decision.candidate_id=work.candidate_id
            AND decision.reviewer_id=?1)
@@ -106,15 +130,38 @@ async function candidateWorkItems(db, reviewerId, now) {
 
 async function tryLease(db, work, reviewerId, now, expiresAt) {
   const existing = await db.prepare(
-    `SELECT assignment_id FROM review_assignments
-     WHERE work_item_id=?1 AND reviewer_id=?2 AND status='leased' AND lease_expires_at<=?3`
-  ).bind(work.work_item_id, reviewerId, now).first();
+    `SELECT assignment_id, status, lease_expires_at FROM review_assignments
+     WHERE work_item_id=?1 AND reviewer_id=?2`
+  ).bind(work.work_item_id, reviewerId).first();
+  let renewSubmitted = false;
+  if (existing?.status === "submitted" && work.work_type === "claim_adjudication" && work.claim_id) {
+    const newerDraft = await db.prepare(
+      `SELECT 1 ok FROM ai_draft_decisions draft
+       WHERE draft.claim_id=?1
+         AND draft.created_at > COALESCE((
+           SELECT MAX(review.created_at) FROM moderator_reviews review
+           WHERE review.claim_id=?1 AND review.reviewer_id=?2
+         ), '')`
+    ).bind(work.claim_id, reviewerId).first();
+    renewSubmitted = Boolean(newerDraft);
+  }
   const assignmentId = existing?.assignment_id || `assignment_${crypto.randomUUID()}`;
   const auditId = `audit_${crypto.randomUUID()}`;
-  const statement = existing
+  const shouldRenew = existing && (
+    existing.status === "released"
+    || (existing.status === "leased" && existing.lease_expires_at <= now)
+    || renewSubmitted
+  );
+  // assigned_at is identity-immutable (DB trigger). Renewals only touch lease fields.
+  const statement = shouldRenew
     ? db.prepare(
-      `UPDATE review_assignments SET lease_expires_at=?1,lease_version=lease_version+1
-       WHERE assignment_id=?2 AND status='leased' AND lease_expires_at<=?3`
+      `UPDATE review_assignments SET status='leased',submitted_at=NULL,
+        lease_expires_at=?1,lease_version=lease_version+1
+       WHERE assignment_id=?2 AND (
+         status='released'
+         OR (status='leased' AND lease_expires_at<=?3)
+         OR status='submitted'
+       )`
     ).bind(expiresAt, assignmentId, now)
     : db.prepare(
       `INSERT OR IGNORE INTO review_assignments
@@ -181,6 +228,81 @@ function nextAction(row) {
   if (row.work_status === "complete" || row.visibility === "published") return "complete";
   if (row.assignment_status === "submitted") return "await_matching_review";
   return row.work_type === "candidate_verification" ? "verify_candidate" : "review_claim";
+}
+
+export async function switchLease(db, reviewerId, workItemId, env, now = new Date().toISOString()) {
+  const targets = (await candidateWorkItems(db, reviewerId, now))
+    .filter((work) => work.work_item_id === workItemId);
+  if (!targets.length) {
+    throw new ReviewWorkflowError("work_unavailable",
+      "That claim is not ready for review or is already fully reviewed.", 409);
+  }
+  const current = await currentAssignment(db, reviewerId, now);
+  if (current && current.work_item_id !== workItemId) {
+    await db.batch([
+      db.prepare(
+        `UPDATE review_assignments SET status='released'
+         WHERE assignment_id=?1 AND reviewer_id=?2 AND status='leased'`
+      ).bind(current.assignment_id, reviewerId),
+      db.prepare(
+        `INSERT INTO review_audit_events
+         (audit_event_id,reviewer_id,event_type,work_item_id,claim_id,candidate_id,
+          assignment_id,detail_json,created_at)
+         VALUES (?1,?2,'assignment_released',?3,NULL,NULL,?4,'{}',?5)`
+      ).bind(`audit_${crypto.randomUUID()}`, reviewerId, current.work_item_id,
+        current.assignment_id, now),
+    ]);
+  } else if (current && current.work_item_id === workItemId) {
+    return db.prepare(
+      `SELECT assignment.assignment_id,assignment.work_item_id,assignment.status,
+        assignment.lease_expires_at,work.claim_id,work.candidate_id,work.work_type
+       FROM review_assignments assignment JOIN review_work_items work
+         ON work.work_item_id=assignment.work_item_id
+       WHERE assignment.assignment_id=?1`
+    ).bind(current.assignment_id).first();
+  }
+  const expiresAt = plusSeconds(now, leaseSeconds(env));
+  const assignmentId = await tryLease(db, targets[0], reviewerId, now, expiresAt);
+  if (!assignmentId) {
+    throw new ReviewWorkflowError("work_unavailable", "The claim was taken just now. Refresh the list.", 409);
+  }
+  return db.prepare(
+    `SELECT assignment.assignment_id,assignment.work_item_id,assignment.status,
+      assignment.lease_expires_at,work.claim_id,work.candidate_id,work.work_type
+     FROM review_assignments assignment JOIN review_work_items work
+       ON work.work_item_id=assignment.work_item_id WHERE assignment.assignment_id=?1`
+  ).bind(assignmentId).first();
+}
+
+export async function listAllClaimWork(db, now = new Date().toISOString()) {
+  const rows = await all(db.prepare(
+    `SELECT work.work_item_id,claim.claim_id,claim.title,person.display_name person,
+      claim.source_date,claim.deadline,claim.visibility,claim.lifecycle_status,
+      (SELECT COUNT(*) FROM moderator_reviews review WHERE review.claim_id=claim.claim_id) reviews,
+      EXISTS (SELECT 1 FROM ai_draft_decisions draft WHERE draft.claim_id=claim.claim_id) has_draft,
+      (work.status='ready' AND EXISTS (
+         SELECT 1 FROM ai_draft_decisions draft WHERE draft.claim_id=claim.claim_id
+       )) is_ready
+     FROM review_work_items work
+     JOIN claims claim ON claim.claim_id=work.claim_id
+     JOIN people person ON person.person_id=claim.person_id
+     WHERE work.work_type='claim_adjudication' AND work.status<>'withdrawn'
+     ORDER BY claim.source_date, claim.claim_id`
+  ));
+  return rows.map((row) => ({
+    workItemId: row.work_item_id,
+    claimId: row.claim_id,
+    title: row.title,
+    person: row.person,
+    sourceDate: row.source_date,
+    deadline: row.deadline,
+    reviews: Number(row.reviews || 0),
+    hasDraft: Boolean(row.has_draft),
+    state: row.visibility === "published" ? "decided"
+      : Number(row.reviews || 0) >= 2 ? "awaiting_reconciliation"
+      : !row.is_ready ? "in_preparation"
+      : Number(row.reviews || 0) === 1 ? "awaiting_second_review" : "ready",
+  }));
 }
 
 export async function listReviewerAssignments(db, reviewerId, now = new Date().toISOString()) {
@@ -309,9 +431,30 @@ export async function getAssignedReviewBundle(db, assignmentId, reviewerId, now 
   if (!claim) return null;
   const evidence = await all(db.prepare(
     `SELECT evidence_id,claim_id,evidence_role,url,title,published_at,accessed_at,
-      source_role,note,search_query,cutoff_date,verification_method,created_at
+      source_role,note,search_query,cutoff_date,verification_method,created_at,
+      supporting_excerpt,source_page
      FROM evidence WHERE claim_id=?1 ORDER BY created_at,evidence_id`
   ).bind(assignment.claim_id));
+  const draftRow = await db.prepare(
+    `SELECT draft_id,revision,claim_type,outcome_status,novelty_status,
+      baseline_probability,evidence_ids_json,prior_receipt_id,reasoning,
+      provenance,created_at
+     FROM ai_draft_decisions WHERE claim_id=?1
+     ORDER BY revision DESC LIMIT 1`
+  ).bind(assignment.claim_id).first();
+  const aiDraftDecision = draftRow ? {
+    draftId: draftRow.draft_id,
+    revision: draftRow.revision,
+    claimType: draftRow.claim_type,
+    outcomeStatus: draftRow.outcome_status,
+    noveltyStatus: draftRow.novelty_status,
+    baselineProbability: draftRow.baseline_probability == null ? null : Number(draftRow.baseline_probability),
+    evidenceIds: parseJsonArrayOfStrings(draftRow.evidence_ids_json),
+    priorReceiptId: draftRow.prior_receipt_id || null,
+    reasoning: draftRow.reasoning,
+    provenance: draftRow.provenance,
+    createdAt: draftRow.created_at,
+  } : null;
   const receipts = await all(db.prepare(
     `SELECT receipt_id,claim_id,cutoff_date,status,search_queries_json,
       sources_checked_json,method_note,completed_at,created_at
@@ -336,18 +479,19 @@ export async function getAssignedReviewBundle(db, assignmentId, reviewerId, now 
   return {
     assignment: assignmentProjection(assignment), subject: claim, evidence,
     priorInformationReceipts: receipts,
+    aiDraftDecision,
     candidateDecisionFields,
     reviewState: { ownSubmissionRecorded: Boolean(ownSubmitted), previousDecisionsBlinded: true },
   };
 }
 
-export async function submitAssignedClaimReview(db, assignmentId, reviewerId, review, now = new Date().toISOString()) {
+export async function submitAssignedClaimReview(db, assignmentId, reviewerId, review, now = new Date().toISOString(), sendback = null) {
   const assignment = await assignmentForAccess(db, assignmentId, reviewerId, now, false);
   if (!assignment || assignment.work_type !== "claim_adjudication") {
     throw new ReviewWorkflowError("assignment_required", "A live claim assignment is required.", 404);
   }
   const reviewId = `review_${crypto.randomUUID()}`;
-  await db.batch([
+  const statements = [
     db.prepare(
       `INSERT INTO moderator_reviews
        (review_id,claim_id,reviewer_id,claim_type,outcome_status,novelty_status,
@@ -364,16 +508,42 @@ export async function submitAssignedClaimReview(db, assignmentId, reviewerId, re
       `INSERT INTO claim_events (event_id,claim_id,event_type,actor_id,detail_json,created_at)
        VALUES (?1,?2,'review_submitted',?3,?4,?5)`
     ).bind(`event_${crypto.randomUUID()}`, assignment.claim_id, reviewerId,
-      JSON.stringify({ reviewId, assignmentId }), now),
+      JSON.stringify({ reviewId, assignmentId, sendback: Boolean(sendback) }), now),
     db.prepare(
       `INSERT INTO review_audit_events
        (audit_event_id,reviewer_id,event_type,work_item_id,claim_id,candidate_id,
         assignment_id,detail_json,created_at)
-       VALUES (?1,?2,'submission_accepted',?3,?4,NULL,?5,'{}',?6)`
+       VALUES (?1,?2,'submission_accepted',?3,?4,NULL,?5,?6,?7)`
     ).bind(`audit_${crypto.randomUUID()}`, reviewerId, assignment.work_item_id,
-      assignment.claim_id, assignmentId, now),
-  ]);
-  return { reviewId, claimId: assignment.claim_id };
+      assignment.claim_id, assignmentId, JSON.stringify({ sendback: Boolean(sendback) }), now),
+  ];
+  if (sendback) {
+    const lesson = String(sendback.lesson || review.rationale || "").trim().slice(0, 500);
+    statements.push(db.prepare(
+      `INSERT INTO research_sendbacks
+       (sendback_id,claim_id,draft_id,draft_revision,review_id,reviewer_id,
+        rejected_outcome,disagreed_outcome,rationale,lesson,created_at)
+       VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)`
+    ).bind(
+      `sendback_${crypto.randomUUID()}`, assignment.claim_id, sendback.draftId,
+      sendback.draftRevision, reviewId, reviewerId, sendback.rejectedOutcome,
+      review.outcomeStatus, review.rationale, lesson, now,
+    ));
+    statements.push(db.prepare(
+      `INSERT INTO claim_events (event_id,claim_id,event_type,actor_id,detail_json,created_at)
+       VALUES (?1,?2,'correction',?3,?4,?5)`
+    ).bind(`event_${crypto.randomUUID()}`, assignment.claim_id, reviewerId,
+      JSON.stringify({
+        reviewId, draftId: sendback.draftId, rejectedOutcome: sendback.rejectedOutcome,
+        disagreedOutcome: review.outcomeStatus,
+      }), now));
+    statements.push(db.prepare(
+      `UPDATE publication_evaluations SET state='needed',last_attempt_at=?1,
+        last_error_code='research_sendback' WHERE claim_id=?2`
+    ).bind(now, assignment.claim_id));
+  }
+  await db.batch(statements);
+  return { reviewId, claimId: assignment.claim_id, sendbackRecorded: Boolean(sendback) };
 }
 
 function cleanText(value, code, { min = 1, max = 2_000 } = {}) {
@@ -552,15 +722,30 @@ export async function submitCandidateDecision(db, assignmentId, reviewerId, deci
 }
 
 export async function hasReviewerSubmission(db, assignmentId, reviewerId) {
-  const row = await db.prepare(
-    `SELECT work.work_type,
-      EXISTS(SELECT 1 FROM moderator_reviews review
-        WHERE review.claim_id=work.claim_id AND review.reviewer_id=?2) claim_submitted,
-      EXISTS(SELECT 1 FROM candidate_review_decisions decision
-        WHERE decision.candidate_id=work.candidate_id AND decision.reviewer_id=?2) candidate_submitted
-     FROM review_assignments assignment JOIN review_work_items work
-       ON work.work_item_id=assignment.work_item_id
+  const assignment = await db.prepare(
+    `SELECT work.work_type, work.claim_id, work.candidate_id
+     FROM review_assignments assignment
+     JOIN review_work_items work ON work.work_item_id=assignment.work_item_id
      WHERE assignment.assignment_id=?1 AND assignment.reviewer_id=?2`
   ).bind(assignmentId, reviewerId).first();
-  return Boolean(row && (row.claim_submitted || row.candidate_submitted));
+  if (!assignment) return false;
+  if (assignment.work_type === "claim_adjudication" && assignment.claim_id) {
+    const latestDraft = await db.prepare(
+      `SELECT created_at FROM ai_draft_decisions WHERE claim_id=?1 ORDER BY revision DESC LIMIT 1`
+    ).bind(assignment.claim_id).first();
+    const row = latestDraft?.created_at
+      ? await db.prepare(
+        `SELECT 1 present FROM moderator_reviews
+         WHERE claim_id=?1 AND reviewer_id=?2 AND created_at>=?3`
+      ).bind(assignment.claim_id, reviewerId, latestDraft.created_at).first()
+      : await db.prepare(
+        `SELECT 1 present FROM moderator_reviews WHERE claim_id=?1 AND reviewer_id=?2`
+      ).bind(assignment.claim_id, reviewerId).first();
+    return Boolean(row);
+  }
+  const row = await db.prepare(
+    `SELECT 1 present FROM candidate_review_decisions
+     WHERE candidate_id=?1 AND reviewer_id=?2`
+  ).bind(assignment.candidate_id, reviewerId).first();
+  return Boolean(row);
 }

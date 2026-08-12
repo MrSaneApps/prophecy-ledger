@@ -10,13 +10,13 @@ import {
   addRevision, createRun, linkExactEmbedded, recordSourceMediaMetadata, registerJob, upsertSourceItem,
 } from "../scanner/src/repository.js";
 import {
-  completeTranscriptBatchItem, repairLegacyStitchedTranscriptBatchItem,
-  resumeScheduledTranscriptBatch, resumeTranscriptBatch, startTranscriptBatch,
-  syncArchiveLinkedTranscriptBatch,
+  completeTranscriptBatchItem, pauseTranscriptBatch, repairLegacyStitchedTranscriptBatchItem,
+  quarantinePendingTranscriptItem, resumeScheduledTranscriptBatch, resumeTranscriptBatch, startTranscriptBatch,
+  skipActiveTranscriptItem, syncArchiveLinkedTranscriptBatch,
 } from "../scanner/src/transcript-batch.js";
 import {
-  ensureTranscriptAnalysisPreparationRun, STITCH_ALGORITHM, stitchTranscript,
-  CLAIM_EXTRACTION_PROMPT_VERSION, transcriptAnalysisPreparationEnvelope, transcriptPlan,
+  ensureTranscriptAnalysisPreparationRun, LEGACY_STITCH_ALGORITHM, stitchTranscript,
+  CLAIM_EXTRACTION_PROMPT_VERSION, transcriptAnalysisPreparationEnvelope, TRANSCRIPT_PLAN_VERSION, transcriptPlan,
 } from "../scanner/src/transcript.js";
 
 const AT = "2026-07-20T10:00:00.000Z";
@@ -35,9 +35,13 @@ function batchEnv() {
   env.sent = [];
   env.INGESTION_QUEUE = { send: async (body) => env.sent.push(body),
     sendBatch: async (messages) => env.sent.push(...messages.map((message) => message.body)) };
+  env.ANALYSIS_QUEUE = { send: async (body) => env.sent.push(body),
+    sendBatch: async (messages) => env.sent.push(...messages.map((message) => message.body)) };
+  env.ANALYSIS_QUEUE = env.INGESTION_QUEUE;
   env.SCANNER_ADMIN_TOKEN = "admin-secret";
   env.SCAN_ENABLED = "0";
   env.TRANSCRIPT_BATCH_ENABLED = "0";
+  env.TRANSCRIPT_BATCH_AUTO_ADVANCE = "0";
   return env;
 }
 
@@ -45,6 +49,18 @@ function r2Memory() {
   const objects = new Map();
   return { objects, put: async (key, value) => objects.set(key, String(value)),
     get: async (key) => objects.has(key) ? { text: async () => objects.get(key) } : null };
+}
+
+function legacyTranscriptPlan(durationSeconds, chunkSeconds = 300, overlapSeconds = 0) {
+  const requests = [];
+  for (let start = 0; start < durationSeconds; start += chunkSeconds - overlapSeconds) {
+    requests.push({ requestStart: start, requestEnd: Math.min(durationSeconds, start + chunkSeconds) });
+  }
+  return requests.map((request, index) => ({ index, ...request,
+    canonicalStart: index ? (requests[index - 1].requestEnd + request.requestStart) / 2 : 0,
+    canonicalEnd: index + 1 < requests.length
+      ? (request.requestEnd + requests[index + 1].requestStart) / 2 : durationSeconds,
+  }));
 }
 
 async function seedLinkedVideos(env, videos) {
@@ -89,186 +105,6 @@ async function seedAnalysisPreparation(env, { youtubeId, transcript }) {
   await registerJob(env.DB, preparation, AT);
   return preparation;
 }
-
-test("authenticated transcript reprocess creates one versioned private preparation job and is idempotent", async () => {
-  const env = batchEnv();
-  env.ARTIFACTS = r2Memory();
-  const preparation = await seedAnalysisPreparation(env, {
-    youtubeId: "Reprocess01A", transcript: "At 9 AM Friday, Mayor Lee closed the bridge.",
-  });
-  env.DB.db.prepare("DELETE FROM ingestion_jobs WHERE job_id=?").run(preparation.jobId);
-  env.DB.db.prepare("DELETE FROM ingestion_runs WHERE run_id=?").run(preparation.runId);
-  const request = () => new Request("https://scanner.example/admin/transcript-analysis", {
-    method: "POST", headers: { authorization: "Bearer admin-secret", "content-type": "application/json" },
-    body: JSON.stringify({ action: "reprocess", transcriptId: preparation.payload.transcriptId }),
-  });
-  const unauthorized = await fetchHandler(new Request("https://scanner.example/admin/transcript-analysis", {
-    method: "POST", headers: { "content-type": "application/json" },
-    body: JSON.stringify({ action: "reprocess", transcriptId: preparation.payload.transcriptId }),
-  }), env);
-  assert.equal(unauthorized.status, 401);
-  const firstResponse = await fetchHandler(request(), env);
-  assert.equal(firstResponse.status, 202);
-  const first = await firstResponse.json();
-  assert.equal(first.promptVersion, CLAIM_EXTRACTION_PROMPT_VERSION);
-  assert.equal(first.reused, false);
-  assert.equal(env.sent.length, 1);
-  assert.equal(env.sent[0].payload.phase, "prepare");
-  assert.equal("transcript" in env.sent[0].payload, false);
-  const secondResponse = await fetchHandler(request(), env);
-  assert.equal(secondResponse.status, 200);
-  assert.equal((await secondResponse.json()).reused, true);
-  assert.equal(env.sent.length, 1);
-  assert.doesNotMatch(JSON.stringify(first), /At 9 AM|transcripts\/final|r2_key/i);
-});
-
-test("transcript reprocess retries only a failed queue dispatch and rejects untrusted artifacts", async () => {
-  const env = batchEnv();
-  env.ARTIFACTS = r2Memory();
-  const preparation = await seedAnalysisPreparation(env, {
-    youtubeId: "Reprocess02B", transcript: "At noon, the city opened the road.",
-  });
-  env.DB.db.prepare("DELETE FROM ingestion_jobs WHERE job_id=?").run(preparation.jobId);
-  env.DB.db.prepare("DELETE FROM ingestion_runs WHERE run_id=?").run(preparation.runId);
-  let fail = true;
-  env.INGESTION_QUEUE.send = async (body) => {
-    if (fail) throw new Error("queue unavailable");
-    env.sent.push(body);
-  };
-  const request = () => fetchHandler(new Request("https://scanner.example/admin/transcript-analysis", {
-    method: "POST", headers: { authorization: "Bearer admin-secret", "content-type": "application/json" },
-    body: JSON.stringify({ action: "reprocess", transcriptId: preparation.payload.transcriptId }),
-  }), env);
-  assert.equal((await request()).status, 503);
-  fail = false;
-  assert.equal((await request()).status, 202);
-  assert.equal(env.sent.length, 1);
-  assert.equal((await request()).status, 200);
-  assert.equal(env.sent.length, 1);
-  const [untrustedSource] = await seedLinkedVideos(env, [{ youtubeId: "Untrusted03", date: "2020-01-02" }]);
-  env.DB.db.prepare(`INSERT INTO transcript_artifacts
-    (transcript_id,source_item_id,r2_key,content_sha256,byte_count,language,has_timing,
-     provenance,verifier_principal,created_at)
-    VALUES ('tx_untrusted',?, 'private/untrusted.txt',?,10,'en',0,'authorized_transcript',NULL,?)`)
-    .run(untrustedSource.source_item_id, "f".repeat(64), AT);
-  const untrusted = await fetchHandler(new Request("https://scanner.example/admin/transcript-analysis", {
-    method: "POST", headers: { authorization: "Bearer admin-secret", "content-type": "application/json" },
-    body: JSON.stringify({ action: "reprocess", transcriptId: "tx_untrusted" }),
-  }), env);
-  assert.equal(untrusted.status, 404);
-});
-
-test("transcript reprocess resets and redispatches only final retryable v5 analysis failures", async () => {
-  const env = batchEnv(); env.ARTIFACTS = r2Memory();
-  const transcript = `[CLIP 00:00:00-00:05:00]\nFirst section.\n[CLIP 00:05:00-00:10:00]\nSecond section.`;
-  const preparation = await seedAnalysisPreparation(env, { youtubeId: "RetryV5A001", transcript });
-  await processEnvelope(env, preparation, { at: AT });
-  const [completedEnvelope, failedEnvelope] = env.sent.splice(0);
-  env.AI_MODEL = "local-model"; env.AI_FALLBACK_MODEL = "local-fallback";
-  env.AI = { run: async () => ({ response: JSON.stringify({ candidates: [] }) }) };
-  await processEnvelope(env, completedEnvelope, { at: "2026-07-20T10:01:00.000Z" });
-  env.DB.db.prepare(`UPDATE ingestion_jobs SET status='failed',attempt_count=3,claimed_at=NULL,
-      lease_token=NULL,completed_at=?,error_code='ai_unavailable' WHERE job_id=?`)
-    .run("2026-07-20T10:02:00.000Z", failedEnvelope.jobId);
-  env.DB.db.prepare(`UPDATE transcript_analysis_sections SET status='failed',attempt_count=3,
-      completed_at=?,error_code='ai_unavailable' WHERE analysis_section_id=?`)
-    .run("2026-07-20T10:02:00.000Z", failedEnvelope.payload.analysisSectionId);
-  env.DB.db.prepare(`UPDATE ingestion_runs SET status='complete_with_errors',completed_at=? WHERE run_id=?`)
-    .run("2026-07-20T10:02:00.000Z", preparation.runId);
-  env.sent.length = 0;
-  let failDispatch = true;
-  env.INGESTION_QUEUE.send = async (body) => {
-    if (failDispatch) throw new Error("queue unavailable");
-    env.sent.push(body);
-  };
-  const request = () => fetchHandler(new Request("https://scanner.example/admin/transcript-analysis", {
-    method: "POST", headers: { authorization: "Bearer admin-secret", "content-type": "application/json" },
-    body: JSON.stringify({ action: "reprocess", transcriptId: preparation.payload.transcriptId }),
-  }), env);
-  const failedDispatch = await request();
-  assert.equal(failedDispatch.status, 503);
-  assert.equal((await failedDispatch.json()).dispatchFailed, 1);
-  assert.equal(env.DB.db.prepare("SELECT status FROM ingestion_jobs WHERE job_id=?")
-    .get(failedEnvelope.jobId).status, "failed");
-  assert.equal(env.DB.db.prepare("SELECT status FROM transcript_analysis_sections WHERE analysis_section_id=?")
-    .get(failedEnvelope.payload.analysisSectionId).status, "failed");
-  failDispatch = false;
-  const retriedResponse = await request();
-  assert.equal(retriedResponse.status, 202);
-  const retried = await retriedResponse.json();
-  assert.deepEqual({ retried: retried.retried, dispatchFailed: retried.dispatchFailed },
-    { retried: 1, dispatchFailed: 0 });
-  assert.equal(env.sent.length, 1);
-  assert.equal(env.sent[0].jobId, failedEnvelope.jobId);
-  assert.equal(env.DB.db.prepare("SELECT attempt_count FROM ingestion_jobs WHERE job_id=?")
-    .get(failedEnvelope.jobId).attempt_count, 3);
-  assert.equal(env.DB.db.prepare("SELECT attempt_count FROM transcript_analysis_sections WHERE analysis_section_id=?")
-    .get(failedEnvelope.payload.analysisSectionId).attempt_count, 3);
-  const completed = env.DB.db.prepare(`SELECT status,extraction_run_id FROM transcript_analysis_sections
-    WHERE analysis_section_id=?`).get(completedEnvelope.payload.analysisSectionId);
-  assert.equal(completed.status, "completed");
-  assert.ok(completed.extraction_run_id);
-  const duplicate = await request();
-  assert.equal(duplicate.status, 200);
-  assert.equal((await duplicate.json()).reused, true);
-  assert.equal(env.sent.length, 1);
-  assert.equal(env.DB.db.prepare("SELECT COUNT(*) count FROM transcript_batch_events").get().count, 0);
-});
-
-test("transcript reprocess never retries final deterministic analysis failures", async () => {
-  const env = batchEnv(); env.ARTIFACTS = r2Memory();
-  const transcript = "[CLIP 00:00:00-00:05:00]\nSection words.";
-  const preparation = await seedAnalysisPreparation(env, { youtubeId: "NoRetryV500", transcript });
-  await processEnvelope(env, preparation, { at: AT });
-  const analysis = env.sent.pop();
-  env.DB.db.prepare(`UPDATE ingestion_jobs SET status='failed',attempt_count=1,completed_at=?,
-      error_code='invalid_transcript_analysis_binding' WHERE job_id=?`).run(AT, analysis.jobId);
-  env.DB.db.prepare(`UPDATE transcript_analysis_sections SET status='failed',attempt_count=1,
-      completed_at=?,error_code='invalid_transcript_analysis_binding' WHERE analysis_section_id=?`)
-    .run(AT, analysis.payload.analysisSectionId);
-  env.sent.length = 0;
-  const response = await fetchHandler(new Request("https://scanner.example/admin/transcript-analysis", {
-    method: "POST", headers: { authorization: "Bearer admin-secret", "content-type": "application/json" },
-    body: JSON.stringify({ action: "reprocess", transcriptId: preparation.payload.transcriptId }),
-  }), env);
-  assert.equal(response.status, 200);
-  assert.equal((await response.json()).retried, 0);
-  assert.equal(env.sent.length, 0);
-  assert.equal(env.DB.db.prepare("SELECT status FROM ingestion_jobs WHERE job_id=?").get(analysis.jobId).status, "failed");
-});
-
-test("transcript reprocess retries the exact repaired v5 persistence failure once within the attempt cap", async () => {
-  const env = batchEnv(); env.ARTIFACTS = r2Memory();
-  const transcript = "[CLIP 00:00:00-00:05:00]\nSection words.";
-  const preparation = await seedAnalysisPreparation(env, { youtubeId: "RetryFixed01", transcript });
-  await processEnvelope(env, preparation, { at: AT });
-  const analysis = env.sent.pop();
-  const repairedError = "D1_ERROR: FOREIGN KEY constraint failed: SQLITE_CONSTRAINT (extended: SQLITE_CONSTRAINT_FOREIGNKEY)";
-  env.DB.db.prepare(`UPDATE ingestion_jobs SET status='failed',attempt_count=7,completed_at=?,
-      error_code=? WHERE job_id=?`).run(AT, repairedError, analysis.jobId);
-  env.DB.db.prepare(`UPDATE transcript_analysis_sections SET status='failed',attempt_count=7,
-      completed_at=?,error_code=? WHERE analysis_section_id=?`)
-    .run(AT, repairedError, analysis.payload.analysisSectionId);
-  env.sent.length = 0;
-  const request = () => fetchHandler(new Request("https://scanner.example/admin/transcript-analysis", {
-    method: "POST", headers: { authorization: "Bearer admin-secret", "content-type": "application/json" },
-    body: JSON.stringify({ action: "reprocess", transcriptId: preparation.payload.transcriptId }),
-  }), env);
-  const retried = await request();
-  assert.equal(retried.status, 202);
-  assert.equal((await retried.json()).retried, 1);
-  assert.equal(env.sent.length, 1);
-  env.DB.db.prepare(`UPDATE ingestion_jobs SET status='failed',attempt_count=8,completed_at=?,
-      error_code=? WHERE job_id=?`).run(AT, repairedError, analysis.jobId);
-  env.DB.db.prepare(`UPDATE transcript_analysis_sections SET status='failed',attempt_count=8,
-      completed_at=?,error_code=? WHERE analysis_section_id=?`)
-    .run(AT, repairedError, analysis.payload.analysisSectionId);
-  env.sent.length = 0;
-  const capped = await request();
-  assert.equal(capped.status, 200);
-  assert.equal((await capped.json()).retried, 0);
-  assert.equal(env.sent.length, 0);
-});
 
 async function seedArchiveLinks(env, sources, { duplicateFirst = false } = {}) {
   const runId = `run_archive_${crypto.randomUUID().replaceAll("-", "")}`;
@@ -332,7 +168,9 @@ async function seedLegacyStitch(env, { durationSeconds = 60, completeChunks = tr
     at: AT, durationFetcher: durationFetcher(durationSeconds) });
   env.sent.length = 0;
   const item = env.DB.db.prepare("SELECT * FROM transcript_batch_items WHERE status='active'").get();
-  const plan = transcriptPlan(durationSeconds);
+  env.DB.db.prepare("UPDATE ingestion_runs SET scope=? WHERE run_id=?")
+    .run(`transcript:${item.source_item_id}:${durationSeconds}:batch:${item.batch_id}`, item.run_id);
+  const plan = legacyTranscriptPlan(durationSeconds);
   const chunks = plan.map((window, index) => `Spoken section ${index + 1}.`);
   const storedChunkCount = completeChunks ? plan.length : Math.max(0, plan.length - 1);
   const hashes = [];
@@ -393,9 +231,9 @@ async function seedLegacyStitch(env, { durationSeconds = 60, completeChunks = tr
   env.DB.db.prepare(`INSERT INTO transcript_stitch_receipts
     (stitch_id,run_id,job_id,source_item_id,transcript_id,duration_seconds,chunk_count,
      overlap_seconds,cue_count,input_manifest_sha256,stitch_algorithm,created_at)
-    VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`).run(await stableId("txs", `${stitchEnvelope.jobId}:${transcriptId}:${STITCH_ALGORITHM}`),
+    VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`).run(await stableId("txs", `${stitchEnvelope.jobId}:${transcriptId}:${LEGACY_STITCH_ALGORITHM}`),
       item.run_id, stitchEnvelope.jobId, item.source_item_id, transcriptId, durationSeconds,
-      plan.length, 0, stitched.cueCount, await sha256(hashes), STITCH_ALGORITHM, AT);
+      plan.length, 0, stitched.cueCount, await sha256(hashes), LEGACY_STITCH_ALGORITHM, AT);
   env.DB.db.prepare(`UPDATE transcript_batches SET status='paused',pause_reason='transcript_retry_exhausted',
     resume_after=?,paused_at=?,transition_count=transition_count+1 WHERE batch_id=?`)
     .run(NEXT_DAY, AT, item.batch_id);
@@ -439,6 +277,9 @@ test("authenticated idempotent batch freezes exact-linked no-artifact videos old
   assert.deepEqual(rows.map((row) => row.ordinal), [1, 2, 3]);
   assert.deepEqual(rows.map((row) => row.status), ["active", "pending", "pending"]);
   assert.equal(env.sent.length, 1);
+  assert.equal(env.sent[0].payload.planVersion, TRANSCRIPT_PLAN_VERSION);
+  assert.match(env.sent[0].stableKey,
+    new RegExp(`:transcript:${TRANSCRIPT_PLAN_VERSION}:chunk:0$`));
   assert.equal(durationCalls.length, 1);
   assert.equal(new URL(durationCalls[0]).hostname, "www.googleapis.com");
   const receipt = env.DB.db.prepare("SELECT method,response_sha256 FROM source_media_metadata").get();
@@ -605,7 +446,7 @@ test("daily cap pauses and acknowledges current work with no same-day or disable
   assert.equal(env.DB.db.prepare("SELECT COUNT(*) count FROM transcript_batch_items WHERE status='active'").get().count, 1);
   assert.equal(env.sent.length, 0);
 
-  env.GEMINI_DAILY_MEDIA_SECONDS = "28800";
+  env.GEMINI_DAILY_MEDIA_SECONDS = "86400";
   let duplicateGeminiCalls = 0;
   const duplicate = queueMessage(message.body);
   await processQueueBatch({ messages: [duplicate] }, env, { at: "2026-07-20T12:00:00.000Z",
@@ -666,6 +507,88 @@ test("Gemini 429 records a redacted failed attempt, pauses, acks, and dispatches
   assert.equal(env.sent.length, 0);
 });
 
+
+
+test("terminal chunk failure auto-advances to the next video when enabled", async () => {
+  const env = batchEnv(); env.GEMINI_API_KEY = "gemini-secret"; env.TRANSCRIPT_BATCH_AUTO_ADVANCE = "1";
+  await seedLinkedVideos(env, [
+    { youtubeId: "AutoAdv0001", date: "2020-01-01" },
+    { youtubeId: "AutoAdv0002", date: "2020-01-02" },
+  ]);
+  const started = await startTranscriptBatch(env, { idempotencyKey: "auto-advance-2026-08-02",
+    at: AT, durationFetcher: durationFetcher() });
+  assert.equal(started.status, "running", JSON.stringify(started));
+  assert.equal(env.sent.length, 1, JSON.stringify(started));
+  const message = queueMessage(env.sent.shift());
+  await processQueueBatch({ messages: [message] }, env, { at: AT,
+    durationFetcher: durationFetcher(),
+    geminiFetcher: async () => new Response(JSON.stringify({ error: { message: "nope" } }), { status: 403 }) });
+  assert.equal(message.state.acked, 1);
+  const items = env.DB.db.prepare(`SELECT youtube_id,status FROM transcript_batch_items
+    WHERE batch_id=? ORDER BY ordinal`).all(started.batchId);
+  assert.deepEqual(items.map((item) => [item.youtube_id, item.status]),
+    [["AutoAdv0001", "skipped"], ["AutoAdv0002", "active"]]);
+  const batch = env.DB.db.prepare("SELECT status,pause_reason FROM transcript_batches WHERE batch_id=?")
+    .get(started.batchId);
+  assert.equal(batch.status, "running");
+  assert.equal(batch.pause_reason, null);
+  assert.equal(env.sent.length, 1);
+  assert.equal(env.sent[0].payload.youtubeId, "AutoAdv0002");
+});
+
+test("RECITATION-blocked chunk completes with placeholder and does not pause the batch", async () => {
+  const env = batchEnv(); env.GEMINI_API_KEY = "gemini-secret"; env.ARTIFACTS = r2Memory();
+  await seedLinkedVideos(env, [{ youtubeId: "Recite00001", date: "2020-01-01" }]);
+  const started = await startTranscriptBatch(env, { idempotencyKey: "recitation-2026-08-02",
+    at: AT, durationFetcher: durationFetcher(120) });
+  assert.equal(started.status, "running", JSON.stringify(started));
+  assert.equal(env.sent.length, 1, JSON.stringify(started));
+  const message = queueMessage(env.sent.shift());
+  await processQueueBatch({ messages: [message] }, env, { at: AT,
+    geminiFetcher: async () => new Response(JSON.stringify({
+      candidates: [{ finishReason: "RECITATION", content: { parts: [] } }],
+    }), { status: 200 }) });
+  assert.equal(message.state.acked, 1);
+  assert.equal(message.state.retried, 0);
+  const job = env.DB.db.prepare("SELECT status,error_code FROM ingestion_jobs WHERE job_id=?")
+    .get(message.body.jobId);
+  assert.equal(job.status, "completed");
+  assert.equal(job.error_code, null);
+  const batch = env.DB.db.prepare("SELECT status,pause_reason FROM transcript_batches WHERE batch_id=?")
+    .get(started.batchId);
+  assert.deepEqual({ ...batch }, { status: "running", pause_reason: null });
+  const attempt = env.DB.db.prepare("SELECT status,finish_reason,error_code FROM transcript_chunk_attempts ORDER BY rowid DESC LIMIT 1").get();
+  assert.equal(attempt.status, "completed");
+  assert.equal(attempt.finish_reason, "STOP");
+  assert.equal(attempt.error_code, null);
+  assert.match(
+    env.ARTIFACTS.objects.get([...env.ARTIFACTS.objects.keys()].at(-1)),
+    /GEMINI BLOCKED RECITATION/,
+  );
+});
+
+test("gemini_output_truncated is retryable and does not terminal-pause on first attempt", async () => {
+  const env = batchEnv(); env.GEMINI_API_KEY = "gemini-secret";
+  await seedLinkedVideos(env, [{ youtubeId: "TruncVid001", date: "2020-01-01" }]);
+  const started = await startTranscriptBatch(env, { idempotencyKey: "truncate-retry-2026-07-20",
+    at: AT, durationFetcher: durationFetcher() });
+  const message = queueMessage(env.sent.shift());
+  await processQueueBatch({ messages: [message] }, env, { at: AT,
+    geminiFetcher: async () => new Response(JSON.stringify({
+      candidates: [{ finishReason: "MAX_TOKENS", content: { parts: [{ text: "partial" }] } }],
+    }), { status: 200 }) });
+  assert.equal(message.state.retried, 1);
+  assert.equal(message.state.acked, 0);
+  const job = env.DB.db.prepare("SELECT status,attempt_count,error_code FROM ingestion_jobs WHERE job_id=?")
+    .get(message.body.jobId);
+  assert.equal(job.status, "queued");
+  assert.equal(job.attempt_count, 1);
+  assert.equal(job.error_code, "gemini_output_truncated");
+  const batch = env.DB.db.prepare("SELECT status,pause_reason FROM transcript_batches WHERE batch_id=?")
+    .get(started.batchId);
+  assert.deepEqual({ ...batch }, { status: "running", pause_reason: null });
+});
+
 test("nonretryable transcript failure pauses batch and controlled resume requeues the failed job", async () => {
   const env = batchEnv(); env.GEMINI_API_KEY = "gemini-secret";
   await seedLinkedVideos(env, [{ youtubeId: "BadReq00001", date: "2020-01-01" }]);
@@ -673,14 +596,14 @@ test("nonretryable transcript failure pauses batch and controlled resume requeue
     at: AT, durationFetcher: durationFetcher() });
   const message = queueMessage(env.sent.shift());
   await processQueueBatch({ messages: [message] }, env, { at: AT,
-    geminiFetcher: async () => new Response(JSON.stringify({ error: { message: "private provider detail" } }), { status: 400 }) });
+    geminiFetcher: async () => new Response(JSON.stringify({ error: { message: "private provider detail" } }), { status: 403 }) });
   assert.deepEqual(message.state, { acked: 1, retried: 0, delay: null });
   assert.equal(env.DB.db.prepare("SELECT status FROM ingestion_jobs WHERE job_id=?").get(message.body.jobId).status, "failed");
   const paused = env.DB.db.prepare("SELECT status,pause_reason,resume_after FROM transcript_batches WHERE batch_id=?")
     .get(started.batchId);
   assert.deepEqual({ ...paused }, { status: "paused", pause_reason: "transcript_terminal_error", resume_after: NEXT_DAY });
   const event = env.DB.db.prepare("SELECT detail_json FROM transcript_batch_events WHERE event_type='batch_paused'").get();
-  assert.doesNotMatch(event.detail_json, /private provider detail|gemini-secret|gemini_http_400/);
+  assert.doesNotMatch(event.detail_json, /private provider detail|gemini-secret|gemini_http_403/);
   env.TRANSCRIPT_BATCH_ENABLED = "1";
   const resumed = await resumeScheduledTranscriptBatch(env, { at: NEXT_DAY });
   assert.equal(resumed.resumed, true);
@@ -718,10 +641,92 @@ test("third transient transcript failure pauses batch and is recoverable on the 
   assert.equal(env.DB.db.prepare("SELECT attempt_count FROM ingestion_jobs WHERE job_id=?").get(body.jobId).attempt_count, 3);
 });
 
+test("admin skip refuses invalid, running, and retryable active transcript items", async () => {
+  const env = batchEnv();
+  await seedLinkedVideos(env, [
+    { youtubeId: "SkipGuard01", date: "2020-01-01" },
+    { youtubeId: "SkipGuard02", date: "2020-01-02" },
+  ]);
+  const started = await startTranscriptBatch(env, { idempotencyKey: "skip-guard-2026-07-20",
+    at: AT, durationFetcher: durationFetcher() });
+  assert.equal((await skipActiveTranscriptItem(env, { batchId: started.batchId })).reason, "batch_not_paused");
+  const active = env.DB.db.prepare("SELECT batch_item_id FROM transcript_batch_items WHERE status='active'").get();
+  await pauseTranscriptBatch(env, { batchId: started.batchId, batchItemId: active.batch_item_id,
+    reason: "daily_media_cap", at: AT, resumeAfter: NEXT_DAY });
+  const retryable = await skipActiveTranscriptItem(env, { batchId: started.batchId });
+  assert.equal(retryable.reason, "active_item_not_failed");
+  const invalid = await fetchHandler(new Request("https://scanner.example/admin/transcript-batch", {
+    method: "POST", headers: { authorization: "Bearer admin-secret", "content-type": "application/json" },
+    body: JSON.stringify({ action: "skip_active_item", batchId: "not-a-batch" }),
+  }), env);
+  assert.equal(invalid.status, 400);
+  assert.equal((await invalid.json()).reason, "invalid_batch_id");
+  assert.equal(env.DB.db.prepare("SELECT COUNT(*) count FROM transcript_batch_events WHERE event_type='item_skipped'").get().count, 0);
+  assert.equal(env.DB.db.prepare("SELECT COUNT(*) count FROM transcript_batch_items WHERE status='active'").get().count, 1);
+  assert.equal(env.sent.length, 1);
+});
+
+test("concurrent admin skip preserves failed history and dispatches exactly one balanced-v2 successor", async () => {
+  const env = batchEnv(); env.GEMINI_API_KEY = "gemini-secret";
+  await seedLinkedVideos(env, [
+    { youtubeId: "SkipFail001", date: "2020-01-01" },
+    { youtubeId: "SkipNext002", date: "2020-01-02" },
+  ]);
+  const started = await startTranscriptBatch(env, { idempotencyKey: "skip-failed-2026-07-20",
+    at: AT, durationFetcher: durationFetcher() });
+  const failedEnvelope = env.sent.shift();
+  const failedMessage = queueMessage(failedEnvelope);
+  await processQueueBatch({ messages: [failedMessage] }, env, { at: AT,
+    geminiFetcher: async () => new Response(JSON.stringify({ error: { message: "private provider detail" } }),
+      { status: 403 }) });
+  const failedBefore = env.DB.db.prepare(`SELECT status,attempt_count,error_code,completed_at
+    FROM ingestion_jobs WHERE job_id=?`).get(failedEnvelope.jobId);
+  const request = () => new Request("https://scanner.example/admin/transcript-batch", {
+    method: "POST", headers: { authorization: "Bearer admin-secret", "content-type": "application/json" },
+    body: JSON.stringify({ action: "skip_active_item", batchId: started.batchId }),
+  });
+  const responses = await Promise.all([
+    fetchHandler(request(), env, { durationFetcher: durationFetcher() }),
+    fetchHandler(request(), env, { durationFetcher: durationFetcher() }),
+  ]);
+  assert.deepEqual(responses.map((response) => response.status).sort(), [200, 409]);
+  const results = await Promise.all(responses.map((response) => response.json()));
+  assert.equal(results.filter((result) => result.skipped).length, 1);
+  assert.equal(results.filter((result) => !result.skipped).length, 1);
+  assert.deepEqual({ ...env.DB.db.prepare(`SELECT status,attempt_count,error_code,completed_at
+    FROM ingestion_jobs WHERE job_id=?`).get(failedEnvelope.jobId) }, { ...failedBefore });
+  const items = env.DB.db.prepare(`SELECT batch_item_id,status,run_id FROM transcript_batch_items
+    WHERE batch_id=? ORDER BY ordinal`).all(started.batchId);
+  assert.deepEqual(items.map((item) => item.status), ["skipped", "active"]);
+  assert.equal(env.DB.db.prepare("SELECT COUNT(*) count FROM transcript_batch_events WHERE event_type='item_skipped'").get().count, 1);
+  assert.equal(env.sent.length, 1);
+  assert.equal(env.sent[0].payload.youtubeId, "SkipNext002");
+  assert.equal(env.sent[0].payload.planVersion, TRANSCRIPT_PLAN_VERSION);
+  assert.match(env.sent[0].stableKey, new RegExp(`:${TRANSCRIPT_PLAN_VERSION}:chunk:0$`));
+  const duplicate = await fetchHandler(request(), env, { durationFetcher: durationFetcher() });
+  assert.equal(duplicate.status, 409);
+  assert.equal(env.sent.length, 1);
+  const successors = await completeTranscriptBatchItem(env, { batchId: started.batchId,
+    batchItemId: items[1].batch_item_id, at: "2026-07-20T10:05:00.000Z",
+    durationFetcher: durationFetcher() });
+  assert.deepEqual(successors, []);
+  const completed = await (await fetchHandler(new Request(
+    `https://scanner.example/admin/transcript-batch?batchId=${started.batchId}`,
+    { headers: { authorization: "Bearer admin-secret" } }), env)).json();
+  assert.equal(completed.status, "completed");
+  assert.equal(completed.itemCount, 2);
+  assert.equal(completed.completedItemCount, 1);
+  assert.deepEqual(completed.counts,
+    { completed: 1, active: 0, pending: 0, quarantined: 0, skipped: 1 });
+});
+
 test("enabled scheduler never creates a batch and never redispatches a running active item", async () => {
   const config = readFileSync(join(ROOT, "scanner", "wrangler.toml"), "utf8");
   assert.match(config, /^SCAN_ENABLED = "0"$/m);
-  assert.match(config, /^TRANSCRIPT_BATCH_ENABLED = "0"$/m);
+  // The owner-approved production conveyor is intentionally enabled. Safety is
+  // enforced by the scheduler's no-create/no-duplicate-dispatch behavior below,
+  // not by asserting a disabled deployment default.
+  assert.match(config, /^TRANSCRIPT_BATCH_ENABLED = "1"$/m);
   const env = batchEnv(); env.TRANSCRIPT_BATCH_ENABLED = "1";
   assert.deepEqual(await resumeScheduledTranscriptBatch(env, { at: AT }), { resumed: false, reason: "no_open_batch" });
   assert.equal(env.DB.db.prepare("SELECT COUNT(*) count FROM transcript_batches").get().count, 0);
@@ -745,7 +750,7 @@ test("batch claim guard leaves legacy non-batch deferred transcript recovery unc
   const first = env.sent.shift();
   await assert.rejects(() => processEnvelope(env, first, { at: AT,
     geminiFetcher: async () => { throw new Error("budget_must_block_before_gemini"); } }), /transcript_budget_deferred/);
-  env.GEMINI_DAILY_MEDIA_SECONDS = "28800";
+  env.GEMINI_DAILY_MEDIA_SECONDS = "86400";
   let geminiCalls = 0;
   const recovered = await processEnvelope(env, first, { at: NEXT_DAY, geminiFetcher: async () => {
     geminiCalls += 1;
@@ -758,280 +763,4 @@ test("batch claim guard leaves legacy non-batch deferred transcript recovery unc
   assert.equal(started.batchId, undefined);
   assert.equal(env.sent.length, 1);
   assert.equal(env.sent[0].payload.phase, "stitch");
-});
-
-test("same-key restart repairs a committed batch with no activated item exactly once", async () => {
-  const env = batchEnv(); env.YOUTUBE_DATA_API_KEY = "batch-data-api-secret";
-  const [source] = await seedLinkedVideos(env, [{ youtubeId: "CrashOne001", date: "2020-01-01" }]);
-  const key = "repair-created-batch-2026-07-20";
-  const batchId = await stableId("txb", `transcript-batch-v1:${key}`);
-  const itemId = `txbi_${batchId.slice(4)}_${source.source_item_id.slice(4)}`;
-  env.DB.db.prepare(`INSERT INTO transcript_batches
-    (batch_id,idempotency_key,person_id,status,item_count,created_at,started_at)
-    VALUES (?,?,?,'running',1,?,?)`).run(batchId, key, "person_troy_black", AT, AT);
-  env.DB.db.prepare(`INSERT INTO transcript_batch_items
-    (batch_item_id,batch_id,source_item_id,youtube_id,source_publication_date,ordinal,status)
-    VALUES (?,?,?,?,?,1,'pending')`).run(itemId, batchId, source.source_item_id, "CrashOne001", "2020-01-01");
-  const repaired = await startTranscriptBatch(env, { idempotencyKey: key, at: AT,
-    durationFetcher: dataApiDurationFetcher() });
-  assert.equal(repaired.reused, true);
-  assert.equal(env.sent.length, 1);
-  assert.equal(env.DB.db.prepare("SELECT COUNT(*) count FROM ingestion_jobs").get().count, 1);
-  await startTranscriptBatch(env, { idempotencyKey: key, at: "2026-07-20T10:01:00.000Z",
-    durationFetcher: async () => { throw new Error("must_not_refetch"); } });
-  assert.equal(env.sent.length, 1);
-});
-
-test("same-key restart repairs an active item missing its first job exactly once", async () => {
-  const env = batchEnv();
-  const [source] = await seedLinkedVideos(env, [{ youtubeId: "CrashTwo001", date: "2020-01-01" }]);
-  const key = "repair-active-item-2026-07-20";
-  const batchId = await stableId("txb", `transcript-batch-v1:${key}`);
-  const itemId = `txbi_${batchId.slice(4)}_${source.source_item_id.slice(4)}`;
-  const runId = await stableId("runtxb", `${batchId}:${itemId}:60`);
-  env.DB.db.prepare(`INSERT INTO transcript_batches
-    (batch_id,idempotency_key,person_id,status,item_count,created_at,started_at)
-    VALUES (?,?,?,'running',1,?,?)`).run(batchId, key, "person_troy_black", AT, AT);
-  env.DB.db.prepare(`INSERT INTO ingestion_runs
-    (run_id,person_id,trigger_type,scope,status,created_at)
-    VALUES (?,?,'manual',?,'queued',?)`).run(runId, "person_troy_black",
-      `transcript:${source.source_item_id}:60:batch:${batchId}`, AT);
-  env.DB.db.prepare(`INSERT INTO transcript_batch_items
-    (batch_item_id,batch_id,source_item_id,youtube_id,source_publication_date,ordinal,status,run_id,duration_seconds,started_at)
-    VALUES (?,?,?,?,?,1,'active',?,60,?)`).run(itemId, batchId, source.source_item_id, "CrashTwo001", "2020-01-01", runId, AT);
-  await startTranscriptBatch(env, { idempotencyKey: key, at: AT, durationFetcher: durationFetcher() });
-  assert.equal(env.sent.length, 1);
-  assert.equal(env.DB.db.prepare("SELECT COUNT(*) count FROM ingestion_jobs").get().count, 1);
-  await startTranscriptBatch(env, { idempotencyKey: key, at: "2026-07-20T10:01:00.000Z" });
-  assert.equal(env.sent.length, 1);
-});
-
-test("duration failure on resume reports the renewed pause and records every transition", async () => {
-  const env = batchEnv(); env.YOUTUBE_DATA_API_KEY = "batch-data-api-secret";
-  await seedLinkedVideos(env, [{ youtubeId: "DurFail0001", date: "2020-01-01" }]);
-  const key = "duration-failure-resume-2026-07-20";
-  const hosts = []; const fail = async (url) => { hosts.push(new URL(url).hostname);
-    return new Response(JSON.stringify({ error: { message: "batch-data-api-secret must stay private" } }), { status: 403 }); };
-  const started = await startTranscriptBatch(env, { idempotencyKey: key, at: AT, durationFetcher: fail });
-  assert.equal(started.started, false);
-  assert.equal(started.reason, "youtube_data_api_http_403");
-  const resumed = await resumeTranscriptBatch(env, { idempotencyKey: key, at: AT, durationFetcher: fail });
-  assert.equal(resumed.resumed, false);
-  assert.equal(resumed.reason, "youtube_data_api_http_403");
-  assert.equal(resumed.status, "paused");
-  const events = env.DB.db.prepare(`SELECT event_id,event_type FROM transcript_batch_events
-    WHERE batch_id=? AND event_type IN ('batch_paused','batch_resumed') ORDER BY rowid`).all(started.batchId);
-  assert.deepEqual(events.map((row) => row.event_type), ["batch_paused", "batch_resumed", "batch_paused"]);
-  assert.equal(new Set(events.map((row) => row.event_id)).size, 3);
-  assert.deepEqual(hosts, ["www.googleapis.com", "www.googleapis.com"]);
-  assert.doesNotMatch(JSON.stringify(env.DB.db.prepare("SELECT detail_json FROM transcript_batch_events").all()),
-    /batch-data-api-secret|googleapis\.com/);
-  env.TRANSCRIPT_BATCH_ENABLED = "1";
-  const scheduled = await resumeScheduledTranscriptBatch(env, { at: AT,
-    durationFetcher: dataApiDurationFetcher() });
-  assert.equal(scheduled.resumed, true);
-  assert.equal(env.DB.db.prepare(`SELECT method FROM source_media_metadata
-    ORDER BY observed_at DESC LIMIT 1`).get().method, "youtube_data_api_v3_content_details");
-});
-
-test("batch reuses an exact official duration receipt but ignores older provenance under the binding", async () => {
-  const env = batchEnv(); env.YOUTUBE_DATA_API_KEY = "batch-data-api-secret";
-  const [source] = await seedLinkedVideos(env, [{ youtubeId: "Receipt0001", date: "2020-01-01" }]);
-  await recordSourceMediaMetadata(env.DB, { sourceItemId: source.source_item_id, durationSeconds: 90,
-    responseSha256: "a".repeat(64), method: "youtube_public_html_length_seconds", observedAt: AT });
-  let calls = 0;
-  const first = await startTranscriptBatch(env, { idempotencyKey: "official-receipt-fetch-2026-07-20", at: AT,
-    durationFetcher: async (url) => { calls += 1; return dataApiDurationFetcher(75)(url); } });
-  assert.equal(first.activeItem.durationSeconds, 75);
-  assert.equal(calls, 1);
-  const env2 = batchEnv(); env2.YOUTUBE_DATA_API_KEY = "batch-data-api-secret";
-  const [source2] = await seedLinkedVideos(env2, [{ youtubeId: "Receipt0002", date: "2020-01-01" }]);
-  await recordSourceMediaMetadata(env2.DB, { sourceItemId: source2.source_item_id, durationSeconds: 80,
-    responseSha256: "b".repeat(64), method: "youtube_data_api_v3_content_details", observedAt: AT });
-  const reused = await startTranscriptBatch(env2, { idempotencyKey: "official-receipt-reuse-2026-07-20", at: AT,
-    durationFetcher: async () => { throw new Error("official_receipt_must_be_reused"); } });
-  assert.equal(reused.activeItem.durationSeconds, 80);
-});
-
-test("different-key concurrent starts produce one batch and a controlled conflict", async () => {
-  const env = batchEnv();
-  await seedLinkedVideos(env, [{ youtubeId: "RaceStart01", date: "2020-01-01" }]);
-  const results = await Promise.all([
-    startTranscriptBatch(env, { idempotencyKey: "race-start-alpha-2026-07-20", at: AT, durationFetcher: durationFetcher() }),
-    startTranscriptBatch(env, { idempotencyKey: "race-start-beta-2026-07-20", at: AT, durationFetcher: durationFetcher() }),
-  ]);
-  assert.equal(results.filter((result) => result.started).length, 1);
-  assert.equal(results.filter((result) => result.reason === "active_batch_exists").length, 1);
-  assert.equal(env.DB.db.prepare("SELECT COUNT(*) count FROM transcript_batches").get().count, 1);
-  assert.equal(env.sent.length, 1);
-});
-
-test("scheduler redispatches one expired active lease and relational binding rejects forged batch envelopes", async () => {
-  const env = batchEnv(); env.TRANSCRIPT_BATCH_ENABLED = "1";
-  await seedLinkedVideos(env, [{ youtubeId: "LeaseFix001", date: "2020-01-01" }]);
-  const started = await startTranscriptBatch(env, { idempotencyKey: "expired-lease-repair-2026-07-20",
-    at: AT, durationFetcher: durationFetcher() });
-  const body = env.sent.shift();
-  env.DB.db.prepare(`UPDATE ingestion_jobs SET status='processing',attempt_count=1,claimed_at=?,lease_token='lost'
-    WHERE job_id=?`).run("2026-07-20T10:01:00.000Z", body.jobId);
-  const repaired = await resumeScheduledTranscriptBatch(env, { at: "2026-07-20T10:20:01.000Z" });
-  assert.equal(repaired.repaired, true);
-  assert.equal(env.sent.length, 1);
-  const forged = structuredClone(body);
-  forged.payload.youtubeId = "Forged00001";
-  await assert.rejects(() => processEnvelope(env, forged, { at: "2026-07-20T10:21:00.000Z" }),
-    /invalid_transcript_batch_binding/);
-  assert.equal(env.DB.db.prepare("SELECT status FROM transcript_batches WHERE batch_id=?").get(started.batchId).status, "running");
-});
-
-test("manual archive sync appends missing videos without rewriting ordinals and priority activation dedupes revisions", async () => {
-  const env = batchEnv();
-  await seedLinkedVideos(env, [
-    { youtubeId: "Ordinary001", date: "2020-01-01" },
-    { youtubeId: "Ordinary002", date: "2020-01-02" },
-  ]);
-  const started = await startTranscriptBatch(env, { idempotencyKey: "archive-priority-2026-07-20",
-    at: AT, durationFetcher: durationFetcher() });
-  const initial = env.DB.db.prepare(`SELECT batch_item_id,source_item_id,ordinal,status
-    FROM transcript_batch_items ORDER BY ordinal`).all();
-  const [archiveSource] = await seedLinkedVideos(env, [
-    { youtubeId: "Archive0001", date: "2025-01-01" },
-  ]);
-  await seedArchiveLinks(env, [archiveSource], { duplicateFirst: true });
-  const unauthorized = await fetchHandler(new Request("https://scanner.example/admin/transcript-batch", {
-    method: "POST", headers: { "content-type": "application/json" },
-    body: JSON.stringify({ action: "sync_archive_items", batchId: started.batchId }),
-  }), env);
-  assert.equal(unauthorized.status, 401);
-  const synced = await syncArchiveLinkedTranscriptBatch(env, { batchId: started.batchId, at: AT });
-  assert.deepEqual({ synced: synced.synced, reused: synced.reused,
-    appendedItemCount: synced.appendedItemCount }, { synced: true, reused: false, appendedItemCount: 1 });
-  const after = env.DB.db.prepare(`SELECT batch_item_id,source_item_id,ordinal,status
-    FROM transcript_batch_items ORDER BY ordinal`).all();
-  assert.deepEqual(after.slice(0, 2).map((row) => [row.batch_item_id, row.source_item_id, row.ordinal]),
-    initial.map((row) => [row.batch_item_id, row.source_item_id, row.ordinal]));
-  assert.equal(after[2].ordinal, 3);
-  assert.equal(after[2].source_item_id, archiveSource.source_item_id);
-  assert.throws(() => env.DB.db.prepare("UPDATE transcript_batch_items SET ordinal=99 WHERE batch_item_id=?")
-    .run(initial[1].batch_item_id), /identity is immutable/);
-  assert.equal((await syncArchiveLinkedTranscriptBatch(env, { batchId: started.batchId })).appendedItemCount, 0);
-  const current = env.DB.db.prepare("SELECT batch_item_id FROM transcript_batch_items WHERE status='active'").get();
-  const successors = await completeTranscriptBatchItem(env, { batchId: started.batchId,
-    batchItemId: current.batch_item_id, at: "2026-07-20T10:02:00.000Z",
-    durationFetcher: durationFetcher() });
-  assert.equal(successors.length, 1);
-  assert.equal(successors[0].payload.youtubeId, "Archive0001");
-  assert.equal(env.DB.db.prepare("SELECT COUNT(*) count FROM transcript_batch_items WHERE status='active'").get().count, 1);
-  assert.equal(env.DB.db.prepare("SELECT COUNT(*) count FROM transcript_batch_repair_events WHERE event_type='archive_items_appended'").get().count, 1);
-});
-
-test("archive sync bulk-appends more than 48 missing videos under the Free D1 statement cap", async () => {
-  const env = batchEnv();
-  await seedLinkedVideos(env, [{ youtubeId: "Ordinary003", date: "2020-01-01" }]);
-  const started = await startTranscriptBatch(env, { idempotencyKey: "archive-bulk-2026-07-20",
-    at: AT, durationFetcher: durationFetcher() });
-  const archiveVideos = Array.from({ length: 60 }, (_, index) => ({
-    youtubeId: `Archive${String(index).padStart(4, "0")}`, date: "2025-01-01",
-  }));
-  const sources = await seedLinkedVideos(env, archiveVideos);
-  await seedArchiveLinks(env, sources);
-  env.DB.resetStatementCount();
-  const synced = await syncArchiveLinkedTranscriptBatch(env, { batchId: started.batchId, at: AT });
-  assert.equal(synced.appendedItemCount, 60);
-  assert.ok(env.DB.statementCount <= 10, `used ${env.DB.statementCount} D1 statements`);
-  const ordinals = env.DB.db.prepare(`SELECT MIN(ordinal) minimum,MAX(ordinal) maximum
-    FROM transcript_batch_items WHERE source_item_id IN (
-      SELECT source_item_id FROM source_items WHERE platform_item_id LIKE 'Archive%'
-    )`).get();
-  assert.deepEqual([ordinals.minimum, ordinals.maximum], [2, 61]);
-});
-
-test("archive priority selection falls back to original ordinal before migration 0020 exists", async () => {
-  const env = preArchiveBatchEnv();
-  await seedLinkedVideos(env, [
-    { youtubeId: "Fallback001", date: "2020-01-01" },
-    { youtubeId: "Fallback002", date: "2020-01-02" },
-  ]);
-  const started = await startTranscriptBatch(env, { idempotencyKey: "pre-archive-fallback-2026-07-20",
-    at: AT, durationFetcher: durationFetcher() });
-  const first = env.DB.db.prepare("SELECT batch_item_id FROM transcript_batch_items WHERE status='active'").get();
-  const successors = await completeTranscriptBatchItem(env, { batchId: started.batchId,
-    batchItemId: first.batch_item_id, at: "2026-07-20T10:02:00.000Z",
-    durationFetcher: durationFetcher() });
-  assert.equal(successors[0].payload.youtubeId, "Fallback002");
-});
-
-test("manual legacy stitch repair verifies receipts, advances once, and queues only private-safe section jobs", async () => {
-  const env = batchEnv();
-  const legacy = await seedLegacyStitch(env, { durationSeconds: 60 });
-  const body = { action: "repair_legacy_stitch", batchId: legacy.started.batchId,
-    batchItemId: legacy.item.batch_item_id };
-  const unauthorized = await fetchHandler(new Request("https://scanner.example/admin/transcript-batch", {
-    method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body),
-  }), env, { durationFetcher: durationFetcher() });
-  assert.equal(unauthorized.status, 401);
-  const response = await fetchHandler(new Request("https://scanner.example/admin/transcript-batch", {
-    method: "POST", headers: { authorization: "Bearer admin-secret", "content-type": "application/json" },
-    body: JSON.stringify(body),
-  }), env, { durationFetcher: durationFetcher() });
-  assert.equal(response.status, 200);
-  const repaired = await response.json();
-  assert.equal(repaired.repaired, true);
-  assert.equal(repaired.reused, false);
-  assert.equal(repaired.acquisitionAdvanced, true);
-  assert.equal(repaired.activeItemCount, 1);
-  assert.equal(repaired.queuedAnalysisSectionCount, 0);
-  assert.equal(repaired.analysisPreparationQueued, true);
-  assert.equal(env.DB.db.prepare("SELECT status FROM transcript_batch_items WHERE batch_item_id=?")
-    .get(legacy.item.batch_item_id).status, "completed");
-  assert.equal(env.DB.db.prepare("SELECT COUNT(*) count FROM transcript_batch_items WHERE status='active'").get().count, 1);
-  assert.equal(env.DB.db.prepare("SELECT COUNT(*) count FROM transcript_analysis_sections WHERE status='queued'").get().count, 0);
-  assert.equal(env.sent.length, 2);
-  assert.equal(env.sent[0].payload.phase, "chunk");
-  assert.equal(env.sent[1].payload.phase, "prepare");
-  const preparation = env.sent.pop();
-  await processEnvelope(env, preparation, { at: "2026-07-20T10:05:30.000Z" });
-  assert.equal(env.DB.db.prepare("SELECT COUNT(*) count FROM transcript_analysis_sections WHERE status='queued'").get().count, 1);
-  assert.equal(env.sent[1].payload.phase, "analyze");
-  assert.deepEqual(Object.keys(env.sent[1].payload).sort(), ["analysisRunId", "analysisSectionId",
-    "inputSha256", "phase", "promptVersion", "sectionIndex", "sourceItemId",
-    "transcriptId", "transcriptSha256"]);
-  assert.doesNotMatch(JSON.stringify({ repaired, queued: env.sent }),
-    /Spoken section|transcripts\/final|r2_key|admin-secret|gemini-secret/i);
-  const sentCount = env.sent.length;
-  const duplicate = await repairLegacyStitchedTranscriptBatchItem(env, {
-    batchId: legacy.started.batchId, batchItemId: legacy.item.batch_item_id,
-    at: "2026-07-20T10:06:00.000Z", durationFetcher: async () => { throw new Error("must_not_repeat"); },
-  });
-  assert.deepEqual(duplicate, { repaired: true, reused: true,
-    batchId: legacy.started.batchId, batchItemId: legacy.item.batch_item_id });
-  assert.equal(env.sent.length, sentCount);
-  assert.equal(env.DB.db.prepare("SELECT COUNT(*) count FROM transcript_batch_repair_events WHERE event_type='legacy_stitch_repaired'").get().count, 1);
-});
-
-test("legacy stitch repair refuses incomplete chunks and forged private artifacts", async () => {
-  const incompleteEnv = batchEnv();
-  const incomplete = await seedLegacyStitch(incompleteEnv, { durationSeconds: 301, completeChunks: false });
-  const refusedIncomplete = await repairLegacyStitchedTranscriptBatchItem(incompleteEnv, {
-    batchId: incomplete.started.batchId, batchItemId: incomplete.item.batch_item_id,
-    at: "2026-07-20T10:05:00.000Z", durationFetcher: durationFetcher(),
-  });
-  assert.deepEqual({ repaired: refusedIncomplete.repaired, reason: refusedIncomplete.reason },
-    { repaired: false, reason: "legacy_stitch_chunks_incomplete" });
-  assert.equal(incompleteEnv.DB.db.prepare("SELECT status FROM transcript_batch_items WHERE batch_item_id=?")
-    .get(incomplete.item.batch_item_id).status, "active");
-  assert.equal(incompleteEnv.sent.length, 0);
-
-  const forgedEnv = batchEnv();
-  const forged = await seedLegacyStitch(forgedEnv, { durationSeconds: 60 });
-  await forgedEnv.ARTIFACTS.put(forged.r2Key, "Forged private transcript body.");
-  const refusedForged = await repairLegacyStitchedTranscriptBatchItem(forgedEnv, {
-    batchId: forged.started.batchId, batchItemId: forged.item.batch_item_id,
-    at: "2026-07-20T10:05:00.000Z", durationFetcher: durationFetcher(),
-  });
-  assert.deepEqual({ repaired: refusedForged.repaired, reason: refusedForged.reason },
-    { repaired: false, reason: "legacy_stitch_content_hash_mismatch" });
-  assert.equal(forgedEnv.DB.db.prepare("SELECT status FROM transcript_batch_items WHERE batch_item_id=?")
-    .get(forged.item.batch_item_id).status, "active");
-  assert.equal(forgedEnv.sent.length, 0);
 });

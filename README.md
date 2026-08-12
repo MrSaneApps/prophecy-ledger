@@ -11,6 +11,24 @@ public site runs on Cloudflare Pages and D1; a separate secret-gated Worker owns
 background ingestion. Deployment identifiers and run receipts are maintainer
 operational state, not repository documentation.
 
+## Current preservation-safe pipeline (2026-08-03)
+
+The runtime treats acquisition, analysis, human review, and publication as four
+truthful phases. A completed transcript remains completed when later analysis is
+queued, failed, or awaiting manual work; AI output remains a private proposal;
+and publication still requires the existing two-person matching-review gate.
+Unavailable pending sources receive an append-only disposition rather than a
+destructive status rewrite, so completed counts and all reviewer/publication
+history remain intact.
+
+Gemini accounting is physical-call based: every provider request reserves its
+exact clip before fetch against the 86,400-second UTC-day fuse. A one-time
+cutover debit fails closed for the transition day. Transcript acquisition and
+analysis use isolated queues and DLQs, with a durable outbox for analysis
+reprocessing. Every canonical worker or operator step must finish with its
+documented terminal receipt and agreeing read-back; an accepted request alone
+is never completion proof.
+
 ## Live ingestion system
 
 ```text
@@ -19,13 +37,14 @@ Pages UI and API -------------------------> shared D1 public catalogue
 
 secret-gated scanner admin / disabled cron
        -> prophecy-ledger-ingestion Queue
-              -> scanner Worker -> shared D1
-                    |-> bounded official-site fetches
-                    |-> Workers AI neutral description triage
-                    |-> direct Gemini public-YouTube transcription
-                    |-> Workers AI exact-quote candidate extraction
-                    |-> private prophecy-ledger-artifacts R2
-                    `-> prophecy-ledger-ingestion-dlq after retry exhaustion
+              -> scanner Worker -> shared D1 + private R2
+                    |-> bounded discovery + description triage
+                    |-> direct Gemini transcript acquisition
+                    `-> prophecy-ledger-ingestion-dlq
+
+       -> prophecy-ledger-analysis Queue
+              -> scanner Worker -> private exact-quote analysis
+                    `-> prophecy-ledger-analysis-dlq
 ```
 
 The product is a reusable people-first ledger. Troy Black is the first pilot,
@@ -34,9 +53,9 @@ corpus. Source totals are kept separate from linked videos, available
 transcripts, possible-claim posts, specific claim candidates, human checks, and
 final ratings. Raw posts and videos never enter the accuracy score.
 
-Workers AI may label a first-party title and description as a possible-claim
+Gemini may label a first-party title and description as a possible-claim
 lead. For a trusted public YouTube source, Gemini 3.1 Flash-Lite may acquire a
-private, clip-labeled generated transcript through Google's live API. Workers AI
+private, clip-labeled generated transcript through Google's live API. Gemini
 then proposes exact-quote candidates only when the quote exists uniquely in that
 private artifact. The system does not scrape captions or mirror media. Generated
 transcripts and candidates remain `needs human check`; publication still
@@ -74,9 +93,9 @@ reviewer credentials are not stored in this repository.
   blocked/partial-source receipts.
 - Separate source, transcript, possible-claim, human-check, and rating counts.
 - Neutral AI-assisted triage without AI adjudication.
-- Private Gemini-generated transcript acquisition with an eight-hour daily
-  reservation cap, bounded five-minute clips, resumable Queue jobs, and explicit
-  human-check labeling.
+- Private Gemini-generated transcript acquisition with a 24-hour physical-call
+  fuse, bounded five-minute clips, resumable Queue jobs, and explicit human-check
+  labeling.
 - Separate claim-outcome and prior-public-information analysis.
 - A two-human-review publication gate and append-only review/event history.
 - A deterministic public PDF export that excludes draft verdicts, private
@@ -105,11 +124,13 @@ are invented.
 
 ## Cost controls
 
-The Worker independently caps transcript reservations at 28,800 media seconds
-per UTC day. Provider pricing and usage receipts are reviewed as operational
-data because preview terms and model prices can change. Cloudflare Workers AI
-usage is separately metered and limited to claim extraction rather than
-transcription.
+The Worker independently caps physical Gemini requests at 86,400 media seconds
+per UTC day (24 hours of source media). Split/retry calls debit the same physical
+ledger, and the legacy cutover uses one explicit debit rather than reinterpreting
+logical reservations. Provider pricing and usage receipts are operational data
+because preview terms and model prices can change. Cloudflare Workers AI usage
+is separately metered for description triage and private claim analysis, never
+publication.
 
 ## Development
 
@@ -119,7 +140,7 @@ npm run check
 npm run dev
 ```
 
-For the local reviewer mutation demo, run `npm run dev:review` and configure a
+For the local reviewer mutation demo, run `npm run dev:review` (then `npm run e2e:reviewer` for durable click E2E — see `docs/REVIEWER_CLICK_E2E.md`) and configure a
 different `DEMO_REVIEWER_N_ID` / `DEMO_REVIEWER_N_TOKEN` pair for each principal.
 Demo credentials work only on loopback when `REVIEW_DEMO_MODE=1`. Production
 uses Cloudflare Access and rejects static bearer credentials. No reviewer token

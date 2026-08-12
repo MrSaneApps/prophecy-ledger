@@ -34,3 +34,7 @@ tmp/
 *.key
 *.p8
 *.pem
+
+# Local leftovers, not source
+*.orig
+/.claude/

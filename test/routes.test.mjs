@@ -5,9 +5,16 @@ import { listPeople } from "../functions/lib/people-directory.js";
 import { onRequestPost as intakePost } from "../functions/api/intake.js";
 import { onRequestGet as peopleGet } from "../functions/api/people.js";
 import { onRequestGet as personGet } from "../functions/api/people/[slug].js";
+import { onRequestGet as sourceGet } from "../functions/api/people/[slug]/sources.js";
 import { onRequestGet as claimGet } from "../functions/api/claims/[id].js";
 import { onRequestGet as reviewGet, onRequestPost as reviewPost } from "../functions/api/review/[id].js";
 import { onRequestGet as reviewQueueGet } from "../functions/api/review/queue.js";
+import {
+  onRequestGet as archiveQueueGet, onRequestPost as archiveQueuePost,
+} from "../functions/api/review/archive/queue.js";
+import {
+  onRequestGet as archiveReviewGet, onRequestPost as archiveReviewPost,
+} from "../functions/api/review/archive/[id].js";
 import { context, jsonBody, makeEnv } from "./helpers/d1.mjs";
 
 const VIDEO_ID = "ZidiIdg3U4M";
@@ -49,6 +56,25 @@ async function assign(env, token) {
   assert.equal(response.status, 200);
   const body = await jsonBody(response);
   return body.assignments.find((item) => item.status === "leased");
+}
+
+async function assignArchive(env, token) {
+  const listed = await archiveQueueGet(context({
+    env, url: "http://localhost/api/review/archive/queue", headers: demoHeaders(token),
+  }));
+  assert.equal(listed.status, 200);
+  const body = await jsonBody(listed);
+  const existing = body.assignments.find((item) =>
+    item.workType === "archive_lead_verification" && item.status === "leased");
+  if (existing) return existing;
+  const target = body.available.find((item) => !item.taken);
+  assert.ok(target?.workItemId);
+  const response = await archiveQueuePost(context({
+    env, url: "http://localhost/api/review/archive/queue", method: "POST",
+    headers: demoHeaders(token), body: { leaseArchiveWorkItemId: target.workItemId },
+  }));
+  assert.equal(response.status, 201, await response.clone().text());
+  return (await jsonBody(response)).assignment;
 }
 
 function seedArchiveRouteWork(env) {
@@ -189,7 +215,9 @@ test("public profile exposes neutral catalogue records but no draft verdict fiel
   assert.match(russia.currentEvidenceSummary, /no legal change/i);
   assert.match(russia.priorPublicInformationSummary, /public sources and satellite images/i);
   assert.match(russia.corpusWarning, /selects claims described as fulfilled/i);
-  assert.ok(body.researchRecords.every((record) => record.revision === 2));
+  assert.ok(body.researchRecords.every((record) => record.revision === env.DB.db.prepare(
+    "SELECT MAX(revision_number) AS revision FROM public_research_briefs WHERE claim_id=?"
+  ).get(record.id).revision));
   assert.deepEqual(body.corpusCoverage, {
     postsFound: 0, videosLinked: 0, transcriptsAvailable: 0, possibleClaimPosts: 0, specificClaimCandidates: 0,
     archiveClaimsCatalogued: 0, archiveOriginalVideos: 0, archiveSourceChecksCompleted: 0,
@@ -204,31 +232,38 @@ test("public profile exposes neutral catalogue records but no draft verdict fiel
 
 test("public profile projects only the newest append-only research revision", async () => {
   const env = makeEnv();
+  const latest = env.DB.db.prepare(
+    `SELECT brief_id,revision_number FROM public_research_briefs
+     WHERE claim_id=? ORDER BY revision_number DESC LIMIT 1`
+  ).get(CLAIM_ID);
+  const nextRevision = latest.revision_number + 1;
+  const nextBriefId = `brief_oil_r${nextRevision}`;
+  const nextReferenceId = `research_oil_r${nextRevision}_source`;
   env.DB.db.prepare(
     `INSERT INTO public_research_briefs
      (brief_id,claim_id,revision_number,supersedes_brief_id,quotation_source_url,
       headline,evidence_strength,test_framing,evidence_summary,prior_information_summary,
       corpus_warning,missing_gates_json,research_status,as_of_date,created_at)
-     SELECT 'brief_oil_r3',claim_id,3,brief_id,quotation_source_url,
+     SELECT ?,claim_id,?,brief_id,quotation_source_url,
       'Corrected public brief',evidence_strength,test_framing,'Corrected evidence summary',
       prior_information_summary,corpus_warning,missing_gates_json,research_status,
       '2026-07-20','2026-07-20T00:00:00.000Z'
-     FROM public_research_briefs WHERE brief_id='brief_oil_r2'`
-  ).run();
+     FROM public_research_briefs WHERE brief_id=?`
+  ).run(nextBriefId, nextRevision, latest.brief_id);
   env.DB.db.prepare(
     `INSERT INTO public_research_references
      (reference_id,brief_id,reference_role,title,url,published_at,note,display_order,created_at)
-     VALUES ('research_oil_r3_source','brief_oil_r3','independent_outcome','Corrected source',
+     VALUES (?,?,'independent_outcome','Corrected source',
       'https://example.test/corrected','2026-07-20','Correction evidence',1,'2026-07-20')`
-  ).run();
+  ).run(nextReferenceId, nextBriefId);
   const response = await personGet(context({
     env, url: "https://example.test/api/people/troy-black", params: { slug: "troy-black" },
   }));
   const body = await jsonBody(response);
   const oil = body.researchRecords.find((record) => record.id === "southeast-asia-oil-2021");
-  assert.equal(oil.revision, 3);
+  assert.equal(oil.revision, nextRevision);
   assert.equal(oil.headline, "Corrected public brief");
-  assert.deepEqual(oil.supportingReferences.map((source) => source.id), ["research_oil_r3_source"]);
+  assert.deepEqual(oil.supportingReferences.map((source) => source.id), [nextReferenceId]);
 });
 
 test("draft public API is 404 and reviewer API requires an authenticated principal", async () => {
@@ -252,28 +287,41 @@ test("draft public API is 404 and reviewer API requires an authenticated princip
 test("archive review routes preserve Access identity, assignment ownership, and work-type binding", async () => {
   const env = makeEnv({ demo: true });
   seedArchiveRouteWork(env);
-  const assignment = await assign(env, "alpha-token");
+  const assignment = await assignArchive(env, "alpha-token");
   assert.equal(assignment.workType, "archive_lead_verification");
-  const unauthenticated = await reviewGet(context({ env,
-    url: `http://localhost/api/review/${assignment.assignmentId}`,
+  const unauthenticated = await archiveReviewGet(context({ env,
+    url: `http://localhost/api/review/archive/${assignment.assignmentId}`,
     params: { id: assignment.assignmentId } }));
   assert.equal(unauthenticated.status, 404);
-  const wrongReviewer = await reviewGet(reviewContext(env, "beta-token", assignment.assignmentId));
+  const wrongReviewer = await archiveReviewGet(context({ env,
+    url: `http://localhost/api/review/archive/${assignment.assignmentId}`,
+    params: { id: assignment.assignmentId }, headers: demoHeaders("beta-token") }));
   assert.equal(wrongReviewer.status, 404);
-  const wrongType = await reviewPost(reviewContext(env, "alpha-token", assignment.assignmentId, {
-    method: "POST", body: { workType: "claim_adjudication", decision: "source_unavailable",
+  const wrongType = await archiveReviewPost(context({ env,
+    url: `http://localhost/api/review/archive/${assignment.assignmentId}`, method: "POST",
+    params: { id: assignment.assignmentId }, headers: demoHeaders("alpha-token"),
+    body: { workType: "claim_adjudication", decision: "source_unavailable",
       rationale: "The assigned source could not be opened for this review." },
   }));
   assert.equal(wrongType.status, 400);
   assert.equal((await jsonBody(wrongType)).code, "work_type_mismatch");
-  const spoofed = await reviewPost(reviewContext(env, "alpha-token", assignment.assignmentId, {
-    method: "POST", body: { workType: "archive_lead_verification", decision: "source_unavailable",
+  const spoofed = await archiveReviewPost(context({ env,
+    url: `http://localhost/api/review/archive/${assignment.assignmentId}`, method: "POST",
+    params: { id: assignment.assignmentId }, headers: demoHeaders("alpha-token"),
+    body: { workType: "archive_lead_verification", decision: "source_unavailable",
       rationale: "The assigned source could not be opened for this review.",
       reviewerId: "reviewer_beta", sourceAvailable: false, contextVerified: false,
       exactSourceVerified: false, testable: false },
   }));
   assert.equal(spoofed.status, 400);
   assert.equal((await jsonBody(spoofed)).code, "reviewer_identity_body_forbidden");
+  const bypass = await reviewPost(reviewContext(env, "alpha-token", assignment.assignmentId, {
+    method: "POST", body: { workType: "archive_lead_verification", decision: "source_unavailable",
+      rationale: "The assigned source could not be opened for this review.", sourceAvailable: false,
+      contextVerified: false, exactSourceVerified: false, testable: false },
+  }));
+  assert.equal(bypass.status, 409);
+  assert.equal((await jsonBody(bypass)).code, "archive_route_required");
 });
 
 test("nonlocal static bearer credentials are not a production reviewer identity", async () => {
@@ -334,6 +382,23 @@ test("two credential-derived matching principals publish one immutable revision"
   assert.equal(stored.visibility, "published");
   assert.equal(stored.outcome_status, "false");
   assert.equal(env.DB.db.prepare("SELECT count(*) count FROM claim_revisions").get().count, 1);
+  env.DB.db.prepare(`INSERT INTO source_items
+    (source_item_id,person_id,platform,platform_item_id,canonical_url,first_discovered_at,last_seen_at,availability)
+    VALUES (?,?,?,?,?,?,?,?)`).run("source_published_unavailable", "person_troy_black", "youtube", VIDEO_ID,
+      `https://www.youtube.com/watch?v=${VIDEO_ID}`, "2026-07-20", "2026-07-20", "unavailable");
+  const sourceResponse = await sourceGet(context({ env,
+    url: "https://example.test/api/people/troy-black/sources?platform=youtube",
+    params: { slug: "troy-black" },
+  }));
+  const publishedSource = (await jsonBody(sourceResponse)).sources[0];
+  assert.equal(publishedSource.status, "source_unavailable");
+  assert.equal(publishedSource.humanReviewStatus, "reviewed");
+  assert.equal(publishedSource.publicStatus, "published");
+  const publicProfile = await jsonBody(await personGet(context({ env,
+    url: "https://example.test/api/people/troy-black", params: { slug: "troy-black" },
+  })));
+  assert.ok(publicProfile.claims.some((claim) => claim.claim_id === CLAIM_ID));
+  assert.doesNotMatch(JSON.stringify(publishedSource), /reviewer|rationale|transcript|model/i);
   assert.throws(() => env.DB.db.prepare("UPDATE claims SET title='changed' WHERE claim_id=?").run(CLAIM_ID), /immutable revision/);
   assert.throws(() => env.DB.db.prepare("DELETE FROM claims WHERE claim_id=?").run(CLAIM_ID), /cannot be deleted/);
 });

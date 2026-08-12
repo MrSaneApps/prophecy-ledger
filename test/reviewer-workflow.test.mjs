@@ -1,8 +1,14 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { normalizeReview } from "../functions/lib/claims.js";
+import { normalizeArchiveDecision } from "../functions/lib/archive-review-workflow.js";
+import { bridgeSupportedObservation } from "../functions/lib/archive-conveyor.js";
 import { onRequestGet as personGet } from "../functions/api/people/[slug].js";
 import { onRequestGet as queueGet } from "../functions/api/review/queue.js";
+import {
+  onRequestGet as archiveQueueGet, onRequestPost as archiveQueuePost,
+} from "../functions/api/review/archive/queue.js";
+import { onRequestPost as archiveReviewPost } from "../functions/api/review/archive/[id].js";
 import { onRequestGet as reviewGet, onRequestPost as reviewPost } from "../functions/api/review/[id].js";
 import {
   leaseReviewWork, reconcileNeededPublications, reconcilePublication, submitAssignedClaimReview,
@@ -11,6 +17,11 @@ import { context, jsonBody, makeEnv } from "./helpers/d1.mjs";
 
 const CLAIM_ID = "southeast-asia-oil-2021";
 const headers = (token) => ({ "x-demo-reviewer-token": token });
+
+async function sha256Hex(value) {
+  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(value));
+  return [...new Uint8Array(digest)].map((byte) => byte.toString(16).padStart(2, "0")).join("");
+}
 
 function groundingJson(values, contextStart, contextEnd) {
   return JSON.stringify({ contextStart, contextEnd, dimensions: Object.fromEntries(
@@ -22,6 +33,9 @@ function groundingJson(values, contextStart, contextEnd) {
 
 function seedCandidate(env) {
   const db = env.DB.db;
+  const gateVersion = "transcript-claims-v4-grounded-5w1h";
+  const transcriptSha = "c".repeat(64);
+  const sectionSha = "b".repeat(64);
   db.prepare(`INSERT INTO ingestion_runs
     (run_id,person_id,trigger_type,scope,status,started_at,completed_at,error_count,created_at)
     VALUES (?,?,?,?,?,?,?,?,?)`).run("run_candidate", "person_troy_black", "canary", "candidate-test",
@@ -38,12 +52,31 @@ function seedCandidate(env) {
     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)`).run("revision_candidate", "source_candidate", "a".repeat(64),
       "https://www.youtube.com/watch?v=ZidiIdg3U4M", "Candidate source title", null,
       "2020-09-10", null, null, null, "2026-07-20T10:01:00Z", "test-v1", "run_candidate");
+  db.prepare(`INSERT INTO transcript_artifacts
+    (transcript_id,source_item_id,r2_key,content_sha256,byte_count,language,has_timing,
+     provenance,verifier_principal,created_at) VALUES (?,?,?,?,?,?,?,?,?,?)`
+  ).run("transcript_candidate", "source_candidate", "test/transcript-candidate.json",
+    transcriptSha, 300, "en", 1, "test_verified_transcript", "test:reviewer-workflow",
+    "2026-07-20T10:01:30Z");
   db.prepare(`INSERT INTO extraction_runs
     (extraction_run_id,source_item_id,transcript_id,input_kind,input_sha256,prompt_version,
      model_family,status,started_at,completed_at,transcript_quality)
-    VALUES (?,?,?,?,?,?,?,?,?,?,?)`).run("extract_candidate", "source_candidate", null,
-      "verified_transcript", "b".repeat(64), "test-v1", "workers-ai", "completed",
+    VALUES (?,?,?,?,?,?,?,?,?,?,?)`).run("extract_candidate", "source_candidate", "transcript_candidate",
+      "verified_transcript", sectionSha, gateVersion, "workers-ai", "completed",
       "2026-07-20T10:02:00Z", "2026-07-20T10:03:00Z", "gemini_generated_needs_human_check");
+  db.prepare(`INSERT INTO transcript_analysis_runs
+    (analysis_run_id,ingestion_run_id,transcript_id,source_item_id,transcript_sha256,
+     prompt_version,section_count,completed_section_count,failed_section_count,status,
+     created_at,completed_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`
+  ).run("analysis_candidate", "run_candidate", "transcript_candidate", "source_candidate",
+    transcriptSha, gateVersion, 1, 1, 0, "completed",
+    "2026-07-20T10:01:45Z", "2026-07-20T10:03:00Z");
+  db.prepare(`INSERT INTO transcript_analysis_sections
+    (analysis_section_id,analysis_run_id,section_index,input_sha256,base_offset,
+     approximate_timestamp_seconds,extraction_run_id,status,attempt_count,completed_at,created_at)
+    VALUES (?,?,?,?,?,?,?,?,?,?,?)`).run("analysis_section_candidate", "analysis_candidate", 0,
+      sectionSha, 0, 120, "extract_candidate", "completed", 1,
+      "2026-07-20T10:03:00Z", "2026-07-20T10:01:45Z");
   const quote = "A measurable event will happen by Friday.";
   db.prepare(`INSERT INTO claim_candidates
     (candidate_id,extraction_run_id,source_item_id,candidate_kind,neutral_paraphrase,
@@ -58,12 +91,24 @@ function seedCandidate(env) {
      where_text,when_text,how_text,how_specificity,public_evidence_text,pass_condition_text,
      fail_condition_text,grounding_json,rejection_codes_json,assessed_by,created_at)
     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`).run("assessment_candidate", "candidate_exact",
-      "transcript-claims-v4-grounded-5w1h", "eligible", "The speaker", "a measurable event",
+      gateVersion, "eligible", "The speaker", "a measurable event",
       "the stated reason", "the stated place", "by Friday", "the stated method", "stated",
       "Public records for the event", "Records show the event by Friday",
       "Records show no event by Friday", groundingJson({ who: "The speaker", what: "a measurable event",
         why: "the stated reason", where: "the stated place", when: "by Friday", how: "the stated method" }, 100, 200),
       "[]", "workers-ai:test", "2026-07-20T10:03:01Z");
+  db.prepare(`INSERT INTO candidate_atomic_readiness
+    (readiness_id,candidate_id,analysis_section_id,transcript_id,source_item_id,gate_version,
+     state,material_proposition_count,transcript_sha256,section_sha256,source_sha256,
+     source_identity_json,quote_start,quote_end,context_start,context_end,section_start,
+     section_end,clip_start_seconds,clip_end_seconds,support_offsets_json,reason_codes_json,
+     assessed_by,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`
+  ).run("readiness_candidate", "candidate_exact", "analysis_section_candidate", "transcript_candidate",
+    "source_candidate", gateVersion, "review_ready", 1, transcriptSha, sectionSha, "a".repeat(64),
+    JSON.stringify({ personId: "person_troy_black", platform: "youtube", platformItemId: "ZidiIdg3U4M",
+      canonicalUrl: "https://www.youtube.com/watch?v=ZidiIdg3U4M" }),
+    100, 100 + quote.length, 90, 200, 0, 300, 120, 180, "{}", "[]",
+    "test:reviewer-workflow", "2026-07-20T10:03:02Z");
 }
 
 function seedArchiveWork(env, suffix = "one") {
@@ -193,16 +238,35 @@ async function queue(env, token) {
   return jsonBody(response);
 }
 
-test("fresh reviewers receive archive source checks first and can open only their leased source version", async () => {
+async function archiveQueue(env, token) {
+  const response = await archiveQueueGet(context({
+    env, url: "http://localhost/api/review/archive/queue", headers: headers(token),
+  }));
+  assert.equal(response.status, 200);
+  return jsonBody(response);
+}
+
+async function openArchiveWork(env, token, workItemId) {
+  const response = await archiveQueuePost(context({
+    env, url: "http://localhost/api/review/archive/queue", method: "POST",
+    headers: headers(token), body: { leaseArchiveWorkItemId: workItemId },
+  }));
+  assert.equal(response.status, 201, await response.clone().text());
+  return (await jsonBody(response)).assignment;
+}
+
+test("claim and candidate work stays prioritized while archive source versions remain explicitly openable", async () => {
   const env = makeEnv({ demo: true });
   seedCandidate(env);
   seedArchiveWork(env);
   const queued = await queue(env, "alpha-token");
-  assert.equal(queued.assignments[0].workType, "archive_lead_verification");
-  assert.equal(queued.assignments[0].archiveRevisionId, "archive_revision_one_current");
+  assert.equal(queued.assignments[0].workType, "candidate_verification");
+  const archiveAssignment = await openArchiveWork(env, "alpha-token", "archive_work_one");
+  assert.equal(archiveAssignment.workType, "archive_lead_verification");
+  assert.equal(archiveAssignment.archiveRevisionId, "archive_revision_one_current");
   assert.doesNotMatch(JSON.stringify(queued), /prophecy_text|claimed_result_text|reviewer_alpha/);
 
-  const assignmentId = queued.assignments[0].assignmentId;
+  const assignmentId = archiveAssignment.assignmentId;
   const detailResponse = await reviewGet(context({
     env, url: `http://localhost/api/review/${assignmentId}`, params: { id: assignmentId },
     headers: headers("alpha-token"),
@@ -234,13 +298,67 @@ test("fresh reviewers receive archive source checks first and can open only thei
   assert.equal(stolen.status, 404);
 });
 
+test("explicit archive switching returns the requested item and revives released identity immutably", async () => {
+  const env = makeEnv({ demo: true });
+  seedArchiveWork(env, "one");
+  seedArchiveWork(env, "two");
+  const initialQueue = await archiveQueue(env, "alpha-token");
+  const initial = initialQueue.assignments.find((item) =>
+    item.workType === "archive_lead_verification" && item.status === "leased");
+  assert.ok(initial?.workItemId);
+  const requested = initialQueue.available.find((item) => item.workItemId !== initial.workItemId);
+  assert.ok(requested?.workItemId);
+  const before = env.DB.db.prepare(
+    `SELECT archive_assignment_id,assigned_at,lease_version
+     FROM archive_review_assignments WHERE archive_work_item_id=? AND reviewer_id='reviewer_alpha'`,
+  ).get(initial.workItemId);
+
+  const switched = await openArchiveWork(env, "alpha-token", requested.workItemId);
+  assert.equal(switched.workItemId, requested.workItemId);
+  assert.notEqual(switched.assignmentId, initial.assignmentId);
+  assert.equal(env.DB.db.prepare(
+    "SELECT status FROM archive_review_assignments WHERE archive_assignment_id=?",
+  ).get(initial.assignmentId).status, "released");
+
+  const revived = await openArchiveWork(env, "alpha-token", initial.workItemId);
+  assert.equal(revived.workItemId, initial.workItemId);
+  assert.equal(revived.assignmentId, before.archive_assignment_id);
+  const after = env.DB.db.prepare(
+    `SELECT assigned_at,lease_version,status FROM archive_review_assignments
+     WHERE archive_assignment_id=?`,
+  ).get(before.archive_assignment_id);
+  assert.equal(after.assigned_at, before.assigned_at);
+  assert.ok(after.lease_version > before.lease_version);
+  assert.equal(after.status, "leased");
+
+  const missing = await archiveQueuePost(context({
+    env, url: "http://localhost/api/review/archive/queue", method: "POST",
+    headers: headers("alpha-token"),
+    body: { leaseArchiveWorkItemId: "archive_work_missing" },
+  }));
+  assert.equal(missing.status, 409);
+  assert.equal((await jsonBody(missing)).code, "archive_lease_unavailable");
+  assert.equal(env.DB.db.prepare(
+    "SELECT status FROM archive_review_assignments WHERE archive_assignment_id=?",
+  ).get(revived.assignmentId).status, "leased");
+});
+
 test("supported archive decisions require exact 5W1H grounding and append an observation without creating a claim", async () => {
   const env = makeEnv({ demo: true });
   seedArchiveWork(env);
-  const assignment = (await queue(env, "alpha-token")).assignments[0];
+  const assignment = await openArchiveWork(env, "alpha-token", "archive_work_one");
   const claimsBefore = env.DB.db.prepare("SELECT count(*) count FROM claims").get().count;
-  const incomplete = await reviewPost(context({
+  const bypass = await reviewPost(context({
     env, url: `http://localhost/api/review/${assignment.assignmentId}`, method: "POST",
+    params: { id: assignment.assignmentId }, headers: headers("alpha-token"),
+    body: supportedArchiveBody(),
+  }));
+  assert.equal(bypass.status, 409);
+  assert.equal((await jsonBody(bypass)).code, "archive_route_required");
+  assert.equal(env.DB.db.prepare("SELECT count(*) count FROM archive_review_decisions").get().count, 0);
+
+  const incomplete = await archiveReviewPost(context({
+    env, url: `http://localhost/api/review/archive/${assignment.assignmentId}`, method: "POST",
     params: { id: assignment.assignmentId }, headers: headers("alpha-token"),
     body: supportedArchiveBody({ why: "Not stated", whySourceBasis: "" }),
   }));
@@ -248,8 +366,8 @@ test("supported archive decisions require exact 5W1H grounding and append an obs
   assert.equal((await jsonBody(incomplete)).code, "archive_why_required");
   assert.equal(env.DB.db.prepare("SELECT count(*) count FROM archive_review_decisions").get().count, 0);
 
-  const accepted = await reviewPost(context({
-    env, url: `http://localhost/api/review/${assignment.assignmentId}`, method: "POST",
+  const accepted = await archiveReviewPost(context({
+    env, url: `http://localhost/api/review/archive/${assignment.assignmentId}`, method: "POST",
     params: { id: assignment.assignmentId }, headers: headers("alpha-token"),
     body: supportedArchiveBody(),
   }));
@@ -278,12 +396,112 @@ test("supported archive decisions require exact 5W1H grounding and append an obs
   assert.throws(() => env.DB.db.exec("DELETE FROM archive_review_observations"), /append-only/);
 });
 
+test("matched supported archive review creates an atomically source-bound candidate", async () => {
+  const env = makeEnv({ demo: true });
+  seedArchiveWork(env);
+  const quote = supportedArchiveBody().exactSourceQuote;
+  const transcript = `[CLIP 00:01:00-00:03:00 | GEMINI-GENERATED, NEEDS HUMAN CHECK]\n${quote}\n`
+    + `the named institution\nwill complete the event\nbecause the stated condition occurs\n`
+    + `in the named region\nduring this year\n`;
+  const transcriptSha = await sha256Hex(transcript);
+  const quoteStart = transcript.indexOf(quote);
+  const transcriptId = "transcript_archive_one_1";
+  const artifactKey = "test/archive-one-transcript.txt";
+  env.DB.db.prepare(`INSERT INTO transcript_artifacts
+    (transcript_id,source_item_id,r2_key,content_sha256,byte_count,language,has_timing,
+     provenance,verifier_principal,created_at) VALUES (?,?,?,?,?,?,?,?,?,?)`
+  ).run(transcriptId, "source_archive_one_1", artifactKey, transcriptSha,
+    new TextEncoder().encode(transcript).byteLength, "en", 1,
+    "test_verified_transcript", "test:archive-conveyor", "2026-07-20T11:06:00Z");
+  env.DB.db.prepare(`INSERT INTO archive_transcript_match_checks
+    (archive_match_check_id,archive_revision_id,archive_video_link_id,transcript_id,
+     source_item_id,prophecy_sha256,matcher_version,transcript_sha256,match_status,
+     match_method,exact_quote,quote_start,quote_end,approximate_clip_start_seconds,created_at)
+    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`
+  ).run("archive_match_one_1", "archive_revision_one_current", "archive_link_one_1",
+    transcriptId, "source_archive_one_1", "c".repeat(64), "whole_cell_v1", transcriptSha,
+    "matched_exact", "exact_text_v1", quote, quoteStart, quoteStart + quote.length, 60,
+    "2026-07-20T11:07:00Z");
+  const assignment = await openArchiveWork(env, "alpha-token", "archive_work_one");
+  env.ARTIFACTS = { get: async () => null };
+  const unavailable = await archiveReviewPost(context({
+    env, url: `http://localhost/api/review/archive/${assignment.assignmentId}`, method: "POST",
+    params: { id: assignment.assignmentId }, headers: headers("alpha-token"),
+    body: supportedArchiveBody(),
+  }));
+  assert.equal(unavailable.status, 503);
+  assert.equal((await jsonBody(unavailable)).code, "archive_conveyor_unavailable");
+  assert.equal(env.DB.db.prepare("SELECT count(*) count FROM archive_review_decisions").get().count, 0);
+  assert.equal(env.DB.db.prepare(
+    "SELECT status FROM archive_review_assignments WHERE archive_assignment_id=?",
+  ).get(assignment.assignmentId).status, "leased");
+  assert.equal(env.DB.db.prepare(
+    "SELECT status FROM archive_verification_work_items WHERE archive_work_item_id='archive_work_one'",
+  ).get().status, "ready");
+
+  env.ARTIFACTS = {
+    get: async (key) => key === artifactKey ? { text: async () => transcript } : null,
+  };
+  const mismatched = await archiveReviewPost(context({
+    env, url: `http://localhost/api/review/archive/${assignment.assignmentId}`, method: "POST",
+    params: { id: assignment.assignmentId }, headers: headers("alpha-token"),
+    body: supportedArchiveBody({ exactSourceQuote: "A different source quotation." }),
+  }));
+  assert.equal(mismatched.status, 409);
+  assert.equal((await jsonBody(mismatched)).code, "review_quote_receipt_mismatch");
+  assert.equal(env.DB.db.prepare("SELECT count(*) count FROM archive_review_decisions").get().count, 0);
+
+  const badTimestamp = await archiveReviewPost(context({
+    env, url: `http://localhost/api/review/archive/${assignment.assignmentId}`, method: "POST",
+    params: { id: assignment.assignmentId }, headers: headers("alpha-token"),
+    body: supportedArchiveBody({ sourceTimestampSeconds: 180 }),
+  }));
+  assert.equal(badTimestamp.status, 409);
+  assert.equal((await jsonBody(badTimestamp)).code, "review_timestamp_outside_section");
+  assert.equal(env.DB.db.prepare("SELECT count(*) count FROM archive_review_decisions").get().count, 0);
+
+  const accepted = await archiveReviewPost(context({
+    env, url: `http://localhost/api/review/archive/${assignment.assignmentId}`, method: "POST",
+    params: { id: assignment.assignmentId }, headers: headers("alpha-token"),
+    body: supportedArchiveBody(),
+  }));
+  const result = await jsonBody(accepted);
+  assert.equal(accepted.status, 201);
+  assert.equal(result.conveyor.bridged, true);
+  const readiness = env.DB.db.prepare(`SELECT state,source_identity_json
+    FROM candidate_atomic_readiness WHERE readiness_id=?`).get(result.conveyor.readinessId);
+  assert.equal(readiness.state, "review_ready");
+  assert.deepEqual(JSON.parse(readiness.source_identity_json), {
+    personId: "person_troy_black",
+    platform: "youtube",
+    platformItemId: "archiveVideooneA",
+    canonicalUrl: "https://www.youtube.com/watch?v=archiveVideooneA",
+  });
+  const queued = await queue(env, "beta-token");
+  assert.ok(queued.assignments.some((item) =>
+    item.workType === "candidate_verification" && item.candidateId === result.conveyor.candidateId));
+
+  const repeated = await bridgeSupportedObservation(env.DB, env.ARTIFACTS, {
+    archiveRevisionId: "archive_revision_one_current",
+    archiveVideoLinkId: "archive_link_one_1",
+    decisionId: "archive_decision_repeat",
+    observationId: "archive_observation_repeat",
+    decision: normalizeArchiveDecision(supportedArchiveBody()),
+    now: "2026-07-20T11:09:00Z",
+  });
+  assert.equal(repeated.bridged, true);
+  assert.equal(env.DB.db.prepare(
+    `SELECT count(*) count FROM review_ready_claim_candidates
+     WHERE candidate_id IN (?,?)`,
+  ).get(result.conveyor.candidateId, repeated.candidateId).count, 2);
+});
+
 test("negative archive outcomes require consistent source checks and cannot masquerade as supported framing", async () => {
   const env = makeEnv({ demo: true });
   seedArchiveWork(env);
-  const assignment = (await queue(env, "alpha-token")).assignments[0];
-  const mislabeled = await reviewPost(context({
-    env, url: `http://localhost/api/review/${assignment.assignmentId}`, method: "POST",
+  const assignment = await openArchiveWork(env, "alpha-token", "archive_work_one");
+  const mislabeled = await archiveReviewPost(context({
+    env, url: `http://localhost/api/review/archive/${assignment.assignmentId}`, method: "POST",
     params: { id: assignment.assignmentId }, headers: headers("alpha-token"),
     body: { workType: "archive_lead_verification", decision: "archive_mismatch",
       rationale: "The available source context does not contain the archive wording.",
@@ -293,8 +511,8 @@ test("negative archive outcomes require consistent source checks and cannot masq
   assert.equal(mislabeled.status, 400);
   assert.equal((await jsonBody(mislabeled)).code, "archive_mismatch_cannot_be_supported");
 
-  const accepted = await reviewPost(context({
-    env, url: `http://localhost/api/review/${assignment.assignmentId}`, method: "POST",
+  const accepted = await archiveReviewPost(context({
+    env, url: `http://localhost/api/review/archive/${assignment.assignmentId}`, method: "POST",
     params: { id: assignment.assignmentId }, headers: headers("alpha-token"),
     body: { workType: "archive_lead_verification", decision: "archive_mismatch",
       rationale: "The available source context does not contain the archive wording.",
@@ -472,8 +690,12 @@ test("second reviewer remains blind and publication reconciles idempotently afte
     env, url: `http://localhost/api/review/${beta.assignment_id}`, params: { id: beta.assignment_id },
     headers: headers("beta-token"),
   }));
-  const serialized = JSON.stringify(await jsonBody(betaDetail));
-  assert.doesNotMatch(serialized, /reviewer_alpha|verified source and independent outcome|outcomeStatus":"false/);
+  const betaBundle = await jsonBody(betaDetail);
+  assert.equal(betaBundle.aiDraftDecision?.outcomeStatus, "false");
+  assert.equal(betaBundle.aiDraftDecision?.provenance, "ai_generated_needs_human_check");
+  assert.equal(betaBundle.reviewState?.previousDecisionsBlinded, true);
+  const serialized = JSON.stringify(betaBundle);
+  assert.doesNotMatch(serialized, /reviewer_alpha|The verified source and independent outcome satisfy the frozen criteria/);
 
   assert.equal((await reconcilePublication(env.DB, CLAIM_ID, now)).state, "awaiting_second_review");
   await submitAssignedClaimReview(env.DB, beta.assignment_id, "reviewer_beta", normalized, now);

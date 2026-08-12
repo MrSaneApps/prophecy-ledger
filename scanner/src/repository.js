@@ -383,6 +383,118 @@ export async function reserveGeminiMedia(db, reservation) {
   }
 }
 
+export async function reserveGeminiPhysicalRequest(db, reservation) {
+  const values = [reservation.physicalRequestId, reservation.logicalReservationId,
+    reservation.mediaDay, reservation.runId, reservation.jobId, reservation.sourceItemId,
+    reservation.chunkIndex, reservation.jobAttempt, reservation.splitPath,
+    reservation.startSeconds, reservation.endSeconds,
+    reservation.endSeconds - reservation.startSeconds,
+    reservation.budgetLimitSeconds, reservation.createdAt || nowIso()];
+  try {
+    await db.prepare(`INSERT INTO gemini_physical_request_reservations
+      (physical_request_id,logical_reservation_id,media_day,run_id,job_id,source_item_id,
+       chunk_index,job_attempt,split_path,start_seconds,end_seconds,reserved_seconds,
+       budget_limit_seconds,created_at)
+      VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)`)
+      .bind(...values).run();
+    return true;
+  } catch (error) {
+    if (/gemini physical media budget exhausted/i.test(error?.message || "")) return false;
+    if (!/UNIQUE constraint failed: gemini_physical_request_reservations/i.test(error?.message || "")) throw error;
+    const stored = await db.prepare(`SELECT logical_reservation_id,media_day,run_id,job_id,
+        source_item_id,chunk_index,job_attempt,split_path,start_seconds,end_seconds,
+        budget_limit_seconds FROM gemini_physical_request_reservations
+      WHERE physical_request_id=?1`).bind(reservation.physicalRequestId).first();
+    if (!stored || stored.logical_reservation_id !== reservation.logicalReservationId ||
+        stored.media_day !== reservation.mediaDay || stored.run_id !== reservation.runId ||
+        stored.job_id !== reservation.jobId || stored.source_item_id !== reservation.sourceItemId ||
+        Number(stored.chunk_index) !== reservation.chunkIndex ||
+        Number(stored.job_attempt) !== reservation.jobAttempt || stored.split_path !== reservation.splitPath ||
+        Number(stored.start_seconds) !== reservation.startSeconds ||
+        Number(stored.end_seconds) !== reservation.endSeconds ||
+        Number(stored.budget_limit_seconds) !== reservation.budgetLimitSeconds) {
+      throw new Error("gemini_physical_request_binding_mismatch");
+    }
+    return true;
+  }
+}
+
+export async function recordGeminiPhysicalRequestResult(db, result) {
+  await db.prepare(`INSERT OR IGNORE INTO gemini_physical_request_results
+    (result_id,physical_request_id,status,safe_cause_code,http_status,response_id,finish_reason,
+     input_tokens,output_tokens,completed_at)
+    VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)`)
+    .bind(result.resultId, result.physicalRequestId, result.status,
+      result.safeCauseCode || null, result.httpStatus || null, result.responseId || null,
+      result.finishReason || null, result.inputTokens ?? null, result.outputTokens ?? null,
+      result.completedAt || nowIso()).run();
+  const stored = await db.prepare(`SELECT physical_request_id,status,safe_cause_code,http_status,
+      response_id,finish_reason,input_tokens,output_tokens FROM gemini_physical_request_results
+    WHERE result_id=?1`).bind(result.resultId).first();
+  if (!stored || stored.physical_request_id !== result.physicalRequestId ||
+      stored.status !== result.status || (stored.safe_cause_code || null) !== (result.safeCauseCode || null)) {
+    throw new Error("gemini_physical_result_not_recorded");
+  }
+  return result.resultId;
+}
+
+export async function recordWorkersAiAttempt(db, attempt) {
+  const receiptId = attempt.receiptId || await stableId("waie", `${attempt.attemptId}:${attempt.status}`);
+  await db.prepare(`INSERT OR IGNORE INTO text_ai_attempt_receipts
+    (receipt_id,attempt_id,work_kind,job_id,job_attempt,analysis_run_id,analysis_section_id,
+     model_name,provider_name,mode,ordinal,status,safe_cause_code,http_status,
+     fallback_eligible,started_at,completed_at,latency_ms)
+    VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18)`)
+    .bind(receiptId, attempt.attemptId, attempt.workKind || "transcript_analysis",
+      attempt.jobId, attempt.jobAttempt, attempt.analysisRunId || null,
+      attempt.analysisSectionId || null, attempt.modelName,
+      attempt.providerName || "workers-ai", attempt.mode, attempt.ordinal, attempt.status,
+      attempt.safeCauseCode || null, attempt.httpStatus || null,
+      attempt.fallbackEligible ? 1 : 0, attempt.startedAt,
+      attempt.completedAt || null, attempt.latencyMs ?? null).run();
+  const stored = await db.prepare(`SELECT attempt_id,work_kind,job_id,job_attempt,analysis_run_id,analysis_section_id,
+      model_name,provider_name,mode,ordinal,status,safe_cause_code,completed_at,latency_ms
+    FROM text_ai_attempt_receipt_history WHERE receipt_id=?1`).bind(receiptId).first();
+  if (!stored || stored.attempt_id !== attempt.attemptId ||
+      stored.work_kind !== (attempt.workKind || "transcript_analysis") || stored.job_id !== attempt.jobId ||
+      Number(stored.job_attempt) !== attempt.jobAttempt ||
+      (stored.analysis_run_id || null) !== (attempt.analysisRunId || null) ||
+      (stored.analysis_section_id || null) !== (attempt.analysisSectionId || null) ||
+      stored.model_name !== attempt.modelName ||
+      !["legacy-unspecified", attempt.providerName || "workers-ai"].includes(stored.provider_name) ||
+      stored.mode !== attempt.mode ||
+      Number(stored.ordinal) !== attempt.ordinal || stored.status !== attempt.status ||
+      (stored.safe_cause_code || null) !== (attempt.safeCauseCode || null) ||
+      (stored.completed_at || null) !== (attempt.completedAt || null) ||
+      (stored.latency_ms === null ? null : Number(stored.latency_ms)) !== (attempt.latencyMs ?? null)) {
+    throw new Error("text_ai_attempt_not_recorded");
+  }
+  return receiptId;
+}
+
+export async function recordQueueObservation(db, observation) {
+  await db.prepare(`INSERT OR IGNORE INTO queue_observation_receipts
+    (observation_id,queue_name,status,backlog_count,backlog_bytes,oldest_message_at,
+     safe_reason_code,observed_at)
+    VALUES (?1,?2,?3,?4,?5,?6,?7,?8)`)
+    .bind(observation.observationId, observation.queueName, observation.status,
+      observation.backlogCount ?? null, observation.backlogBytes ?? null,
+      observation.oldestMessageAt || null, observation.safeReasonCode || null,
+      observation.observedAt).run();
+  const stored = await db.prepare(`SELECT queue_name,status,backlog_count,backlog_bytes,
+      oldest_message_at,safe_reason_code,observed_at FROM queue_observation_receipts
+    WHERE observation_id=?1`).bind(observation.observationId).first();
+  if (!stored || stored.queue_name !== observation.queueName || stored.status !== observation.status ||
+      (stored.backlog_count === null ? null : Number(stored.backlog_count)) !== (observation.backlogCount ?? null) ||
+      (stored.backlog_bytes === null ? null : Number(stored.backlog_bytes)) !== (observation.backlogBytes ?? null) ||
+      (stored.oldest_message_at || null) !== (observation.oldestMessageAt || null) ||
+      (stored.safe_reason_code || null) !== (observation.safeReasonCode || null) ||
+      stored.observed_at !== observation.observedAt) {
+    throw new Error("queue_observation_not_recorded");
+  }
+  return observation.observationId;
+}
+
 export async function recordTranscriptChunkAttempt(db, attempt) {
   await db.prepare(`INSERT OR IGNORE INTO transcript_chunk_attempts
     (chunk_attempt_id,reservation_id,run_id,job_id,source_item_id,chunk_index,start_seconds,end_seconds,

@@ -6,11 +6,21 @@
   "description": "Neutral, evidence-first claim ledger MVP",
   "scripts": {
     "test": "node --test 'test/**/*.test.mjs'",
-    "check:imports": "find public functions scanner/src -name '*.js' -print0 | xargs -0 -n1 node --check",
+    "check:imports": "node scripts/import-check.mjs",
     "check": "npm test && npm run check:imports",
     "dev": "wrangler pages dev public --persist-to .wrangler/state",
     "dev:review": "wrangler pages dev public --persist-to .wrangler/state --binding REVIEW_DEMO_MODE=1",
-    "deploy:pages": "wrangler pages deploy public --project-name=prophecy-ledger --commit-dirty=true"
+    "deploy:pages": "node scripts/deploy-runtime.mjs --apply",
+    "smoke:reviewer": "node scripts/reviewer-smoke.mjs",
+    "deploy:pages:nosmoke": "node scripts/deploy-runtime.mjs --apply",
+    "bakeoff:research": "node scripts/research-provider-bakeoff.mjs",
+    "reconcile:analysis": "node scripts/analysis-reconciler.mjs",
+    "conveyor:machine": "node scripts/machine-conveyor.mjs --limit 25",
+    "deploy:runtime": "node scripts/deploy-runtime.mjs",
+    "test:reviewer-workflows": "node --test test/reviewer-workflows-e2e.test.mjs",
+    "e2e:reviewer": "bash scripts/run-reviewer-click-e2e.sh --mode local",
+    "e2e:reviewer:live": "node scripts/reviewer-click-e2e.mjs --mode live",
+    "e2e:reviewer:wrap": "bash scripts/run-reviewer-click-e2e.sh"
   },
   "devDependencies": {
     "wrangler": "4.104.0"

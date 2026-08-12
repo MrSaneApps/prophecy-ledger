@@ -16,7 +16,7 @@ export async function onRequestGet({ request, env, params }) {
     return json(catalogue);
   } catch (error) {
     if (error instanceof SourceCatalogueError) return apiError(error.message, error.code, 400);
-    if (/no such table:\s*(source_items|source_item_revisions|transcript_artifacts|claim_candidates)/i.test(String(error?.message || error))) {
+    if (/no such (?:table|view):\s*(source_items|source_item_revisions|transcript_artifacts|claim_candidates|transcript_analysis_runs|transcript_batch_items|effective_transcript_batch_item_dispositions|review_work_items|review_assignments|candidate_review_decisions)/i.test(String(error?.message || error))) {
       return apiError("The source catalogue is not ready yet.", "catalogue_not_ready", 503);
     }
     console.error("source_catalogue_failed", error);

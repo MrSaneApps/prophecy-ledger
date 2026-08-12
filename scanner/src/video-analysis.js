@@ -5,7 +5,8 @@ import {
 import { sha256, stableId } from "./hash.js";
 import {
   disputedVideoCandidateIds, latestCompletedVideoAttempt, nowIso, primaryVideoCandidates,
-  recordVideoAnalysisFailure, recordVideoAnalysisSuccess, videoAttempt, videoChecks,
+  recordGeminiPhysicalRequestResult, recordVideoAnalysisFailure, recordVideoAnalysisSuccess,
+  reserveGeminiMedia, reserveGeminiPhysicalRequest, videoAttempt, videoChecks,
 } from "./repository.js";
 
 const PROMPT_VERSIONS = Object.freeze({
@@ -87,7 +88,108 @@ async function attemptRecord({
 async function callAndRecordFailure(env, args, call) {
   try { return await call(); }
   catch (error) {
-    await recordVideoAnalysisFailure(env.DB, await attemptRecord({ ...args, result: error.geminiResult || null, error }));
+    if (error.providerCallStarted) {
+      await recordVideoAnalysisFailure(env.DB,
+        await attemptRecord({ ...args, result: error.geminiResult || null, error }));
+    }
+    throw error;
+  }
+}
+
+function safePhysicalVideoCause(error) {
+  const message = String(error?.message || "");
+  if (message === "gemini_timeout") return "gemini_timeout";
+  if (message === "gemini_network_error") return "gemini_network_error";
+  if (message === "gemini_http_429") return "gemini_http_429";
+  if (/^gemini_http_5\d\d$/.test(message)) return "gemini_http_5xx";
+  if (/^gemini_http_4\d\d$/.test(message)) return "gemini_http_4xx";
+  if (message === "gemini_incomplete_response") return message;
+  return "physical_result_unknown";
+}
+
+function nextUtcDay(at) {
+  const next = new Date(Date.parse(at));
+  next.setUTCDate(next.getUTCDate() + 1);
+  next.setUTCHours(0, 0, 0, 0);
+  return next.toISOString();
+}
+
+async function sourceDurationSeconds(env, sourceItemId) {
+  const row = await env.DB.prepare(`SELECT duration_seconds FROM source_media_metadata
+    WHERE source_item_id=?1 ORDER BY observed_at DESC,metadata_id DESC LIMIT 1`)
+    .bind(sourceItemId).first();
+  const duration = Number(row?.duration_seconds);
+  if (!Number.isInteger(duration) || duration < 1 || duration > 43_200) {
+    throw new Error("video_duration_receipt_required");
+  }
+  return duration;
+}
+
+async function callMeteredGeminiVideo(env, { envelope, job, sourceItemId, stage,
+  physicalNow = nowIso }, call) {
+  const durationSeconds = await sourceDurationSeconds(env, sourceItemId);
+  // The day is deliberately derived here, immediately before this physical provider call.
+  const createdAt = physicalNow();
+  const mediaDay = createdAt.slice(0, 10);
+  const budgetLimitSeconds = Math.min(86_400,
+    Math.max(1, Number(env.GEMINI_DAILY_MEDIA_SECONDS) || 86_400));
+  const logicalReservationId = await stableId("gmr",
+    `${envelope.jobId}:${job.attempt_count}:video:${stage}`);
+  const logicalReserved = await reserveGeminiMedia(env.DB, {
+    reservationId: logicalReservationId, mediaDay, runId: envelope.runId,
+    jobId: envelope.jobId, sourceItemId, chunkIndex: 0,
+    jobAttempt: Number(job.attempt_count), startSeconds: 0, endSeconds: durationSeconds,
+    budgetLimitSeconds, createdAt,
+  });
+  if (!logicalReserved) {
+    const error = new Error("gemini_video_budget_deferred");
+    error.defer = true; error.eligibleAt = nextUtcDay(createdAt);
+    error.retryAfterSeconds = Math.max(300,
+      Math.ceil((Date.parse(error.eligibleAt) - Date.parse(createdAt)) / 1000));
+    throw error;
+  }
+  const physicalRequestId = await stableId("gpr",
+    `${logicalReservationId}:root:0:${durationSeconds}`);
+  const physicalReserved = await reserveGeminiPhysicalRequest(env.DB, {
+    physicalRequestId, logicalReservationId, mediaDay, runId: envelope.runId,
+    jobId: envelope.jobId, sourceItemId, chunkIndex: 0,
+    jobAttempt: Number(job.attempt_count), splitPath: "root", startSeconds: 0,
+    endSeconds: durationSeconds, budgetLimitSeconds, createdAt,
+  });
+  if (!physicalReserved) {
+    const error = new Error("gemini_video_budget_deferred");
+    error.defer = true; error.eligibleAt = nextUtcDay(createdAt);
+    error.retryAfterSeconds = Math.max(300,
+      Math.ceil((Date.parse(error.eligibleAt) - Date.parse(createdAt)) / 1000));
+    throw error;
+  }
+  const resultId = await stableId("gpres", physicalRequestId);
+  try {
+    const result = await call();
+    try {
+      await recordGeminiPhysicalRequestResult(env.DB, {
+        resultId, physicalRequestId, status: "completed", safeCauseCode: null,
+        httpStatus: result.httpStatus || null, responseId: result.interactionId || null,
+        completedAt: nowIso(),
+      });
+    } catch (error) { error.providerCallStarted = true; throw error; }
+    return result;
+  } catch (error) {
+    error.providerCallStarted = true;
+    const prior = await env.DB.prepare(`SELECT status FROM gemini_physical_request_results
+      WHERE physical_request_id=?1`).bind(physicalRequestId).first();
+    if (!prior) {
+      try {
+        await recordGeminiPhysicalRequestResult(env.DB, {
+          resultId, physicalRequestId, status: "failed", safeCauseCode: safePhysicalVideoCause(error),
+          httpStatus: error.geminiResult?.httpStatus || null,
+          responseId: error.geminiResult?.interactionId || null, completedAt: nowIso(),
+        });
+      } catch (receiptError) {
+        receiptError.providerCallStarted = true;
+        throw receiptError;
+      }
+    }
     throw error;
   }
 }
@@ -106,7 +208,7 @@ function tiebreakerDescriptor(envelope, primaryAttemptId, verifierAttemptId, can
   };
 }
 
-export async function processPrimaryVideoAnalysis(env, envelope, job) {
+export async function processPrimaryVideoAnalysis(env, envelope, job, options = {}) {
   const item = await trustedVideo(env, envelope);
   const existing = await latestCompletedVideoAttempt(env.DB, envelope.jobId);
   if (existing) {
@@ -116,10 +218,12 @@ export async function processPrimaryVideoAnalysis(env, envelope, job) {
   const stage = "primary", model = modelFor(env, stage), prompt = primaryVideoPrompt(), startedAt = nowIso();
   const gateway = gatewayOptions(env);
   const args = { envelope, job, stage, sourceItemId: item.source_item_id, model, prompt, gatewayId: gateway.gatewayId, startedAt };
-  const result = await callAndRecordFailure(env, args, () => extractPublicVideoClaims({
-    ...gateway, model, videoUrl: item.canonical_url, timeoutMs: timeoutMs(env),
-    fetcher: env.GEMINI_FETCH || fetch,
-  }));
+  const result = await callAndRecordFailure(env, args, () => callMeteredGeminiVideo(env,
+    { envelope, job, sourceItemId: item.source_item_id, stage,
+      physicalNow: options.physicalNow || nowIso }, () => extractPublicVideoClaims({
+      ...gateway, model, videoUrl: item.canonical_url, timeoutMs: timeoutMs(env),
+      fetcher: env.GEMINI_FETCH || fetch,
+    })));
   const attempt = await attemptRecord({ ...args, result });
   const createdAt = nowIso();
   const candidates = await Promise.all(result.claims.map(async (claim, ordinal) => ({
@@ -130,7 +234,7 @@ export async function processPrimaryVideoAnalysis(env, envelope, job) {
   return candidates.length ? [verifierDescriptor(envelope, attempt.attemptId)] : [];
 }
 
-export async function processVerifierVideoAnalysis(env, envelope, job) {
+export async function processVerifierVideoAnalysis(env, envelope, job, options = {}) {
   const item = await trustedVideo(env, envelope);
   const primary = await videoAttempt(env.DB, envelope.payload.primaryAttemptId, item.source_item_id);
   if (!primary || primary.stage !== "primary") throw new Error("primary_video_attempt_required");
@@ -148,10 +252,12 @@ export async function processVerifierVideoAnalysis(env, envelope, job) {
     envelope, job, stage, sourceItemId: item.source_item_id, parentAttemptId: primary.attempt_id,
     model, prompt, gatewayId: gateway.gatewayId, startedAt,
   };
-  const result = await callAndRecordFailure(env, args, () => verifyPublicVideoClaims({
-    ...gateway, model, videoUrl: item.canonical_url, candidates,
-    timeoutMs: timeoutMs(env), fetcher: env.GEMINI_FETCH || fetch,
-  }));
+  const result = await callAndRecordFailure(env, args, () => callMeteredGeminiVideo(env,
+    { envelope, job, sourceItemId: item.source_item_id, stage,
+      physicalNow: options.physicalNow || nowIso }, () => verifyPublicVideoClaims({
+      ...gateway, model, videoUrl: item.canonical_url, candidates,
+      timeoutMs: timeoutMs(env), fetcher: env.GEMINI_FETCH || fetch,
+    })));
   const attempt = await attemptRecord({ ...args, result });
   const createdAt = nowIso();
   const checks = []; const agreements = []; const disputed = [];
@@ -171,7 +277,7 @@ export async function processVerifierVideoAnalysis(env, envelope, job) {
   return disputed.length ? [tiebreakerDescriptor(envelope, primary.attempt_id, attempt.attemptId, disputed)] : [];
 }
 
-export async function processTiebreakerVideoAnalysis(env, envelope, job) {
+export async function processTiebreakerVideoAnalysis(env, envelope, job, options = {}) {
   const item = await trustedVideo(env, envelope);
   const primary = await videoAttempt(env.DB, envelope.payload.primaryAttemptId, item.source_item_id);
   const verifier = await videoAttempt(env.DB, envelope.payload.verifierAttemptId, item.source_item_id);
@@ -193,10 +299,12 @@ export async function processTiebreakerVideoAnalysis(env, envelope, job) {
     envelope, job, stage, sourceItemId: item.source_item_id, parentAttemptId: verifier.attempt_id,
     model, prompt, gatewayId: gateway.gatewayId, startedAt,
   };
-  const result = await callAndRecordFailure(env, args, () => tiebreakPublicVideoClaims({
-    ...gateway, model, videoUrl: item.canonical_url, candidates: disputes,
-    timeoutMs: timeoutMs(env), fetcher: env.GEMINI_FETCH || fetch,
-  }));
+  const result = await callAndRecordFailure(env, args, () => callMeteredGeminiVideo(env,
+    { envelope, job, sourceItemId: item.source_item_id, stage,
+      physicalNow: options.physicalNow || nowIso }, () => tiebreakPublicVideoClaims({
+      ...gateway, model, videoUrl: item.canonical_url, candidates: disputes,
+      timeoutMs: timeoutMs(env), fetcher: env.GEMINI_FETCH || fetch,
+    })));
   const attempt = await attemptRecord({ ...args, result });
   const createdAt = nowIso();
   const checks = []; const agreements = []; const escalations = [];

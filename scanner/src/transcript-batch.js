@@ -1,19 +1,33 @@
 import { sha256, stableId } from "./hash.js";
-import { completedTranscriptChunks, nowIso, recordSourceMediaMetadata, registerJob } from "./repository.js";
+import { nowIso, recordSourceMediaMetadata, registerJob } from "./repository.js";
 import {
-  ensureTranscriptAnalysisPreparationRun, fetchYouTubeDataApiDuration, fetchYouTubeDuration,
-  STITCH_ALGORITHM, stitchTranscript, transcriptAnalysisPreparationEnvelope, transcriptPlan,
+  fetchYouTubeDataApiDuration, fetchYouTubeDuration, TRANSCRIPT_PLAN_VERSION,
 } from "./transcript.js";
+import { repairLegacyStitchedTranscriptBatchItemImpl } from "./transcript-batch-legacy-repair.js";
 
 const PERSON_ID = "person_troy_black";
 const BATCH_ID = /^txb_[a-f0-9]{32}$/;
 const BATCH_ITEM_ID = /^txbi_[a-f0-9]{32}_[a-f0-9]{32}$/;
 const IDEMPOTENCY_KEY = /^[A-Za-z0-9][A-Za-z0-9._:-]{7,127}$/;
+const SOURCE_UNAVAILABLE_REASON = "source_unavailable";
+const SOURCE_UNAVAILABLE_ERROR = "youtube_data_api_video_not_found";
 
 function changed(result) {
   return Boolean(result?.meta?.changes);
 }
-
+async function currentPhysicalMedia(env, at) {
+  const mediaDay = new Date(at).toISOString().slice(0, 10), configured = Number(env.GEMINI_DAILY_MEDIA_SECONDS);
+  const limitSeconds = Number.isInteger(configured) && configured >= 1 && configured <= 86_400
+    ? configured : 86_400;
+  const tables = await env.DB.prepare(`SELECT name FROM sqlite_master WHERE type='table'
+    AND name IN ('gemini_physical_request_reservations','gemini_physical_day_debits')`).all();
+  const available = new Set((tables.results || []).map((row) => row.name)).size === 2;
+  const usage = available ? await env.DB.prepare(`SELECT (SELECT COALESCE(SUM(reserved_seconds),0) FROM
+    gemini_physical_request_reservations WHERE media_day=?1) request_seconds,(SELECT COALESCE(SUM(reserved_seconds),0)
+    FROM gemini_physical_day_debits WHERE media_day=?1) debit_seconds`).bind(mediaDay).first() : null;
+  const mediaSeconds = Number(usage?.request_seconds || 0) + Number(usage?.debit_seconds || 0);
+  return { mediaDay, mediaSeconds, mediaLimitSeconds: limitSeconds, exhausted: available && mediaSeconds >= limitSeconds, available };
+}
 export function nextTranscriptBatchDay(at = nowIso()) {
   const next = new Date(at);
   next.setUTCHours(24, 0, 5, 0);
@@ -25,7 +39,7 @@ function transcriptEnvelope(item, payload = null) {
     version: 1, jobId: payload.jobId, runId: payload.runId, personId: payload.personId,
     type: payload.type, stableKey: payload.stableKey, payload: payload.payload,
   };
-  const stableKey = `youtube:${item.youtube_id}:transcript:chunk:0`;
+  const stableKey = `youtube:${item.youtube_id}:transcript:${TRANSCRIPT_PLAN_VERSION}:chunk:0`;
   return {
     version: 1,
     jobId: item.first_job_id,
@@ -34,7 +48,7 @@ function transcriptEnvelope(item, payload = null) {
     type: "transcript_extract",
     stableKey,
     payload: {
-      phase: "chunk", chunkIndex: 0, youtubeId: item.youtube_id,
+      phase: "chunk", planVersion: TRANSCRIPT_PLAN_VERSION, chunkIndex: 0, youtubeId: item.youtube_id,
       sourceItemId: item.source_item_id, durationSeconds: Number(item.duration_seconds),
       batchId: item.batch_id, batchItemId: item.batch_item_id,
     },
@@ -43,7 +57,7 @@ function transcriptEnvelope(item, payload = null) {
 
 async function firstTranscriptEnvelope(item) {
   if (item.first_job_id) return transcriptEnvelope(item);
-  const stableKey = `youtube:${item.youtube_id}:transcript:chunk:0`;
+  const stableKey = `youtube:${item.youtube_id}:transcript:${TRANSCRIPT_PLAN_VERSION}:chunk:0`;
   const firstJobId = await stableId("job", `${item.run_id}:transcript_extract:${stableKey}`);
   return transcriptEnvelope({ ...item, first_job_id: firstJobId });
 }
@@ -74,10 +88,31 @@ async function activeItem(db, batchId) {
     WHERE item.batch_id=?1 AND item.status='active' ORDER BY job.job_id LIMIT 1`).bind(batchId).first();
 }
 
+async function dispositionProjectionAvailable(db) {
+  const projection = await db.prepare(`SELECT 1 ok FROM sqlite_master
+    WHERE type='view' AND name='effective_transcript_batch_item_dispositions'`).first();
+  return projection?.ok === 1;
+}
+
 async function statusCounts(db, batchId) {
-  const rows = await db.prepare(`SELECT status,COUNT(*) count FROM transcript_batch_items
-    WHERE batch_id=?1 GROUP BY status`).bind(batchId).all();
-  return Object.fromEntries((rows.results || []).map((row) => [row.status, Number(row.count)]));
+  let rows;
+  try {
+    rows = await db.prepare(`SELECT effective_status AS status,COUNT(*) count FROM (
+      SELECT CASE WHEN item.status='pending' AND disposition.batch_item_id IS NOT NULL
+        THEN 'quarantined' ELSE item.status END AS effective_status
+      FROM transcript_batch_items item
+      LEFT JOIN effective_transcript_batch_item_dispositions disposition
+        ON disposition.batch_item_id=item.batch_item_id
+      WHERE item.batch_id=?1
+    ) effective_items GROUP BY effective_status`).bind(batchId).all();
+  } catch (error) {
+    if (!/no such table:\s*effective_transcript_batch_item_dispositions/i.test(String(error?.message || error))) throw error;
+    rows = await db.prepare(`SELECT status,COUNT(*) count FROM transcript_batch_items
+      WHERE batch_id=?1 GROUP BY status`).bind(batchId).all();
+  }
+  const counts = { completed: 0, active: 0, pending: 0, quarantined: 0, skipped: 0 };
+  for (const row of rows.results || []) counts[row.status] = Number(row.count);
+  return counts;
 }
 
 export async function transcriptBatchStatus(env, batchId) {
@@ -89,6 +124,8 @@ export async function transcriptBatchStatus(env, batchId) {
   return {
     batchId: batch.batch_id, status: batch.status, itemCount: Number(batch.item_count),
     completedItemCount: Number(batch.completed_item_count), counts,
+    pendingItemCount: counts.pending, quarantinedItemCount: counts.quarantined,
+    skippedItemCount: counts.skipped, transitionCount: Number(batch.transition_count || 0),
     pauseReason: batch.pause_reason, resumeAfter: batch.resume_after,
     createdAt: batch.created_at, startedAt: batch.started_at, pausedAt: batch.paused_at,
     completedAt: batch.completed_at,
@@ -143,12 +180,19 @@ async function resolveDuration(env, item, durationFetcher) {
 
 async function finishBatchIfEmpty(env, batchId, at) {
   const eventId = await stableId("txbe", `${batchId}:completed`);
+  const hasDispositions = await dispositionProjectionAvailable(env.DB);
+  const unfinished = hasDispositions ? `NOT EXISTS (SELECT 1 FROM transcript_batch_items item
+          LEFT JOIN effective_transcript_batch_item_dispositions disposition
+            ON disposition.batch_item_id=item.batch_item_id
+          WHERE item.batch_id=?1 AND (item.status='active'
+            OR (item.status='pending' AND disposition.batch_item_id IS NULL)))`
+    : `NOT EXISTS (SELECT 1 FROM transcript_batch_items
+          WHERE batch_id=?1 AND status IN ('pending','active'))`;
   const [result] = await env.DB.batch([
     env.DB.prepare(`UPDATE transcript_batches SET status='completed',completed_at=?2,
-        completed_item_count=item_count,pause_reason=NULL,resume_after=NULL
-      WHERE batch_id=?1 AND status='running'
-        AND NOT EXISTS (SELECT 1 FROM transcript_batch_items
-          WHERE batch_id=?1 AND status IN ('pending','active'))`).bind(batchId, at),
+        completed_item_count=(SELECT COUNT(*) FROM transcript_batch_items
+          WHERE batch_id=?1 AND status='completed'),pause_reason=NULL,resume_after=NULL
+      WHERE batch_id=?1 AND status='running' AND ${unfinished}`).bind(batchId, at),
     env.DB.prepare(`INSERT OR IGNORE INTO transcript_batch_events
       (event_id,batch_id,batch_item_id,event_type,detail_json,created_at)
       SELECT ?1,?2,NULL,'batch_completed','{}',?3
@@ -164,19 +208,26 @@ async function archiveSelectorAvailable(db) {
   return selector?.ok === 1;
 }
 
-async function nextPendingItem(env, batch) {
+async function nextPendingItem(env, batch, excludedBatchItemId = null) {
+  const hasDispositions = await dispositionProjectionAvailable(env.DB);
+  const dispositionClause = hasDispositions ? `AND NOT EXISTS (
+      SELECT 1 FROM effective_transcript_batch_item_dispositions disposition
+      WHERE disposition.batch_item_id=item.batch_item_id)` : "";
   if (!(await archiveSelectorAvailable(env.DB))) {
-    return env.DB.prepare(`SELECT * FROM transcript_batch_items
-      WHERE batch_id=?1 AND status='pending' ORDER BY ordinal,batch_item_id LIMIT 1`)
-      .bind(batch.batch_id).first();
+    return env.DB.prepare(`SELECT item.* FROM transcript_batch_items item
+      WHERE item.batch_id=?1 AND item.status='pending'
+        AND (?2 IS NULL OR item.batch_item_id<>?2) ${dispositionClause}
+      ORDER BY item.ordinal,item.batch_item_id LIMIT 1`)
+      .bind(batch.batch_id, excludedBatchItemId).first();
   }
   return env.DB.prepare(`SELECT item.* FROM transcript_batch_items item
     WHERE item.batch_id=?1 AND item.status='pending'
+      AND (?3 IS NULL OR item.batch_item_id<>?3) ${dispositionClause}
     ORDER BY CASE WHEN EXISTS (
       SELECT 1 FROM archive_linked_video_selector archive
       WHERE archive.person_id=?2 AND archive.source_item_id=item.source_item_id
     ) THEN 0 ELSE 1 END,item.ordinal,item.batch_item_id LIMIT 1`)
-    .bind(batch.batch_id, batch.person_id).first();
+    .bind(batch.batch_id, batch.person_id, excludedBatchItemId).first();
 }
 
 async function activateNextItem(env, batchId, { at = nowIso(), durationFetcher = fetch } = {}) {
@@ -195,8 +246,11 @@ async function activateNextItem(env, batchId, { at = nowIso(), durationFetcher =
       reason: error?.message || "duration_lookup_failed", at, resumeAfter: at });
     return { envelope: null, reason: error?.message || "duration_lookup_failed" };
   }
-  const runId = await stableId("runtxb", `${batchId}:${item.batch_item_id}:${durationSeconds}`);
-  const stableKey = `youtube:${item.youtube_id}:transcript:chunk:0`;
+  // Include activation time so a requeued item cannot collide with a prior failed run/job
+  // (prod bug: 5n8QpgQXXaU requeue reused runtxb_019c… and the old failed chunk:0 job forever).
+  const runId = await stableId("runtxb",
+    `${batchId}:${item.batch_item_id}:${durationSeconds}:${TRANSCRIPT_PLAN_VERSION}:${at}`);
+  const stableKey = `youtube:${item.youtube_id}:transcript:${TRANSCRIPT_PLAN_VERSION}:chunk:0`;
   const jobId = await stableId("job", `${runId}:transcript_extract:${stableKey}`);
   const eventId = await stableId("txbe", `${batchId}:${item.batch_item_id}:started`);
   const activated = { ...item, batch_id: batchId, run_id: runId,
@@ -206,7 +260,8 @@ async function activateNextItem(env, batchId, { at = nowIso(), durationFetcher =
     env.DB.prepare(`INSERT OR IGNORE INTO ingestion_runs
       (run_id,person_id,trigger_type,scope,status,created_at)
       VALUES (?1,?2,'manual',?3,'queued',?4)`)
-      .bind(runId, PERSON_ID, `transcript:${item.source_item_id}:${durationSeconds}:batch:${batchId}`, at),
+      .bind(runId, PERSON_ID,
+        `transcript:${item.source_item_id}:${durationSeconds}:plan:${TRANSCRIPT_PLAN_VERSION}:batch:${batchId}`, at),
     env.DB.prepare(`UPDATE transcript_batch_items SET status='active',run_id=?3,duration_seconds=?4,started_at=?5
       WHERE batch_id=?1 AND batch_item_id=?2 AND status='pending'
         AND NOT EXISTS (SELECT 1 FROM transcript_batch_items WHERE status='active')`)
@@ -284,175 +339,12 @@ export async function syncArchiveLinkedTranscriptBatch(env, { batchId, at = nowI
     batchId, itemCount: status.itemCount };
 }
 
-function acquisitionSettings(env) {
-  const integer = (value, fallback, minimum, maximum) => {
-    const parsed = Number(value);
-    return Number.isInteger(parsed) && parsed >= minimum && parsed <= maximum ? parsed : fallback;
-  };
-  return { chunkSeconds: integer(env.TRANSCRIPT_CHUNK_SECONDS, 300, 60, 300),
-    overlapSeconds: integer(env.TRANSCRIPT_OVERLAP_SECONDS, 0, 0, 30) };
-}
-
-async function legacyStitchEvidence(env, item) {
-  const receipt = await env.DB.prepare(`SELECT receipt.*,artifact.r2_key,artifact.content_sha256,
-      artifact.byte_count,artifact.source_item_id artifact_source_item_id,artifact.provenance,
-      job.job_type,job.stable_key,job.payload_json,run.person_id,run.scope,
-      source.platform,source.platform_item_id,source.canonical_url
-    FROM transcript_stitch_receipts receipt
-    JOIN transcript_artifacts artifact ON artifact.transcript_id=receipt.transcript_id
-    JOIN ingestion_jobs job ON job.job_id=receipt.job_id AND job.run_id=receipt.run_id
-    JOIN ingestion_runs run ON run.run_id=receipt.run_id
-    JOIN source_items source ON source.source_item_id=receipt.source_item_id
-    WHERE receipt.run_id=?1 AND receipt.source_item_id=?2
-    ORDER BY receipt.created_at DESC,receipt.stitch_id DESC LIMIT 1`)
-    .bind(item.run_id, item.source_item_id).first();
-  if (!receipt) throw new Error("legacy_stitch_receipt_missing");
-  let payload;
-  try { payload = JSON.parse(receipt.payload_json); }
-  catch { throw new Error("legacy_stitch_job_binding_invalid"); }
-  const expectedScope = `transcript:${item.source_item_id}:${item.duration_seconds}:batch:${item.batch_id}`;
-  const expectedStableKey = `youtube:${item.youtube_id}:transcript:stitch`;
-  if (receipt.job_type !== "transcript_extract" || receipt.stable_key !== expectedStableKey ||
-      receipt.scope !== expectedScope || receipt.person_id !== item.person_id ||
-      receipt.platform !== "youtube" || receipt.platform_item_id !== item.youtube_id ||
-      receipt.canonical_url !== `https://www.youtube.com/watch?v=${item.youtube_id}` ||
-      receipt.artifact_source_item_id !== item.source_item_id ||
-      receipt.provenance !== "gemini_generated_public_youtube_clipped_v1" ||
-      payload?.phase !== "stitch" || payload?.batchId !== item.batch_id ||
-      payload?.batchItemId !== item.batch_item_id || payload?.sourceItemId !== item.source_item_id ||
-      payload?.youtubeId !== item.youtube_id || Number(payload?.durationSeconds) !== Number(item.duration_seconds)) {
-    throw new Error("legacy_stitch_job_binding_invalid");
-  }
-  if (Number(receipt.duration_seconds) !== Number(item.duration_seconds) ||
-      receipt.stitch_algorithm !== STITCH_ALGORITHM ||
-      !/^[a-f0-9]{64}$/.test(receipt.input_manifest_sha256 || "") ||
-      !/^[a-f0-9]{64}$/.test(receipt.content_sha256 || "")) {
-    throw new Error("legacy_stitch_receipt_invalid");
-  }
-  const plan = transcriptPlan(Number(item.duration_seconds), acquisitionSettings(env));
-  const chunks = await completedTranscriptChunks(env.DB, item.run_id, item.source_item_id);
-  if (chunks.length !== plan.length || Number(receipt.chunk_count) !== plan.length) {
-    throw new Error("legacy_stitch_chunks_incomplete");
-  }
-  const texts = [];
-  for (const [index, row] of chunks.entries()) {
-    const window = plan[index];
-    if (Number(row.chunk_index) !== index || Number(row.start_seconds) !== window.requestStart ||
-        Number(row.end_seconds) !== window.requestEnd ||
-        Number(row.overlap_seconds) !== acquisitionSettings(env).overlapSeconds ||
-        !/^[a-f0-9]{64}$/.test(row.content_sha256 || "")) {
-      throw new Error("legacy_stitch_chunks_incomplete");
-    }
-    const object = await env.ARTIFACTS.get(row.r2_key);
-    if (!object) throw new Error("legacy_stitch_chunk_artifact_missing");
-    const text = await object.text();
-    if (await sha256(text) !== row.content_sha256 ||
-        new TextEncoder().encode(text).length !== Number(row.byte_count)) {
-      throw new Error("legacy_stitch_chunk_hash_mismatch");
-    }
-    texts.push(text);
-  }
-  if (await sha256(chunks.map((row) => row.content_sha256)) !== receipt.input_manifest_sha256) {
-    throw new Error("legacy_stitch_manifest_hash_mismatch");
-  }
-  const expected = stitchTranscript(texts, plan);
-  const object = await env.ARTIFACTS.get(receipt.r2_key);
-  if (!object) throw new Error("legacy_stitch_artifact_missing");
-  const transcript = await object.text();
-  if (transcript !== expected.text || await sha256(transcript) !== receipt.content_sha256 ||
-      new TextEncoder().encode(transcript).length !== Number(receipt.byte_count) ||
-      Number(receipt.cue_count) !== expected.cueCount) {
-    throw new Error("legacy_stitch_content_hash_mismatch");
-  }
-  return { receipt, transcript };
-}
-
-async function resumeBatchForLegacyRepair(env, item, at) {
-  const batch = await batchRow(env.DB, item.batch_id);
-  if (batch.status === "running") return;
-  if (batch.status !== "paused") throw new Error("batch_not_open");
-  const transition = Number(batch.transition_count) + 1;
-  const eventId = await stableId("txbe", `${item.batch_id}:transition:${transition}:resumed`);
-  const [resumed] = await env.DB.batch([
-    env.DB.prepare(`UPDATE transcript_batches SET status='running',pause_reason=NULL,
-      resume_after=NULL,paused_at=NULL,transition_count=?3
-      WHERE batch_id=?1 AND status='paused' AND transition_count=?2`)
-      .bind(item.batch_id, Number(batch.transition_count), transition),
-    env.DB.prepare(`INSERT OR IGNORE INTO transcript_batch_events
-      (event_id,batch_id,batch_item_id,event_type,detail_json,created_at)
-      SELECT ?1,?2,?3,'batch_resumed',?4,?5 WHERE EXISTS (
-        SELECT 1 FROM transcript_batches WHERE batch_id=?2 AND status='running' AND transition_count=?6)`)
-      .bind(eventId, item.batch_id, item.batch_item_id,
-        JSON.stringify({ action: "legacy_stitch_repair" }), at, transition),
-  ]);
-  if (!changed(resumed)) throw new Error("legacy_stitch_resume_lost");
-}
-
-export async function repairLegacyStitchedTranscriptBatchItem(env, { batchId, batchItemId,
-  at = nowIso(), durationFetcher = fetch } = {}) {
-  if (!BATCH_ID.test(batchId || "") || !BATCH_ITEM_ID.test(batchItemId || "")) {
-    return { repaired: false, reason: "invalid_batch_item" };
-  }
-  const existingEvent = await env.DB.prepare(`SELECT repair_event_id FROM transcript_batch_repair_events
-    WHERE batch_id=?1 AND batch_item_id=?2 AND event_type='legacy_stitch_repaired' LIMIT 1`)
-    .bind(batchId, batchItemId).first();
-  if (existingEvent) return { repaired: true, reused: true, batchId, batchItemId };
-  const item = await env.DB.prepare(`SELECT item.*,batch.person_id,batch.status batch_status
-    FROM transcript_batch_items item JOIN transcript_batches batch ON batch.batch_id=item.batch_id
-    WHERE item.batch_id=?1 AND item.batch_item_id=?2`).bind(batchId, batchItemId).first();
-  if (!item) return { repaired: false, reason: "batch_item_not_found" };
-  if (!["active", "completed"].includes(item.status) || !item.run_id || !item.duration_seconds) {
-    return { repaired: false, reason: "legacy_stitch_item_not_repairable" };
-  }
-  if (item.status === "active" && !["running", "paused"].includes(item.batch_status)) {
-    return { repaired: false, reason: "batch_not_open" };
-  }
-  let evidence;
-  try { evidence = await legacyStitchEvidence(env, item); }
-  catch (error) { return { repaired: false, reason: error?.message || "legacy_stitch_verification_failed" }; }
-  if (item.status === "active") {
-    try { await resumeBatchForLegacyRepair(env, item, at); }
-    catch (error) { return { repaired: false, reason: error?.message || "legacy_stitch_resume_failed" }; }
-  }
-  const acquisition = item.status === "active" ? await completeTranscriptBatchItem(env, {
-    batchId, batchItemId, at, durationFetcher,
-  }) : [];
-  for (const envelope of acquisition) {
-    const sent = await dispatchTranscriptBatchEnvelope(env, batchId, envelope.payload.batchItemId, envelope, at);
-    if (!sent) return { repaired: false, reason: "next_acquisition_dispatch_failed" };
-  }
-  const preparation = await transcriptAnalysisPreparationEnvelope({
-    transcriptId: evidence.receipt.transcript_id, sourceItemId: item.source_item_id,
-    personId: item.person_id, transcriptSha256: evidence.receipt.content_sha256,
+export async function repairLegacyStitchedTranscriptBatchItem(env, options = {}) {
+  return repairLegacyStitchedTranscriptBatchItemImpl(env, options, {
+    batchRow, changed, completeTranscriptBatchItem, dispatchTranscriptBatchEnvelope,
+    transcriptBatchStatus,
   });
-  try {
-    await ensureTranscriptAnalysisPreparationRun(env.DB, preparation, at);
-    await registerJob(env.DB, preparation, at);
-    await env.INGESTION_QUEUE.send(preparation);
-  } catch {
-    return { repaired: false, reason: "analysis_preparation_dispatch_failed",
-      acquisitionAdvanced: acquisition.length === 1, batchId, batchItemId };
-  }
-  const repairEventId = await stableId("txbrep",
-    `${batchId}:${batchItemId}:legacy_stitch_repaired:${evidence.receipt.transcript_id}:${evidence.receipt.input_manifest_sha256}`);
-  await env.DB.prepare(`INSERT OR IGNORE INTO transcript_batch_repair_events
-    (repair_event_id,batch_id,batch_item_id,event_type,detail_json,created_at)
-    VALUES (?1,?2,?3,'legacy_stitch_repaired',?4,?5)`)
-    .bind(repairEventId, batchId, batchItemId, JSON.stringify({
-      transcriptId: evidence.receipt.transcript_id,
-      contentSha256: evidence.receipt.content_sha256,
-      manifestSha256: evidence.receipt.input_manifest_sha256,
-      chunkCount: Number(evidence.receipt.chunk_count),
-      analysisPreparationJobId: preparation.jobId,
-    }), at).run();
-  const status = await transcriptBatchStatus(env, batchId);
-  return { repaired: true, reused: false, batchId, batchItemId,
-    queuedAnalysisSectionCount: 0, analysisPreparationQueued: true,
-    acquisitionAdvanced: acquisition.length === 1,
-    status: status.status, completedItemCount: status.completedItemCount,
-    activeItemCount: Number(status.counts.active || 0) };
 }
-
 export async function dispatchTranscriptBatchEnvelope(env, batchId, batchItemId, envelope, at = nowIso()) {
   const stale = new Date(Date.parse(at) - 300_000).toISOString();
   const claimed = await env.DB.prepare(`UPDATE transcript_batch_items
@@ -636,6 +528,215 @@ export async function completeTranscriptBatchItem(env, { batchId, batchItemId,
   return prepared.envelope ? [prepared.envelope] : [];
 }
 
+async function dispositionForItem(db, batchId, batchItemId) {
+  return db.prepare(`SELECT * FROM transcript_batch_item_dispositions
+    WHERE batch_id=?1 AND batch_item_id=?2 AND disposition='source_unavailable'`)
+    .bind(batchId, batchItemId).first();
+}
+
+async function advanceQuarantinedBatch(env, disposition, { at, durationFetcher }) {
+  const batch = await batchRow(env.DB, disposition.batch_id);
+  if (!batch || batch.status !== "running") return false;
+  const successorId = disposition.successor_batch_item_id;
+  if (!successorId) {
+    await finishBatchIfEmpty(env, disposition.batch_id, at);
+    return true;
+  }
+  let successor = await env.DB.prepare(`SELECT * FROM transcript_batch_items
+    WHERE batch_id=?1 AND batch_item_id=?2`).bind(disposition.batch_id, successorId).first();
+  if (!successor) return false;
+  if (successor.status === "pending") {
+    if (await activeItem(env.DB, disposition.batch_id)) return false;
+    const prepared = await activateNextItem(env, disposition.batch_id, { at, durationFetcher });
+    if (!prepared.envelope || prepared.envelope.payload.batchItemId !== successorId) return false;
+    return dispatchTranscriptBatchEnvelope(env, disposition.batch_id, successorId, prepared.envelope, at);
+  }
+  if (successor.status === "active" && successor.dispatch_state !== "sent") {
+    const envelope = await storedResumableEnvelope(env.DB, successor) || await firstTranscriptEnvelope(successor);
+    return dispatchTranscriptBatchEnvelope(env, disposition.batch_id, successorId, envelope, at);
+  }
+  return ["active", "completed", "skipped"].includes(successor.status);
+}
+
+async function quarantineReceipt(env, disposition, { applied, reused, dispatched }) {
+  const status = await transcriptBatchStatus(env, disposition.batch_id);
+  const successor = disposition.successor_batch_item_id
+    ? await env.DB.prepare(`SELECT batch_item_id,youtube_id,status,dispatch_state
+        FROM transcript_batch_items WHERE batch_id=?1 AND batch_item_id=?2`)
+      .bind(disposition.batch_id, disposition.successor_batch_item_id).first()
+    : null;
+  return {
+    contract: "transcript-batch-quarantine-v1", action: "quarantine_pending_item",
+    quarantined: true, applied, reused, dispatched,
+    dispositionId: disposition.disposition_id,
+    batchId: disposition.batch_id, batchItemId: disposition.batch_item_id,
+    youtubeId: disposition.youtube_id,
+    reasonCode: disposition.reason_code, observedErrorCode: disposition.observed_error_code,
+    transitionBefore: Number(disposition.expected_transition_count),
+    transitionAfter: Number(disposition.applied_transition_count),
+    successor: successor ? { batchItemId: successor.batch_item_id, youtubeId: successor.youtube_id,
+      status: successor.status, dispatchState: successor.dispatch_state } : null,
+    ...status,
+  };
+}
+
+export async function quarantinePendingTranscriptItem(env, { batchId, batchItemId,
+  idempotencyKey, expectedTransitionCount, reasonCode, observedErrorCode,
+  at = nowIso(), durationFetcher = fetch } = {}) {
+  if (!BATCH_ID.test(batchId || "")) return { quarantined: false, reason: "invalid_batch_id" };
+  if (!BATCH_ITEM_ID.test(batchItemId || "")) return { quarantined: false, reason: "invalid_batch_item_id" };
+  if (!IDEMPOTENCY_KEY.test(idempotencyKey || "")) return { quarantined: false, reason: "invalid_idempotency_key" };
+  if (!Number.isInteger(expectedTransitionCount) || expectedTransitionCount < 0) {
+    return { quarantined: false, reason: "invalid_transition_count" };
+  }
+  if (reasonCode !== SOURCE_UNAVAILABLE_REASON || observedErrorCode !== SOURCE_UNAVAILABLE_ERROR) {
+    return { quarantined: false, reason: "invalid_disposition_reason" };
+  }
+  const batch = await batchRow(env.DB, batchId);
+  if (!batch) return { quarantined: false, reason: "batch_not_found" };
+  if (batch.idempotency_key !== idempotencyKey) {
+    return { quarantined: false, reason: "idempotency_key_mismatch", ...(await transcriptBatchStatus(env, batchId)) };
+  }
+  const item = await env.DB.prepare(`SELECT * FROM transcript_batch_items
+    WHERE batch_id=?1 AND batch_item_id=?2`).bind(batchId, batchItemId).first();
+  if (!item) return { quarantined: false, reason: "batch_item_not_found" };
+  const existing = await dispositionForItem(env.DB, batchId, batchItemId);
+  if (existing) {
+    if (Number(existing.expected_transition_count) !== expectedTransitionCount ||
+        existing.reason_code !== reasonCode || existing.observed_error_code !== observedErrorCode ||
+        existing.source_item_id !== item.source_item_id) {
+      return { quarantined: false, reason: "disposition_conflict", ...(await transcriptBatchStatus(env, batchId)) };
+    }
+    const bound = { ...existing, youtube_id: item.youtube_id };
+    const dispatched = await advanceQuarantinedBatch(env, bound, { at, durationFetcher });
+    return quarantineReceipt(env, bound, { applied: false, reused: true, dispatched });
+  }
+  if (batch.status !== "paused") {
+    return { quarantined: false, reason: "batch_not_paused", ...(await transcriptBatchStatus(env, batchId)) };
+  }
+  if (Number(batch.transition_count) !== expectedTransitionCount) {
+    return { quarantined: false, reason: "transition_mismatch", ...(await transcriptBatchStatus(env, batchId)) };
+  }
+  if (batch.pause_reason !== SOURCE_UNAVAILABLE_ERROR) {
+    return { quarantined: false, reason: "pause_reason_mismatch", ...(await transcriptBatchStatus(env, batchId)) };
+  }
+  if (item.status !== "pending" || item.run_id || item.duration_seconds != null || item.started_at || item.completed_at) {
+    return { quarantined: false, reason: "item_not_pristine_pending", ...(await transcriptBatchStatus(env, batchId)) };
+  }
+  if (await activeItem(env.DB, batchId)) {
+    return { quarantined: false, reason: "active_item_exists", ...(await transcriptBatchStatus(env, batchId)) };
+  }
+  const artifact = await env.DB.prepare(`SELECT 1 present FROM transcript_artifacts
+    WHERE source_item_id=?1 LIMIT 1`).bind(item.source_item_id).first();
+  if (artifact) return { quarantined: false, reason: "transcript_artifact_exists", ...(await transcriptBatchStatus(env, batchId)) };
+  const latestPause = await env.DB.prepare(`SELECT batch_item_id FROM transcript_batch_events
+    WHERE batch_id=?1 AND event_type='batch_paused'
+    ORDER BY created_at DESC,event_id DESC LIMIT 1`).bind(batchId).first();
+  if (latestPause?.batch_item_id !== batchItemId) {
+    return { quarantined: false, reason: "pause_item_mismatch", ...(await transcriptBatchStatus(env, batchId)) };
+  }
+  const successor = await nextPendingItem(env, batch, batchItemId);
+  const transitionAfter = expectedTransitionCount + 1;
+  const dispositionId = await stableId("txbd",
+    `${batchId}:${batchItemId}:source_unavailable:${observedErrorCode}:transition:${expectedTransitionCount}`);
+  const [inserted, transitioned] = await env.DB.batch([
+    env.DB.prepare(`INSERT OR IGNORE INTO transcript_batch_item_dispositions
+      (disposition_id,batch_id,batch_item_id,source_item_id,successor_batch_item_id,
+       disposition,link_availability,reason_code,observed_error_code,
+       expected_transition_count,applied_transition_count,created_at)
+      SELECT ?1,batch.batch_id,item.batch_item_id,item.source_item_id,?6,
+        'source_unavailable','unavailable',?7,?8,?4,?5,?9
+      FROM transcript_batches batch JOIN transcript_batch_items item
+        ON item.batch_id=batch.batch_id AND item.batch_item_id=?3
+      WHERE batch.batch_id=?2 AND batch.idempotency_key=?10 AND batch.status='paused'
+        AND batch.pause_reason=?8 AND batch.transition_count=?4
+        AND item.status='pending' AND item.run_id IS NULL AND item.duration_seconds IS NULL
+        AND item.started_at IS NULL AND item.completed_at IS NULL
+        AND NOT EXISTS (SELECT 1 FROM transcript_artifacts artifact
+          WHERE artifact.source_item_id=item.source_item_id)
+        AND NOT EXISTS (SELECT 1 FROM transcript_batch_items active WHERE active.status='active')
+        AND (SELECT event.batch_item_id FROM transcript_batch_events event
+          WHERE event.batch_id=batch.batch_id AND event.event_type='batch_paused'
+          ORDER BY event.created_at DESC,event.event_id DESC LIMIT 1)=item.batch_item_id`)
+      .bind(dispositionId, batchId, batchItemId, expectedTransitionCount, transitionAfter,
+        successor?.batch_item_id || null, reasonCode, observedErrorCode, at, idempotencyKey),
+    env.DB.prepare(`UPDATE transcript_batches SET status='running',pause_reason=NULL,
+        resume_after=NULL,paused_at=NULL,transition_count=?3
+      WHERE batch_id=?1 AND status='paused' AND transition_count=?2
+        AND EXISTS (SELECT 1 FROM transcript_batch_item_dispositions
+          WHERE disposition_id=?4 AND applied_transition_count=?3)`)
+      .bind(batchId, expectedTransitionCount, transitionAfter, dispositionId),
+  ]);
+  if (!changed(inserted) || !changed(transitioned)) {
+    const raced = await dispositionForItem(env.DB, batchId, batchItemId);
+    if (!raced) return { quarantined: false, reason: "quarantine_lost", ...(await transcriptBatchStatus(env, batchId)) };
+    const bound = { ...raced, youtube_id: item.youtube_id };
+    const dispatched = await advanceQuarantinedBatch(env, bound, { at, durationFetcher });
+    return quarantineReceipt(env, bound, { applied: false, reused: true, dispatched });
+  }
+  const disposition = { ...(await dispositionForItem(env.DB, batchId, batchItemId)), youtube_id: item.youtube_id };
+  const dispatched = await advanceQuarantinedBatch(env, disposition, { at, durationFetcher });
+  return quarantineReceipt(env, disposition, { applied: true, reused: false, dispatched });
+}
+
+export async function skipActiveTranscriptItem(env, { batchId, at = nowIso(),
+  durationFetcher = fetch } = {}) {
+  if (!BATCH_ID.test(batchId || "")) return { skipped: false, reason: "invalid_batch_id" };
+  const batch = await batchRow(env.DB, batchId);
+  if (!batch) return { skipped: false, reason: "batch_not_found" };
+  if (batch.status !== "paused") {
+    return { skipped: false, reason: "batch_not_paused", ...(await transcriptBatchStatus(env, batchId)) };
+  }
+  const active = await activeItem(env.DB, batchId);
+  if (!active) {
+    return { skipped: false, reason: "no_active_item", ...(await transcriptBatchStatus(env, batchId)) };
+  }
+  const failed = await env.DB.prepare(`SELECT job_id FROM ingestion_jobs
+    WHERE run_id=?1 AND status='failed' ORDER BY completed_at DESC,job_id LIMIT 1`)
+    .bind(active.run_id).first();
+  if (!failed) {
+    return { skipped: false, reason: "active_item_not_failed", ...(await transcriptBatchStatus(env, batchId)) };
+  }
+  const transition = Number(batch.transition_count) + 1;
+  const eventId = await stableId("txbe", `${batchId}:transition:${transition}:item_skipped`);
+  const detail = JSON.stringify({ reason: "admin_skip_after_terminal_failure",
+    youtubeId: active.youtube_id, failedJobId: failed.job_id });
+  const [skipped, resumed] = await env.DB.batch([
+    env.DB.prepare(`UPDATE transcript_batch_items SET status='skipped'
+      WHERE batch_id=?1 AND batch_item_id=?2 AND status='active' AND run_id=?3
+        AND EXISTS (SELECT 1 FROM transcript_batches
+          WHERE batch_id=?1 AND status='paused' AND transition_count=?4)
+        AND EXISTS (SELECT 1 FROM ingestion_jobs WHERE run_id=?3 AND status='failed')`)
+      .bind(batchId, active.batch_item_id, active.run_id, Number(batch.transition_count)),
+    env.DB.prepare(`UPDATE transcript_batches SET status='running',pause_reason=NULL,
+        resume_after=NULL,paused_at=NULL,transition_count=?3
+      WHERE batch_id=?1 AND status='paused' AND transition_count=?2
+        AND EXISTS (SELECT 1 FROM transcript_batch_items
+          WHERE batch_id=?1 AND batch_item_id=?4 AND status='skipped')`)
+      .bind(batchId, Number(batch.transition_count), transition, active.batch_item_id),
+    env.DB.prepare(`INSERT OR IGNORE INTO transcript_batch_events
+      (event_id,batch_id,batch_item_id,event_type,detail_json,created_at)
+      SELECT ?1,?2,?3,'item_skipped',?4,?5
+      WHERE EXISTS (SELECT 1 FROM transcript_batches
+        WHERE batch_id=?2 AND status='running' AND transition_count=?6)
+        AND EXISTS (SELECT 1 FROM transcript_batch_items
+          WHERE batch_id=?2 AND batch_item_id=?3 AND status='skipped')`)
+      .bind(eventId, batchId, active.batch_item_id, detail, at, transition),
+  ]);
+  if (!changed(skipped) || !changed(resumed)) {
+    return { skipped: false, reason: "skip_lost", ...(await transcriptBatchStatus(env, batchId)) };
+  }
+  const prepared = await activateNextItem(env, batchId, { at, durationFetcher });
+  let dispatched = false;
+  if (prepared.envelope) {
+    dispatched = await dispatchTranscriptBatchEnvelope(env, batchId,
+      prepared.envelope.payload.batchItemId, prepared.envelope, at);
+  }
+  const status = await transcriptBatchStatus(env, batchId);
+  return { skipped: true, dispatched, reason: prepared.envelope && !dispatched
+    ? status?.pauseReason || "queue_dispatch_failed" : null, ...status };
+}
+
 export async function resumeTranscriptBatch(env, { idempotencyKey, at = nowIso(), durationFetcher = fetch } = {}) {
   if (!IDEMPOTENCY_KEY.test(idempotencyKey || "")) return { resumed: false, reason: "invalid_idempotency_key" };
   const batch = await batchRowByKey(env.DB, idempotencyKey);
@@ -643,13 +744,20 @@ export async function resumeTranscriptBatch(env, { idempotencyKey, at = nowIso()
   if (batch.status === "completed") return { resumed: false, reason: "batch_complete", ...(await transcriptBatchStatus(env, batch.batch_id)) };
   if (batch.status !== "paused") return { resumed: false, reason: "batch_not_paused", ...(await transcriptBatchStatus(env, batch.batch_id)) };
   if (batch.resume_after > at) return { resumed: false, reason: "resume_not_ready", ...(await transcriptBatchStatus(env, batch.batch_id)) };
+  const media = await currentPhysicalMedia(env, at);
+  if (media.exhausted) return { resumed: false, reason: "media_fuse_exhausted",
+    mediaDay: media.mediaDay, mediaSeconds: media.mediaSeconds, mediaLimitSeconds: media.mediaLimitSeconds,
+    ...(await transcriptBatchStatus(env, batch.batch_id)) };
   const active = await activeItem(env.DB, batch.batch_id);
   const transition = Number(batch.transition_count) + 1;
   const eventId = await stableId("txbe", `${batch.batch_id}:transition:${transition}:resumed`);
+  const fuseClause = media.available ? `AND ((SELECT COALESCE(SUM(reserved_seconds),0) FROM gemini_physical_request_reservations
+    WHERE media_day=substr(?2,1,10)) + (SELECT COALESCE(SUM(reserved_seconds),0)
+    FROM gemini_physical_day_debits WHERE media_day=substr(?2,1,10))) < ${media.mediaLimitSeconds}` : "";
   const statements = [
     env.DB.prepare(`UPDATE transcript_batches SET status='running',pause_reason=NULL,resume_after=NULL,paused_at=NULL,
         transition_count=?3
-      WHERE batch_id=?1 AND status='paused' AND resume_after<=?2 AND transition_count=?4`)
+      WHERE batch_id=?1 AND status='paused' AND resume_after<=?2 AND transition_count=?4 ${fuseClause}`)
       .bind(batch.batch_id, at, transition, Number(batch.transition_count)),
     env.DB.prepare(`INSERT OR IGNORE INTO transcript_batch_events
       (event_id,batch_id,batch_item_id,event_type,detail_json,created_at)
@@ -662,15 +770,21 @@ export async function resumeTranscriptBatch(env, { idempotencyKey, at = nowIso()
   if (active) {
     envelope = await storedResumableEnvelope(env.DB, active);
     if (!envelope) return { resumed: false, reason: "paused_job_not_found", ...(await transcriptBatchStatus(env, batch.batch_id)) };
-    statements.splice(1, 0, env.DB.prepare(`UPDATE ingestion_jobs SET status='queued',claimed_at=NULL,
-        lease_token=NULL,error_code=NULL,completed_at=NULL
-      WHERE job_id=?1 AND status IN ('queued','failed')`).bind(envelope.jobId));
-    statements.splice(2, 0, env.DB.prepare(`UPDATE transcript_batch_items SET dispatch_state='pending',
-        dispatch_claimed_at=NULL
-      WHERE batch_item_id=?1 AND status='active'`).bind(active.batch_item_id));
+    statements.splice(1, 0, env.DB.prepare(`UPDATE ingestion_jobs SET status='queued',claimed_at=NULL,lease_token=NULL,
+      error_code=NULL,completed_at=NULL WHERE job_id=?1 AND status IN ('queued','failed')
+      AND EXISTS (SELECT 1 FROM transcript_batches WHERE batch_id=?2 AND status='running' AND transition_count=?3)`)
+      .bind(envelope.jobId, batch.batch_id, transition));
+    statements.splice(2, 0, env.DB.prepare(`UPDATE transcript_batch_items SET dispatch_state='pending',dispatch_claimed_at=NULL WHERE
+      batch_item_id=?1 AND status='active' AND EXISTS (SELECT 1 FROM transcript_batches WHERE batch_id=?2
+        AND status='running' AND transition_count=?3)`)
+      .bind(active.batch_item_id, batch.batch_id, transition));
   }
   const [resumed] = await env.DB.batch(statements);
-  if (!changed(resumed)) return { resumed: false, reason: "resume_lost", ...(await transcriptBatchStatus(env, batch.batch_id)) };
+  if (!changed(resumed)) {
+    const readback = await currentPhysicalMedia(env, at);
+    return { resumed: false, reason: readback.exhausted ? "media_fuse_exhausted" : "resume_lost", mediaDay: readback.mediaDay,
+      mediaSeconds: readback.mediaSeconds, mediaLimitSeconds: readback.mediaLimitSeconds, ...(await transcriptBatchStatus(env, batch.batch_id)) };
+  }
   let preparedReason = null;
   if (!envelope) {
     const prepared = await activateNextItem(env, batch.batch_id, { at, durationFetcher });

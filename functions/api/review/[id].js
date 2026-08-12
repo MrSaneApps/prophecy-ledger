@@ -7,7 +7,6 @@ import {
 } from "../../lib/review-workflow.js";
 import {
   getAssignedArchiveReviewBundle, hasArchiveReviewerSubmission,
-  normalizeArchiveDecision, submitArchiveDecision,
 } from "../../lib/archive-review-workflow.js";
 import { apiError, json, readJson } from "../../lib/response.js";
 
@@ -123,32 +122,76 @@ export async function onRequestPost({ request, env, params }) {
     }
 
     if (bundle.assignment.workType === "archive_lead_verification") {
-      const decision = normalizeArchiveDecision(input);
-      const result = await submitArchiveDecision(
-        env.DB, assignmentId, principal.reviewerId, decision,
+      return apiError(
+        "Archive source checks must use the transcript-bound archive route.",
+        "archive_route_required", 409,
       );
-      return json({ state: "archive_source_check_recorded", ...result }, 201);
     }
 
+    let reviewInput = input;
+    let sendback = null;
+    if (typeof input?.verdict === "string") {
+      const draft = bundle.aiDraftDecision;
+      if (!draft) {
+        throw new ReviewWorkflowError("draft_missing", "No pending AI draft decision exists for this claim.", 409);
+      }
+      if (!["agree", "disagree"].includes(input.verdict)) {
+        throw new ReviewWorkflowError("verdict_invalid", "Choose agree or disagree.", 400);
+      }
+      const outcomeStatus = input.verdict === "agree"
+        ? draft.outcomeStatus : String(input.disagreeOutcome || "").trim();
+      if (input.verdict === "disagree" && !outcomeStatus) {
+        throw new ReviewWorkflowError("disagree_outcome_required", "State the outcome you find supported.", 400);
+      }
+      reviewInput = {
+        claimType: draft.claimType,
+        outcomeStatus,
+        noveltyStatus: draft.noveltyStatus,
+        baselineProbability: draft.baselineProbability,
+        evidenceIds: draft.evidenceIds,
+        priorReceiptId: draft.priorReceiptId,
+        rationale: input.rationale,
+      };
+      if (input.verdict === "disagree") {
+        sendback = {
+          draftId: draft.draftId,
+          draftRevision: draft.revision,
+          rejectedOutcome: draft.outcomeStatus,
+          lesson: String(input.rationale || "").trim(),
+        };
+      }
+    }
     let review;
-    try { review = normalizeReview(input); } catch (error) {
+    try { review = normalizeReview(reviewInput); } catch (error) {
       throw new ReviewWorkflowError(error.message, "The review did not pass the publication rules.", 400);
     }
     if (bundle.subject.visibility === "published") {
       throw new ReviewWorkflowError("already_published", "This adjudication is immutable after publication.", 409);
     }
-    const prerequisites = validateReviewPrerequisites(
-      bundle.subject, bundle.evidence, bundle.priorInformationReceipts, review,
-    );
-    if (!prerequisites.ok) {
-      return apiError("The cited record is not sufficient for this review decision.",
-        "review_prerequisites_missing", 409, prerequisites.missing);
+    // Send-back (disagree) returns the claim to research; it must NOT be blocked
+    // by publication evidence prerequisites. Only Accept (agree / publish path)
+    // continues to require the full cited record.
+    if (!sendback) {
+      const prerequisites = validateReviewPrerequisites(
+        bundle.subject, bundle.evidence, bundle.priorInformationReceipts, review,
+      );
+      if (!prerequisites.ok) {
+        return apiError("The cited record is not sufficient for this review decision.",
+          "review_prerequisites_missing", 409, prerequisites.missing);
+      }
     }
     const accepted = await submitAssignedClaimReview(
-      env.DB, assignmentId, principal.reviewerId, review,
+      env.DB, assignmentId, principal.reviewerId, review, undefined, sendback,
     );
-    const evaluation = await reconcilePublication(env.DB, accepted.claimId);
-    return json({ reviewId: accepted.reviewId, publication: publicEvaluation(evaluation) }, 201);
+    const evaluation = sendback
+      ? { state: "research_requested" }
+      : await reconcilePublication(env.DB, accepted.claimId);
+    return json({
+      reviewId: accepted.reviewId,
+      publication: publicEvaluation(evaluation),
+      sendbackRecorded: Boolean(accepted.sendbackRecorded),
+      advance: true,
+    }, 201);
   } catch (error) {
     const duplicate = /UNIQUE constraint failed: (moderator_reviews|candidate_review_decisions|archive_review_decisions)/.test(String(error));
     const code = duplicate ? "duplicate_reviewer" : (error.code || "review_unavailable");

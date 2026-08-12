@@ -120,7 +120,10 @@ function parsePayload(result) {
 
 function retryableModelError(error) {
   const status = Number(error?.status || error?.cause?.status || 0);
-  return status === 429 || status >= 500 || /unavailable|not found|model|timeout/i.test(error?.message || "");
+  return error?.fallbackEligible === true ||
+    ["invalid_json", "invalid_payload", "json_schema_unsupported", "model_unavailable", "provider_429", "provider_5xx"]
+      .includes(error?.safeCauseCode) ||
+    status === 429 || status >= 500 || /unavailable|not found|model|timeout/i.test(error?.message || "");
 }
 
 function exactKeys(value, expected) {
@@ -212,17 +215,18 @@ function gatewayResult(response, raw, model) {
   };
 }
 
-export async function callGeminiVideo({
+async function callGeminiInteraction({
   apiKey, gatewayAccountId, gatewayId, gatewayToken, useByok = false,
-  model, videoUrl, prompt, schema, fetcher = fetch, timeoutMs = 90_000,
+  model, input, systemInstruction = null, schema, strictJson = true,
+  fetcher = fetch, timeoutMs = 90_000,
 }) {
   if (!/^[a-f0-9]{32}$/.test(gatewayAccountId || "")) throw new Error("ai_gateway_account_invalid");
   if (!/^[a-z0-9-]{1,64}$/.test(gatewayId || "")) throw new Error("ai_gateway_id_invalid");
   if (!gatewayToken) throw new Error("ai_gateway_token_required");
   if (!useByok && !apiKey) throw new Error("gemini_key_required");
-  if (!model) throw new Error("gemini_model_required");
-  if (!/^https:\/\/www\.youtube\.com\/watch\?v=[A-Za-z0-9_-]{11}$/.test(videoUrl || "")) throw new Error("gemini_invalid_video_url");
+  if (!/^[a-z0-9][a-z0-9.-]{0,127}$/.test(model || "")) throw new Error("gemini_model_required");
   const controller = new AbortController();
+  const gatewayTimeoutMs = Math.max(1_000, timeoutMs - 1_000);
   const timer = setTimeout(() => controller.abort("gemini_timeout"), timeoutMs);
   let response; let bodyText;
   try {
@@ -233,16 +237,16 @@ export async function callGeminiVideo({
       "cf-aig-skip-cache": "true",
       "cf-aig-collect-log-payload": "false",
       "cf-aig-max-attempts": "1",
-      "cf-aig-request-timeout": String(timeoutMs),
+      "cf-aig-request-timeout": String(gatewayTimeoutMs),
       ...(!useByok ? { "x-goog-api-key": apiKey } : {}),
     };
     response = await fetcher(endpoint, {
-      method: "POST", signal: controller.signal,
-      headers,
+      method: "POST", signal: controller.signal, headers,
       body: JSON.stringify({
-        model, store: false,
-        input: [{ type: "video", uri: videoUrl }, { type: "text", text: prompt }],
-        response_format: [{ type: "text", mime_type: "application/json", schema }],
+        model, store: false, input,
+        ...(systemInstruction ? { system_instruction: systemInstruction } : {}),
+        response_format: [{ type: "text", mime_type: "application/json",
+          ...(schema ? { schema } : {}) }],
       }),
     });
     bodyText = await response.text();
@@ -252,8 +256,9 @@ export async function callGeminiVideo({
   } finally { clearTimeout(timer); }
   const raw = sanitizedGatewayBody(bodyText, [apiKey, gatewayToken]);
   if (!response.ok) {
-    const error = new Error(`gemini_http_${response.status}`);
-    error.retryable = response.status === 429 || response.status >= 500;
+    const error = new Error([408, 504].includes(response.status) ? "gemini_timeout" : `gemini_http_${response.status}`);
+    error.status = response.status;
+    error.retryable = response.status === 408 || response.status === 429 || response.status >= 500;
     error.geminiResult = gatewayResult(response, raw, model);
     throw error;
   }
@@ -263,7 +268,10 @@ export async function callGeminiVideo({
     throw error;
   }
   let structured;
-  try { structured = JSON.parse(interactionText(raw)); } catch (cause) {
+  try {
+    const outputText = interactionText(raw);
+    structured = strictJson ? JSON.parse(outputText) : outputText;
+  } catch (cause) {
     const error = new Error(cause?.message?.startsWith("gemini_") ? cause.message : "gemini_invalid_output_json");
     error.geminiResult = gatewayResult(response, raw, raw.model || model);
     error.cause = cause; throw error;
@@ -272,6 +280,17 @@ export async function callGeminiVideo({
     raw, structured, model: raw.model || model, interactionId: raw.id || null,
     gatewayLogId: response.headers.get("cf-aig-log-id"), httpStatus: response.status,
   };
+}
+
+export async function callGeminiVideo({
+  apiKey, gatewayAccountId, gatewayId, gatewayToken, useByok = false,
+  model, videoUrl, prompt, schema, fetcher = fetch, timeoutMs = 90_000,
+}) {
+  if (!/^https:\/\/www\.youtube\.com\/watch\?v=[A-Za-z0-9_-]{11}$/.test(videoUrl || "")) throw new Error("gemini_invalid_video_url");
+  return callGeminiInteraction({
+    apiKey, gatewayAccountId, gatewayId, gatewayToken, useByok, model, schema, fetcher, timeoutMs,
+    input: [{ type: "video", uri: videoUrl }, { type: "text", text: prompt }],
+  });
 }
 
 export function primaryVideoPrompt() {
@@ -394,7 +413,85 @@ export function compareVideoClaims(primary, check) {
   };
 }
 
-async function runWithTimeout(ai, model, input, timeoutMs) {
+export function createGeminiGatewayTextRunner({
+  apiKey = null, gatewayAccountId, gatewayId, gatewayToken, useByok = false,
+  fetcher = fetch,
+}) {
+  return {
+    provider: "gemini-ai-gateway",
+    async runAbortable(model, input, { timeoutMs, schema }) {
+      const messages = Array.isArray(input?.messages) ? input.messages : [];
+      const systemInstruction = messages.filter((message) => message?.role === "system")
+        .map((message) => String(message.content || "")).filter(Boolean).join("\n\n");
+      const userInput = messages.filter((message) => message?.role !== "system")
+        .map((message) => `${String(message?.role || "user").toUpperCase()}:\n${String(message?.content || "")}`)
+        .join("\n\n");
+      if (!userInput) throw new Error("ai_missing_input");
+      const responseSchema = input?.response_format?.type === "json_schema" ? schema : null;
+      try {
+        const result = await callGeminiInteraction({
+          apiKey, gatewayAccountId, gatewayId, gatewayToken, useByok,
+          model, input: userInput, systemInstruction, schema: responseSchema,
+          strictJson: Boolean(responseSchema), fetcher, timeoutMs,
+        });
+        return result.structured;
+      } catch (cause) {
+        const status = Number(cause?.status || cause?.geminiResult?.httpStatus || 0);
+        const providerError = cause?.geminiResult?.raw?.error;
+        const providerStatus = String(providerError?.status || "");
+        const providerMessage = String(providerError?.message || "").slice(0, 4_096);
+        const schemaContractRejected = status === 400 && Boolean(responseSchema) &&
+          providerStatus === "INVALID_ARGUMENT" &&
+          (/\bresponse[_\s-]?format\b|\bresponse\s+schema\b/i.test(providerMessage) ||
+           /\bschema\b.{0,120}\b(?:complex|unsupported|invalid|property|properties|additional)\b/i.test(providerMessage) ||
+           /\b(?:complex|unsupported|invalid)\b.{0,120}\bschema\b/i.test(providerMessage));
+        let message = cause?.message || "gemini_network_error";
+        if (message === "gemini_timeout") message = "ai_timeout_confirmed";
+        else if (schemaContractRejected) message = "json_schema_unsupported";
+        else if (message === "gemini_invalid_response_json" || message === "gemini_invalid_output_json") message = "ai_invalid_json";
+        else if (message === "gemini_incomplete_response" || message === "gemini_missing_output") message = "ai_invalid_payload";
+        const error = new Error(message);
+        error.status = status || undefined;
+        // Gemini's Interactions API can return only the generic body
+        // { error: { message: "Request contains an invalid argument." } } for a
+        // rejected response schema. The mode and HTTP status are durable facts;
+        // allow exactly one schema-free attempt without claiming the prose named
+        // the schema. Plain mode never sets this flag, so this cannot recurse.
+        error.schemaFallbackEligible = status === 400 && Boolean(responseSchema);
+        error.retryable = cause?.retryable === true || status === 429 || status >= 500 ||
+          ["ai_timeout_confirmed", "ai_invalid_json", "ai_invalid_payload"].includes(message);
+        error.cause = cause;
+        throw error;
+      }
+    },
+  };
+}
+
+export function textAnalysisRuntime(env) {
+  const gatewayModels = [env.GEMINI_ANALYSIS_MODEL, env.GEMINI_ANALYSIS_FALLBACK_MODEL].filter(Boolean);
+  const timeout = Number(env.AI_TIMEOUT_MS);
+  if (!gatewayModels.length) {
+    return { ai: env.AI, models: [env.AI_MODEL, env.AI_FALLBACK_MODEL].filter(Boolean),
+      timeoutMs: Number.isFinite(timeout) && timeout > 0 ? timeout : 45_000 };
+  }
+  return {
+    ai: createGeminiGatewayTextRunner({
+      apiKey: env.AI_GATEWAY_BYOK === "1" ? null : env.GEMINI_API_KEY,
+      gatewayAccountId: env.AI_GATEWAY_ACCOUNT_ID,
+      gatewayId: env.AI_GATEWAY_ID || "default",
+      gatewayToken: env.AI_GATEWAY_TOKEN,
+      useByok: env.AI_GATEWAY_BYOK === "1",
+      fetcher: env.GEMINI_TEXT_FETCH || env.GEMINI_FETCH || fetch,
+    }),
+    models: gatewayModels,
+    timeoutMs: Number.isFinite(timeout) && timeout > 0 ? timeout : 45_000,
+  };
+}
+
+async function runWithTimeout(ai, model, input, timeoutMs, schema) {
+  if (typeof ai?.runAbortable === "function") {
+    return ai.runAbortable(model, input, { timeoutMs, schema });
+  }
   let timer;
   try {
     return await Promise.race([
@@ -403,6 +500,7 @@ async function runWithTimeout(ai, model, input, timeoutMs) {
         timer = setTimeout(() => {
           const error = new Error("ai_timeout");
           error.retryable = true;
+          error.uncancelled = true;
           reject(error);
         }, timeoutMs);
       }),
@@ -410,44 +508,152 @@ async function runWithTimeout(ai, model, input, timeoutMs) {
   } finally { clearTimeout(timer); }
 }
 
-async function structured(ai, { models, messages, schema, name, timeoutMs = 45_000 }) {
+export function safeWorkersAiCause(error, mode = "json_schema") {
+  const status = Number(error?.status || error?.cause?.status || 0);
+  const message = String(error?.message || "");
+  if (message === "ai_timeout_confirmed") return "ai_timeout_confirmed";
+  if (message === "json_schema_unsupported") return "json_schema_unsupported";
+  if (message === "ai_timeout" || message === "ai_timeout_unconfirmed") return "ai_timeout_unconfirmed";
+  if (status === 429) return "provider_429";
+  if (status >= 500) return "provider_5xx";
+  if (/json mode couldn.?t be met|json[_ ]mode|json schema/i.test(message)) return "json_schema_unsupported";
+  if (/ai_invalid_json|ai_missing_json/i.test(message)) return "invalid_json";
+  if (/invalid_|missing_|payload|candidate|category/i.test(message)) return "invalid_payload";
+  if (/unavailable|not found|model/i.test(message)) return "model_unavailable";
+  return mode === "plain_json" && /json/i.test(message) ? "invalid_json" : "unknown_provider_error";
+}
+
+function payloadTypeMatches(value, expected) {
+  const types = Array.isArray(expected) ? expected : [expected];
+  return types.some((type) => {
+    if (type === "array") return Array.isArray(value);
+    if (type === "object") return value !== null && typeof value === "object" && !Array.isArray(value);
+    if (type === "null") return value === null;
+    if (type === "integer") return Number.isInteger(value);
+    if (type === "number") return typeof value === "number" && Number.isFinite(value);
+    return typeof value === type;
+  });
+}
+
+function validateRequiredPayload(payload, schema) {
+  if (!payloadTypeMatches(payload, schema?.type)) throw new Error("ai_invalid_payload");
+  for (const key of schema.required || []) {
+    const valid = Object.prototype.hasOwnProperty.call(payload, key) &&
+      payloadTypeMatches(payload[key], schema.properties?.[key]?.type);
+    if (!valid) {
+      throw new Error(key === "candidates" ? "ai_invalid_candidates" : "ai_invalid_payload");
+    }
+  }
+}
+
+const STRUCTURED_OUTPUT_MAX_TOKENS = 16_384;
+
+async function structured(ai, { models, messages, schema, timeoutMs = 45_000,
+  maxTokens = STRUCTURED_OUTPUT_MAX_TOKENS, onAttempt = null }) {
   let last;
+  let ordinal = 0;
+  const emitAttempt = async (receipt) => {
+    if (!onAttempt) return;
+    try { await onAttempt({ ...receipt, providerName: ai?.provider || "workers-ai" }); }
+    catch (cause) {
+      const error = new Error("workers_ai_attempt_receipt_failed");
+      error.code = "workers_ai_attempt_receipt_failed";
+      error.retryable = true;
+      error.receiptPersistenceFailure = true;
+      error.cause = cause;
+      throw error;
+    }
+  };
+  const attempt = async (model, mode, input) => {
+    const currentOrdinal = ordinal; ordinal += 1;
+    const started = Date.now(); const startedAt = new Date(started).toISOString();
+    await emitAttempt({ modelName: model, mode, ordinal: currentOrdinal,
+      status: "started", safeCauseCode: null, httpStatus: null, fallbackEligible: false,
+      startedAt, completedAt: null, latencyMs: null });
+    let payload;
+    try {
+      payload = parsePayload(await runWithTimeout(ai, model, input, timeoutMs, schema));
+      validateRequiredPayload(payload, schema);
+    } catch (error) {
+      const completed = Date.now(); const safeCauseCode = safeWorkersAiCause(error, mode);
+      const fallbackEligible = safeCauseCode !== "ai_timeout_unconfirmed" &&
+        (error.schemaFallbackEligible === true || safeCauseCode === "provider_429" ||
+         safeCauseCode === "provider_5xx" ||
+         safeCauseCode === "model_unavailable" || safeCauseCode === "json_schema_unsupported" ||
+         safeCauseCode === "invalid_json" || safeCauseCode === "invalid_payload" ||
+         safeCauseCode === "ai_timeout_confirmed");
+      error.safeCauseCode = safeCauseCode; error.fallbackEligible = fallbackEligible;
+      await emitAttempt({ modelName: model, mode, ordinal: currentOrdinal,
+        status: "failed", safeCauseCode,
+        httpStatus: Number(error?.status || error?.cause?.status || 0) || null,
+        fallbackEligible, startedAt, completedAt: new Date(completed).toISOString(),
+        latencyMs: completed - started });
+      throw error;
+    }
+    const completed = Date.now();
+    await emitAttempt({ modelName: model, mode, ordinal: currentOrdinal,
+      status: "completed", safeCauseCode: null, httpStatus: null, fallbackEligible: false,
+      startedAt, completedAt: new Date(completed).toISOString(), latencyMs: completed - started });
+    return payload;
+  };
   for (const model of models.filter(Boolean)) {
     try {
-      const result = await runWithTimeout(ai, model, {
-        messages, temperature: 0,
-        response_format: { type: "json_schema", json_schema: { name, strict: true, schema } },
-      }, timeoutMs);
-      return { payload: parsePayload(result), model };
+      const payload = await attempt(model, "json_schema", {
+        messages, temperature: 0, max_tokens: maxTokens,
+        response_format: { type: "json_schema", json_schema: schema },
+      });
+      return { payload, model, provider: ai?.provider || "workers-ai" };
     } catch (error) {
       last = error;
-      console.warn("workers_ai_structured_failed", { model, name: error?.name || "Error",
-        message: String(error?.message || "unknown").slice(0, 300), status: Number(error?.status || error?.cause?.status || 0) || null });
-      if (/json mode couldn.?t be met|json[_ ]mode|json schema|ai_invalid_json|ai_missing_json/i.test(error?.message || "")) {
+      const safeCauseCode = error?.safeCauseCode || safeWorkersAiCause(error);
+      console.warn("workers_ai_structured_failed", { model, safeCauseCode,
+        httpStatus: Number(error?.status || error?.cause?.status || 0) || null });
+      if (error.receiptPersistenceFailure) {
+        const failure = new Error("ai_unavailable"); failure.code = error.code;
+        failure.retryable = true; failure.cause = error; throw failure;
+      }
+      if (error.safeCauseCode === "ai_timeout_unconfirmed") {
+        const failure = new Error("ai_unavailable"); failure.code = error.safeCauseCode;
+        failure.retryable = true; failure.cause = error; throw failure;
+      }
+      if (error.schemaFallbackEligible === true ||
+          ["json_schema_unsupported","invalid_json","invalid_payload"].includes(error.safeCauseCode)) {
         try {
-          const result = await runWithTimeout(ai, model, {
+          const payload = await attempt(model, "plain_json", {
             messages: [{ role: "system", content: `Return only valid JSON matching this schema: ${JSON.stringify(schema)}` }, ...messages],
-            temperature: 0, max_tokens: 4_096,
-          }, timeoutMs);
-          return { payload: parsePayload(result), model };
+            temperature: 0, max_tokens: maxTokens,
+          });
+          return { payload, model, provider: ai?.provider || "workers-ai" };
         } catch (plainError) {
           last = plainError;
-          console.warn("workers_ai_plain_json_failed", { model, name: plainError?.name || "Error",
-            message: String(plainError?.message || "unknown").slice(0, 300), status: Number(plainError?.status || plainError?.cause?.status || 0) || null });
+          const safeCauseCode = plainError?.safeCauseCode || safeWorkersAiCause(plainError, "plain_json");
+          console.warn("workers_ai_plain_json_failed", { model, safeCauseCode,
+            httpStatus: Number(plainError?.status || plainError?.cause?.status || 0) || null });
+          if (plainError.receiptPersistenceFailure) {
+            const failure = new Error("ai_unavailable"); failure.code = plainError.code;
+            failure.retryable = true; failure.cause = plainError; throw failure;
+          }
+          if (plainError.safeCauseCode === "ai_timeout_unconfirmed") {
+            const failure = new Error("ai_unavailable"); failure.code = plainError.safeCauseCode;
+            failure.retryable = true; failure.cause = plainError; throw failure;
+          }
         }
       }
       if (!retryableModelError(last)) break;
     }
   }
   const failure = new Error("ai_unavailable");
+  failure.code = last?.safeCauseCode || safeWorkersAiCause(last);
+  failure.retryable = retryableModelError(last);
   failure.cause = last;
   throw failure;
 }
 
-export async function triageDescription(ai, { title, description, models, timeoutMs = 45_000 }) {
+export async function triageDescription(ai, { title, description, models, timeoutMs = 45_000,
+  onAttempt = null }) {
   if (!description?.trim()) return { status: "not_enough_information", category: "not_enough_information", neutralParaphrase: null, model: null };
-  const { payload, model } = await structured(ai, {
-    models, schema: TRIAGE_SCHEMA, name: "description_triage", timeoutMs,
+  const { payload, model, provider } = await structured(ai, {
+    models, schema: TRIAGE_SCHEMA, name: "description_triage", timeoutMs, onAttempt,
     messages: [
       { role: "system", content: "Classify only the supplied first-party title and description. This is a lead for human research, not a quotation, verdict, or truth rating. Paraphrase neutrally and return null when there is not enough information." },
       { role: "user", content: JSON.stringify({ title, description }) },
@@ -456,7 +662,7 @@ export async function triageDescription(ai, { title, description, models, timeou
   if (!TRIAGE_CATEGORIES.has(payload.category)) throw new Error("ai_invalid_category");
   const paraphrase = typeof payload.neutralParaphrase === "string" ? payload.neutralParaphrase.trim() : null;
   if (payload.category !== "not_enough_information" && !paraphrase) throw new Error("ai_missing_paraphrase");
-  return { status: "completed", category: payload.category, neutralParaphrase: paraphrase, model };
+  return { status: "completed", category: payload.category, neutralParaphrase: paraphrase, model, provider };
 }
 
 function exactSpan(text, quote, start, end) {
@@ -471,10 +677,10 @@ function uniqueSpan(text, quote) {
   return { start: first, end: first + quote.length };
 }
 
-export async function extractTranscriptClaims(ai, { transcript, models, timeoutMs = 45_000 }) {
+export async function extractTranscriptClaims(ai, { transcript, models, timeoutMs = 45_000, onAttempt = null }) {
   if (!transcript?.trim()) throw new Error("transcript_required");
-  const { payload, model } = await structured(ai, {
-    models, schema: CLAIM_SCHEMA, name: "transcript_claim_candidates", timeoutMs,
+  const { payload, model, provider } = await structured(ai, {
+    models, schema: CLAIM_SCHEMA, name: "transcript_claim_candidates", timeoutMs, onAttempt,
     messages: [
       { role: "system", content: "Extract only concrete public statements that can be checked true or false with public evidence. For each suggestion, extract who, what, why, where, when, and how from one bounded passage around the exact quote. Each stated dimension must contain the speaker's verbatim wording plus exact character offsets. Use the literal value 'Not stated' with null support when the passage does not explicitly state a dimension. Who, what, why, where, and when are essential. How is optional because a prediction may not reveal its mechanism; preserve it as 'Not stated' rather than inferring it. Never infer or invent a missing subject, place, time, cause, rationale, mechanism, intent, belief, knowledge, or relationship. Why must be speaker-stated. How, when present, must also be speaker-stated and becomes separately testable. Also provide the public evidence to inspect and separate concrete pass and fail conditions without adding facts absent from the passage. A suggestion with any essential 'Not stated' field will be rejected before the reviewer queue. Omit general encouragement, advice, commentary, prayer, exhortation, symbolism, theology, biblical interpretation, rhetorical or hypothetical speech, internal mental-state claims, vague future language, and predictions without a bounded deadline. The candidate context must be at most 1,200 characters and must contain the exact quote. A prediction's deadline must be verbatim in that same context. Every quote, context, support quote, and character offset must exactly match the supplied transcript. Do not judge truth, novelty, probability, character, motive, sincerity, prophetic status, fraud, or divine causation. Return an empty candidates array when nothing qualifies." },
       { role: "user", content: transcript },
@@ -577,6 +783,6 @@ export async function extractTranscriptClaims(ai, { transcript, models, timeoutM
     if (reasons.length) { rejectionCodes.push(...reasons); rejectedCandidateCount += 1; }
     else candidates.push(assessed);
   }
-  return { status: "completed", model, candidates, rejectedCandidateCount,
+  return { status: "completed", model, provider, candidates, rejectedCandidateCount,
     assessments, rejectionCodes: [...new Set(rejectionCodes)].sort(), correctedOffsetCount };
 }

@@ -1,11 +1,28 @@
-import { extractTranscriptClaims } from "./ai.js";
+import { extractTranscriptClaims, textAnalysisRuntime } from "./ai.js";
 import { sha256, stableId } from "./hash.js";
-import { nowIso } from "./repository.js";
+import { nowIso, recordWorkersAiAttempt } from "./repository.js";
 
 export const TRANSCRIPT_MODEL = "gemini-3.1-flash-lite";
 export const TRANSCRIPT_PROMPT_VERSION = "youtube-clip-text-v1";
-export const STITCH_ALGORITHM = "ordered-clip-text-v1";
-export const CLAIM_EXTRACTION_PROMPT_VERSION = "transcript-claims-v5-grounded-5w1h-offset-repair";
+/** Below this, Gemini clipping is unreliable (hallucinates or 400). Never call the API. */
+export const MIN_TRANSCRIPT_WINDOW_SECONDS = 15;
+export const SHORT_WINDOW_PLACEHOLDER =
+  "[NO USABLE SPEECH — CLIP SHORTER THAN MIN TRANSCRIPT WINDOW]";
+/** Cap recursive splits so a pathological clip cannot fan out forever. */
+export const MAX_TRANSCRIPT_SPLIT_DEPTH = 4;
+/** Gemini refuses to emit text (copyright/recitation/safety). Split cannot recover these. */
+export const POLICY_BLOCKED_FINISH_REASONS = new Set([
+  "RECITATION", "SAFETY", "PROHIBITED_CONTENT", "BLOCKLIST", "SPII",
+  "IMAGE_SAFETY", "IMAGE_PROHIBITED_CONTENT",
+]);
+export function policyBlockedPlaceholder(finishReason, window) {
+  const start = Number(window.requestStart); const end = Number(window.requestEnd);
+  return `[GEMINI BLOCKED ${finishReason} — NO TRANSCRIPT FOR ${start}s-${end}s | NEEDS HUMAN/ALT SOURCE]`;
+}
+export const TRANSCRIPT_PLAN_VERSION = "balanced-integer-v2";
+export const STITCH_ALGORITHM = "ordered-clip-text-balanced-v2";
+export const LEGACY_STITCH_ALGORITHM = "ordered-clip-text-v1";
+export const CLAIM_EXTRACTION_PROMPT_VERSION = "transcript-claims-v13-gemini-schema-http400-fallback";
 
 function formatTime(seconds) {
   const hours = Math.floor(seconds / 3600); const minutes = Math.floor((seconds % 3600) / 60); const secs = Math.floor(seconds % 60);
@@ -16,8 +33,19 @@ export function transcriptPlan(durationSeconds, { chunkSeconds = 300, overlapSec
   if (!Number.isInteger(durationSeconds) || durationSeconds < 1 || durationSeconds > 43_200) throw new Error("invalid_video_duration");
   if (!Number.isInteger(chunkSeconds) || chunkSeconds < 60 || chunkSeconds > 300) throw new Error("invalid_chunk_seconds");
   if (!Number.isInteger(overlapSeconds) || overlapSeconds < 0 || overlapSeconds > 30 || overlapSeconds >= chunkSeconds) throw new Error("invalid_overlap_seconds");
-  const stride = chunkSeconds - overlapSeconds; const requests = [];
-  for (let start = 0; start < durationSeconds; start += stride) requests.push({ requestStart: start, requestEnd: Math.min(durationSeconds, start + chunkSeconds) });
+  const stride = chunkSeconds - overlapSeconds;
+  const requestCount = Math.max(1, Math.ceil((durationSeconds - overlapSeconds) / stride));
+  const requestedSeconds = durationSeconds + ((requestCount - 1) * overlapSeconds);
+  const baseRequestSeconds = Math.floor(requestedSeconds / requestCount);
+  const longerRequestCount = requestedSeconds % requestCount;
+  const requests = [];
+  let requestStart = 0;
+  for (let index = 0; index < requestCount; index += 1) {
+    const requestLength = baseRequestSeconds + (index < longerRequestCount ? 1 : 0);
+    const requestEnd = requestStart + requestLength;
+    requests.push({ requestStart, requestEnd });
+    requestStart = requestEnd - overlapSeconds;
+  }
   return requests.map((request, index) => ({ index, ...request,
     canonicalStart: index ? (requests[index - 1].requestEnd + request.requestStart) / 2 : 0,
     canonicalEnd: index + 1 < requests.length ? (request.requestEnd + requests[index + 1].requestStart) / 2 : durationSeconds,
@@ -46,18 +74,55 @@ function responseText(payload) {
   return (payload?.candidates?.[0]?.content?.parts || []).map((part) => part.text || "").join("").trim();
 }
 
-export async function requestTranscriptChunk({ apiKey, videoUrl, window, model = TRANSCRIPT_MODEL, fetcher = fetch, timeoutMs = 120_000 }) {
+function safeGeminiCause(error) {
+  const message = String(error?.message || "");
+  if (message === "gemini_timeout") return "gemini_timeout";
+  if (message === "gemini_network_error") return "gemini_network_error";
+  if (message === "gemini_http_429") return "gemini_http_429";
+  if (/^gemini_http_5\d\d$/.test(message)) return "gemini_http_5xx";
+  if (/^gemini_http_4\d\d$/.test(message)) return "gemini_http_4xx";
+  if (["gemini_output_truncated","gemini_incomplete_response","transcript_empty_output",
+    "transcript_chunk_too_large"].includes(message)) return message;
+  return "physical_result_unknown";
+}
+
+export async function requestTranscriptChunk({ apiKey, videoUrl, window, model = TRANSCRIPT_MODEL,
+  fetcher = fetch, timeoutMs = 120_000, splitPath = "root",
+  beforePhysicalRequest = null, afterPhysicalRequest = null }) {
   if (!apiKey) throw new Error("gemini_key_required");
+  const duration = Number(window.requestEnd) - Number(window.requestStart);
+  if (!Number.isFinite(duration) || duration <= 0) throw new Error("invalid_transcript_window");
+  // Tiny windows are not valid transcription targets (prod: 1s tail → gemini_http_400; canary: 1s → hallucinated speech).
+  if (duration < MIN_TRANSCRIPT_WINDOW_SECONDS) {
+    return {
+      text: SHORT_WINDOW_PLACEHOLDER,
+      requestSha256: await sha256({ shortWindow: true, window, model }),
+      responseId: null,
+      // D1 CHECK requires completed rows to use finish_reason=STOP.
+      finishReason: "STOP",
+      blockedReason: "SHORT_WINDOW_SKIPPED",
+      inputTokens: null,
+      outputTokens: null,
+      splitCount: 0,
+    };
+  }
   const prompt = [
     "Transcribe every spoken word in this supplied clip from beginning to end.",
     "Return only the spoken transcript as plain text. Do not include timestamps, speaker guesses, notes, headings, markdown fences, summaries, paraphrases, interpretations, corrections, or omissions.",
     "Include ordinary encouragement, prayer, repetition, and filler because this is source acquisition, not claim analysis.",
   ].join(" ");
+  // Keep maxOutputTokens moderate: raising it on runaway loops only produces more garbage (canary: 32k still MAX_TOKENS).
   const requestBody = { contents: [{ role: "user", parts: [
     { fileData: { fileUri: videoUrl, mimeType: "video/*" }, videoMetadata: { startOffset: `${window.requestStart}s`, endOffset: `${window.requestEnd}s` } },
     { text: prompt },
-  ] }], generationConfig: { temperature: 0, maxOutputTokens: 16_384 } };
+  ] }], generationConfig: { temperature: 0, maxOutputTokens: 16_384, thinkingConfig: { thinkingLevel: "minimal" } } };
   const requestSha256 = await sha256(requestBody);
+  const physicalRequestId = beforePhysicalRequest ? await beforePhysicalRequest({
+    splitPath, window, model, requestSha256,
+  }) : null;
+  const finishPhysicalRequest = async (result) => {
+    if (afterPhysicalRequest) await afterPhysicalRequest({ physicalRequestId, splitPath, window, ...result });
+  };
   const controller = new AbortController(); const timer = setTimeout(() => controller.abort(), timeoutMs);
   let response; let payload;
   try {
@@ -68,23 +133,111 @@ export async function requestTranscriptChunk({ apiKey, videoUrl, window, model =
     payload = await response.json().catch(() => null);
   } catch (cause) {
     const error = new Error(controller.signal.aborted ? "gemini_timeout" : "gemini_network_error");
-    error.retryable = true; error.cause = cause; error.requestSha256 = requestSha256; throw error;
+    error.retryable = true; error.cause = cause; error.requestSha256 = requestSha256;
+    await finishPhysicalRequest({ status: "failed", safeCauseCode: safeGeminiCause(error) });
+    throw error;
   } finally { clearTimeout(timer); }
   if (!response.ok) {
-    const error = new Error(`gemini_http_${response.status}`); error.retryable = response.status === 429 || response.status >= 500;
-    error.requestSha256 = requestSha256; error.responseId = payload?.responseId || null; throw error;
+    // Public YouTube URL ingestion intermittently returns 400; treat as retryable except clearly-invalid windows (handled above).
+    const error = new Error(`gemini_http_${response.status}`);
+    error.retryable = response.status === 429 || response.status === 400 || response.status >= 500;
+    error.requestSha256 = requestSha256; error.responseId = payload?.responseId || null;
+    error.httpStatus = response.status;
+    await finishPhysicalRequest({ status: "failed", safeCauseCode: safeGeminiCause(error),
+      httpStatus: response.status, responseId: error.responseId });
+    throw error;
   }
-  const finishReason = payload?.candidates?.[0]?.finishReason; const text = responseText(payload);
+  const candidate = payload?.candidates?.[0];
+  const finishReason = candidate?.finishReason;
+  const text = responseText(payload);
+  const usage = payload?.usageMetadata || {};
+  // Policy blocks (esp. RECITATION on scripture/copyrighted speech): empty text forever.
+  // Live probe: mjQd35WtGRs / wQ2tL06qmzw returned RECITATION on full window and all halves.
+  // Mark the clip and continue acquisition — do not retry/split/pause the whole batch.
+  if (POLICY_BLOCKED_FINISH_REASONS.has(String(finishReason || ""))) {
+    await finishPhysicalRequest({ status: "completed", httpStatus: response.status,
+      responseId: payload?.responseId || null, finishReason,
+      inputTokens: usage.promptTokenCount ?? null, outputTokens: usage.candidatesTokenCount ?? null });
+    return {
+      text: policyBlockedPlaceholder(finishReason, window),
+      requestSha256,
+      responseId: payload?.responseId || null,
+      // Persist STOP for the completed-row CHECK; real block reason lives in text + blockedReason.
+      finishReason: "STOP",
+      blockedReason: finishReason,
+      finishMessage: candidate?.finishMessage || null,
+      inputTokens: usage.promptTokenCount ?? null,
+      outputTokens: usage.candidatesTokenCount ?? null,
+      splitCount: 0,
+      policyBlocked: true,
+    };
+  }
   if (finishReason !== "STOP" || !text) {
     const error = new Error(finishReason === "MAX_TOKENS" ? "gemini_output_truncated" : "gemini_incomplete_response");
-    error.requestSha256 = requestSha256; error.responseId = payload?.responseId || null; throw error;
+    // Do NOT accept partial MAX_TOKENS text — canary showed 70k-char repetition loops. Split instead.
+    error.retryable = true;
+    error.splitCandidate = finishReason === "MAX_TOKENS" || !text;
+    error.finishReason = finishReason || null;
+    error.requestSha256 = requestSha256; error.responseId = payload?.responseId || null;
+    error.inputTokens = usage.promptTokenCount ?? null;
+    error.outputTokens = usage.candidatesTokenCount ?? null;
+    await finishPhysicalRequest({ status: "failed", safeCauseCode: safeGeminiCause(error),
+      httpStatus: response.status, responseId: error.responseId, finishReason: error.finishReason,
+      inputTokens: error.inputTokens, outputTokens: error.outputTokens });
+    throw error;
   }
   let cleaned;
   try { cleaned = cleanTranscriptText(text); } catch (error) {
-    error.requestSha256 = requestSha256; error.responseId = payload?.responseId || null; throw error;
+    error.requestSha256 = requestSha256; error.responseId = payload?.responseId || null;
+    await finishPhysicalRequest({ status: "failed", safeCauseCode: safeGeminiCause(error),
+      httpStatus: response.status, responseId: error.responseId, finishReason,
+      inputTokens: usage.promptTokenCount ?? null, outputTokens: usage.candidatesTokenCount ?? null });
+    throw error;
   }
+  await finishPhysicalRequest({ status: "completed", httpStatus: response.status,
+    responseId: payload?.responseId || null, finishReason,
+    inputTokens: usage.promptTokenCount ?? null, outputTokens: usage.candidatesTokenCount ?? null });
   return { text: cleaned, requestSha256, responseId: payload?.responseId || null, finishReason,
-    inputTokens: payload?.usageMetadata?.promptTokenCount ?? null, outputTokens: payload?.usageMetadata?.candidatesTokenCount ?? null };
+    inputTokens: payload?.usageMetadata?.promptTokenCount ?? null,
+    outputTokens: payload?.usageMetadata?.candidatesTokenCount ?? null,
+    splitCount: 0 };
+}
+
+/**
+ * Live canary (KMr0tGfmvZs 283-565): full window → MAX_TOKENS runaway loop;
+ * halves → STOP with ~550 tokens each. Same-window retries are useless — split.
+ */
+export async function requestTranscriptChunkWithSplit(options, { depth = 0, splitPath = "root" } = {}) {
+  const window = options.window;
+  const duration = Number(window.requestEnd) - Number(window.requestStart);
+  try {
+    return await requestTranscriptChunk({ ...options, splitPath });
+  } catch (error) {
+    const canSplit = error?.splitCandidate
+      && duration >= (MIN_TRANSCRIPT_WINDOW_SECONDS * 2)
+      && depth < MAX_TRANSCRIPT_SPLIT_DEPTH;
+    if (!canSplit) throw error;
+    const mid = Number(window.requestStart) + Math.floor(duration / 2);
+    const left = await requestTranscriptChunkWithSplit({
+      ...options,
+      window: { ...window, requestStart: Number(window.requestStart), requestEnd: mid },
+    }, { depth: depth + 1, splitPath: splitPath === "root" ? "L" : `${splitPath}L` });
+    const right = await requestTranscriptChunkWithSplit({
+      ...options,
+      window: { ...window, requestStart: mid, requestEnd: Number(window.requestEnd) },
+    }, { depth: depth + 1, splitPath: splitPath === "root" ? "R" : `${splitPath}R` });
+    const text = cleanTranscriptText(`${left.text}
+${right.text}`);
+    return {
+      text,
+      requestSha256: left.requestSha256,
+      responseId: right.responseId || left.responseId,
+      finishReason: "STOP",
+      inputTokens: (left.inputTokens || 0) + (right.inputTokens || 0),
+      outputTokens: (left.outputTokens || 0) + (right.outputTokens || 0),
+      splitCount: 1 + (left.splitCount || 0) + (right.splitCount || 0),
+    };
+  }
 }
 
 export async function fetchYouTubeDuration({ youtubeId, fetcher = fetch, timeoutMs = 20_000 }) {
@@ -168,13 +321,17 @@ export function transcriptSections(text) {
 }
 
 export async function extractTranscriptSection(ai, { db, transcriptId, sourceItemId,
-  transcript, section, models, timeoutMs = 45_000, createdAt = nowIso() }) {
+  transcript, section, models, timeoutMs = 45_000, createdAt = nowIso(), aiAttemptContext = null }) {
   const inputSha256 = await sha256(section.text);
   const extractionRunId = await stableId("ext", `${transcriptId}:${inputSha256}:${CLAIM_EXTRACTION_PROMPT_VERSION}`);
   const existing = await db.prepare("SELECT status FROM extraction_runs WHERE extraction_run_id=?1")
     .bind(extractionRunId).first();
   if (existing?.status === "completed") return { extractionRunId, candidateCount: 0, reused: true };
-  const result = await extractTranscriptClaims(ai, { transcript: section.text, models, timeoutMs });
+  const onAttempt = aiAttemptContext ? async (attempt) => {
+    const attemptId = await stableId("wai", `${aiAttemptContext.jobId}:${aiAttemptContext.jobAttempt}:${attempt.modelName}:${attempt.mode}:${attempt.ordinal}`);
+    await recordWorkersAiAttempt(db, { attemptId, ...aiAttemptContext, ...attempt });
+  } : null;
+  const result = await extractTranscriptClaims(ai, { transcript: section.text, models, timeoutMs, onAttempt });
   const extractionStatement = db.prepare(`INSERT INTO extraction_runs
       (extraction_run_id,source_item_id,transcript_id,input_kind,input_sha256,prompt_version,model_family,status,started_at,completed_at,
        transcript_quality,rejected_candidate_count,rejection_codes_json,corrected_offset_count)
@@ -209,7 +366,7 @@ export async function extractTranscriptSection(ai, { db, transcriptId, sourceIte
           supportStart: value.supportStart === null ? null : value.supportStart + section.baseOffset,
           supportEnd: value.supportEnd === null ? null : value.supportEnd + section.baseOffset,
         }])) }), rejectionCodesJson: JSON.stringify(candidate.rejectionCodes),
-      assessedBy: `workers-ai:${result.model}`, createdAt });
+      assessedBy: `${result.provider || "workers-ai"}:${result.model}`, createdAt });
     persistence.push({ rejectionId: await stableId("txpr", `${extractionRunId}:${ordinal}`),
       extractionRunId, ordinal, candidateId, assessmentId, createdAt });
   }
@@ -281,7 +438,7 @@ export async function extractSections(ai, options) {
   return candidateCount;
 }
 
-function analysisEnvelope({ analysisRunId, ingestionRunId, analysisSectionId, transcriptId,
+export function transcriptAnalysisSectionEnvelope({ analysisRunId, ingestionRunId, analysisSectionId, transcriptId,
   sourceItemId, personId, sectionIndex, transcriptSha256, inputSha256 }) {
   const stableKey = `transcript:${transcriptId}:analysis:${sectionIndex}:${CLAIM_EXTRACTION_PROMPT_VERSION}`;
   return stableId("job", `${ingestionRunId}:transcript_extract:${stableKey}`).then((jobId) => ({
@@ -414,7 +571,7 @@ export async function prepareTranscriptAnalysis(env, { transcriptId, sourceItemI
   }
   const envelopes = [];
   for (const [index, row] of stored.entries()) {
-    if (row.status === "queued") envelopes.push(await analysisEnvelope({ analysisRunId,
+    if (row.status === "queued") envelopes.push(await transcriptAnalysisSectionEnvelope({ analysisRunId,
       ingestionRunId, analysisSectionId: row.analysis_section_id, transcriptId,
       sourceItemId, personId, sectionIndex: Number(row.section_index), transcriptSha256,
       inputSha256: sectionRows[index].inputSha256 }));
@@ -453,7 +610,7 @@ export async function prepareTranscriptAnalysisFromArtifact(env, payload, {
     ingestionRunId, at });
 }
 
-export async function processTranscriptAnalysis(env, payload, { at = nowIso(), attemptCount = 1 } = {}) {
+export async function processTranscriptAnalysis(env, payload, { at = nowIso(), attemptCount = 1, jobId = null } = {}) {
   const row = await env.DB.prepare(`SELECT section.*,analysis.transcript_id,analysis.source_item_id,
       analysis.transcript_sha256,analysis.prompt_version,artifact.r2_key,artifact.content_sha256,
       source.person_id
@@ -482,10 +639,12 @@ export async function processTranscriptAnalysis(env, payload, { at = nowIso(), a
       attempt_count=?2,error_code=NULL,started_at=COALESCE(started_at,?3),completed_at=NULL
     WHERE analysis_section_id=?1 AND status IN ('queued','failed')`)
     .bind(payload.analysisSectionId, attemptCount, at).run();
-  const result = await extractTranscriptSection(env.AI, { db: env.DB,
+  const runtime = textAnalysisRuntime(env);
+  const result = await extractTranscriptSection(runtime.ai, { db: env.DB,
     transcriptId: row.transcript_id, sourceItemId: row.source_item_id, transcript, section,
-    models: [env.AI_MODEL, env.AI_FALLBACK_MODEL],
-    timeoutMs: Number(env.AI_TIMEOUT_MS) || 45_000, createdAt: at });
+    models: runtime.models, timeoutMs: runtime.timeoutMs, createdAt: at,
+    aiAttemptContext: { jobId, jobAttempt: attemptCount,
+      analysisRunId: payload.analysisRunId, analysisSectionId: payload.analysisSectionId } });
   await env.DB.prepare(`UPDATE transcript_analysis_sections SET status='completed',
       extraction_run_id=?2,error_code=NULL,completed_at=?3
     WHERE analysis_section_id=?1 AND status='processing'`)

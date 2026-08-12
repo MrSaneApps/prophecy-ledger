@@ -1,7 +1,9 @@
 import { resolveReviewerPrincipal } from "../../lib/reviewer-auth.js";
 import {
   leaseReviewWork, listReviewerAssignments, reconcileNeededPublications, recordReviewAudit,
+  ReviewWorkflowError, switchLease,
 } from "../../lib/review-workflow.js";
+import { readJson } from "../../lib/response.js";
 import {
   leaseArchiveReviewWork, listArchiveReviewerAssignments,
 } from "../../lib/archive-review-workflow.js";
@@ -11,6 +13,38 @@ function hidden() { return apiError("Not found.", "not_found", 404); }
 
 async function bestEffortAudit(db, event) {
   try { await recordReviewAudit(db, event); } catch { console.error("review_audit_failed"); }
+}
+
+export async function onRequestPost({ request, env }) {
+  const principal = await resolveReviewerPrincipal(request, env);
+  if (!principal) {
+    await bestEffortAudit(env.DB, { eventType: "auth_failed", detail: { code: "missing_or_invalid" } });
+    return hidden();
+  }
+  let body;
+  try { body = await readJson(request, 2_048); } catch (error) {
+    return apiError("The request must be a small JSON object.", error.message, 400);
+  }
+  const workItemId = String(body?.leaseWorkItemId || "").trim();
+  if (!workItemId || workItemId.length > 160) {
+    return apiError("Name the claim work item to open.", "work_item_required", 400);
+  }
+  try {
+    const assignment = await switchLease(env.DB, principal.reviewerId, workItemId, env);
+    return json({
+      assignment: {
+        assignmentId: assignment.assignment_id,
+        workItemId: assignment.work_item_id,
+        workType: assignment.work_type,
+        claimId: assignment.claim_id,
+        leaseExpiresAt: assignment.lease_expires_at,
+      },
+    }, 201);
+  } catch (error) {
+    if (error instanceof ReviewWorkflowError) return apiError(error.message, error.code, error.status);
+    console.error("lease_switch_failed", error);
+    return apiError("The claim could not be opened.", "lease_unavailable", 503);
+  }
 }
 
 export async function onRequestGet({ request, env }) {
@@ -23,13 +57,19 @@ export async function onRequestGet({ request, env }) {
     await recordReviewAudit(env.DB, {
       reviewerId: principal.reviewerId, eventType: "auth_succeeded", detail: { mode: principal.mode },
     });
-    await reconcileNeededPublications(env.DB);
-    const archiveAssignment = await leaseArchiveReviewWork(env.DB, principal.reviewerId, env);
-    if (!archiveAssignment) await leaseReviewWork(env.DB, principal.reviewerId, env);
-    const [archiveAssignments, standardAssignments] = await Promise.all([
-      listArchiveReviewerAssignments(env.DB, principal.reviewerId),
-      listReviewerAssignments(env.DB, principal.reviewerId),
-    ]);
+    try { await reconcileNeededPublications(env.DB); }
+    catch (error) { console.error("review_queue_reconcile_failed", error); }
+    // Prefer claim/candidate review work. Archive must never take down the queue.
+    try { await leaseReviewWork(env.DB, principal.reviewerId, env); }
+    catch (error) { console.error("review_queue_lease_failed", error); }
+    try { await leaseArchiveReviewWork(env.DB, principal.reviewerId, env); }
+    catch (error) { console.error("review_queue_archive_lease_failed", error); }
+    let archiveAssignments = [];
+    let standardAssignments = [];
+    try { standardAssignments = await listReviewerAssignments(env.DB, principal.reviewerId); }
+    catch (error) { console.error("review_queue_list_failed", error); throw error; }
+    try { archiveAssignments = await listArchiveReviewerAssignments(env.DB, principal.reviewerId); }
+    catch (error) { console.error("review_queue_archive_list_failed", error); }
     const assignments = [...archiveAssignments, ...standardAssignments].sort((left, right) => {
       if (left.status !== right.status) return left.status === "leased" ? -1 : 1;
       if (left.workType !== right.workType) {

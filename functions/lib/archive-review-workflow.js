@@ -71,7 +71,7 @@ async function archiveWorkItems(db, reviewerId, now) {
          WHERE decision.archive_work_item_id=work.archive_work_item_id)
        AND NOT EXISTS (SELECT 1 FROM archive_review_assignments own
          WHERE own.archive_work_item_id=work.archive_work_item_id AND own.reviewer_id=?1
-           AND own.status IN ('submitted','released'))
+           AND own.status='submitted')
        AND NOT EXISTS (SELECT 1 FROM archive_review_assignments active
          WHERE active.archive_work_item_id=work.archive_work_item_id
            AND (active.status='submitted' OR
@@ -83,16 +83,21 @@ async function archiveWorkItems(db, reviewerId, now) {
 
 async function tryLeaseArchive(db, work, reviewerId, now, expiresAt) {
   const existing = await db.prepare(
-    `SELECT archive_assignment_id FROM archive_review_assignments
-     WHERE archive_work_item_id=?1 AND reviewer_id=?2
-       AND status='leased' AND lease_expires_at<=?3`
-  ).bind(work.archive_work_item_id, reviewerId, now).first();
-  if (existing) {
+    `SELECT archive_assignment_id,status,lease_expires_at
+     FROM archive_review_assignments
+     WHERE archive_work_item_id=?1 AND reviewer_id=?2`
+  ).bind(work.archive_work_item_id, reviewerId).first();
+  const shouldRenew = existing && (
+    existing.status === "released"
+    || (existing.status === "leased" && existing.lease_expires_at <= now)
+  );
+  if (shouldRenew) {
     const result = await db.prepare(
       `UPDATE archive_review_assignments
-       SET lease_expires_at=?1,lease_version=lease_version+1
-       WHERE archive_assignment_id=?2 AND reviewer_id=?3 AND status='leased'
-         AND lease_expires_at<=?4
+       SET status='leased',submitted_at=NULL,lease_expires_at=?1,
+         lease_version=lease_version+1
+       WHERE archive_assignment_id=?2 AND reviewer_id=?3
+         AND (status='released' OR (status='leased' AND lease_expires_at<=?4))
          AND NOT EXISTS (SELECT 1 FROM archive_review_assignments active
            WHERE active.archive_work_item_id=?5
              AND active.archive_assignment_id<>?2 AND active.status='leased'
@@ -101,6 +106,7 @@ async function tryLeaseArchive(db, work, reviewerId, now, expiresAt) {
       work.archive_work_item_id).run();
     return changes(result) ? existing.archive_assignment_id : null;
   }
+  if (existing) return null;
   const assignmentId = `archive_assignment_${crypto.randomUUID()}`;
   const result = await db.prepare(
     `INSERT OR IGNORE INTO archive_review_assignments
@@ -134,6 +140,67 @@ export async function leaseArchiveReviewWork(db, reviewerId, env, now = new Date
        WHERE assignment.archive_assignment_id=?1`
     ).bind(assignmentId).first();
     break;
+  }
+  return assignment;
+}
+
+async function archiveWorkItemForLease(db, reviewerId, workItemId, now) {
+  return db.prepare(
+    `SELECT work.archive_work_item_id,work.archive_revision_id,work.archive_video_link_id
+     FROM archive_verification_work_items work
+     WHERE work.archive_work_item_id=?1 AND work.status='ready'
+       AND NOT EXISTS (SELECT 1 FROM archive_review_decisions decision
+         WHERE decision.archive_work_item_id=work.archive_work_item_id)
+       AND NOT EXISTS (SELECT 1 FROM archive_review_assignments own
+         WHERE own.archive_work_item_id=work.archive_work_item_id AND own.reviewer_id=?2
+           AND own.status='submitted')
+       AND NOT EXISTS (SELECT 1 FROM archive_review_assignments active
+         WHERE active.archive_work_item_id=work.archive_work_item_id
+           AND (active.status='submitted' OR
+             (active.status='leased' AND active.lease_expires_at>?3)))`
+  ).bind(workItemId, reviewerId, now).first();
+}
+
+async function archiveAssignmentRow(db, assignmentId) {
+  return db.prepare(
+    `SELECT assignment.archive_assignment_id,assignment.archive_work_item_id,
+      assignment.status,assignment.lease_expires_at,work.archive_revision_id,
+      work.archive_video_link_id,work.status work_status
+     FROM archive_review_assignments assignment
+     JOIN archive_verification_work_items work
+       ON work.archive_work_item_id=assignment.archive_work_item_id
+     WHERE assignment.archive_assignment_id=?1`
+  ).bind(assignmentId).first();
+}
+
+export async function switchArchiveLease(
+  db, reviewerId, workItemId, env, now = new Date().toISOString(),
+) {
+  const current = await currentArchiveAssignment(db, reviewerId, now);
+  if (current?.archive_work_item_id === workItemId) return current;
+
+  const target = await archiveWorkItemForLease(db, reviewerId, workItemId, now);
+  if (!target) {
+    throw new ReviewWorkflowError("archive_lease_unavailable",
+      "That source check is not ready or was taken just now.", 409);
+  }
+  if (current) {
+    await db.prepare(
+      `UPDATE archive_review_assignments SET status='released',submitted_at=NULL
+       WHERE archive_assignment_id=?1 AND reviewer_id=?2 AND status='leased'`
+    ).bind(current.archive_assignment_id, reviewerId).run();
+  }
+
+  const expiresAt = plusSeconds(now, leaseSeconds(env));
+  const assignmentId = await tryLeaseArchive(db, target, reviewerId, now, expiresAt);
+  if (!assignmentId) {
+    throw new ReviewWorkflowError("archive_lease_unavailable",
+      "That source check was taken just now. Refresh the list.", 409);
+  }
+  const assignment = await archiveAssignmentRow(db, assignmentId);
+  if (!assignment || assignment.archive_work_item_id !== workItemId) {
+    throw new ReviewWorkflowError("archive_lease_unavailable",
+      "The requested source check could not be opened.", 409);
   }
   return assignment;
 }
@@ -394,14 +461,16 @@ function checkNote(decision, name) {
 }
 
 export async function submitArchiveDecision(
-  db, assignmentId, reviewerId, decision, now = new Date().toISOString(),
+  db, assignmentId, reviewerId, decision, now = new Date().toISOString(), options = {},
 ) {
   const assignment = await archiveAssignmentForAccess(db, assignmentId, reviewerId, now, false);
   if (!assignment) {
     throw new ReviewWorkflowError("assignment_required", "A live archive assignment is required.", 404);
   }
-  const decisionId = `archive_decision_${crypto.randomUUID()}`;
-  const observationId = `archive_observation_${crypto.randomUUID()}`;
+  const decisionId = options.decisionId || `archive_decision_${crypto.randomUUID()}`;
+  const observationId = options.observationId || `archive_observation_${crypto.randomUUID()}`;
+  const additionalStatements = Array.isArray(options.additionalStatements)
+    ? options.additionalStatements : [];
   const checks = ["source_available", "testable", "exact_source", "who", "what", "why", "where", "when", "how"];
   await db.batch([
     db.prepare(
@@ -436,6 +505,7 @@ export async function submitArchiveDecision(
        VALUES (?1,?2,?3,?4,?5,?6)`
     ).bind(`archive_check_${crypto.randomUUID()}`, decisionId, name,
       checkStatus(decision, name), checkNote(decision, name), now)),
+    ...additionalStatements,
     db.prepare(
       `UPDATE archive_review_assignments SET status='submitted',submitted_at=?1
        WHERE archive_assignment_id=?2 AND reviewer_id=?3 AND status='leased'

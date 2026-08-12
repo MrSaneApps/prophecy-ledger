@@ -141,6 +141,21 @@ test("report findings include only resolved, published, summarized claims", () =
   assert.equal(model.findings[0].outcome, "false");
 });
 
+test("published report findings survive a later unavailable-source fact without private material", () => {
+  const model = buildProfileReportModel(reportProfile({
+    sources: [{ source_type: "youtube", source_role: "first_party", identity_status: "confirmed",
+      availability: "unavailable", url: "https://example.test/original", note: "Original link unavailable." }],
+    claims: [{ claim_id: "preserved", title: "Preserved finding", exact_quote: "Archived exact words",
+      source_url: "https://example.test/original", source_date: "2020-01-01",
+      statement_type: "testable_prediction", novelty_status: "not_assessed", visibility: "published",
+      outcome_status: "false", publication_summary: "Two matching human reviews published this finding." }],
+    transcript_body: "private transcript", reviewer_notes: "private rationale",
+  }));
+  assert.deepEqual(model.findings.map((finding) => finding.id), ["preserved"]);
+  assert.equal(model.sources[0].availability, "Unavailable");
+  assert.doesNotMatch(JSON.stringify(model), /private transcript|private rationale|transcript_body|reviewer_notes/);
+});
+
 test("report byte output is stable for the same public profile", async () => {
   const profile = reportProfile();
   const first = await buildProfileReportPdf(profile);

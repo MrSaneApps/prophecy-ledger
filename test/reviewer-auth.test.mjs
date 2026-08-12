@@ -64,7 +64,9 @@ test("Access JWT fails closed for wrong issuer, audience, expiry, and signature"
     }), /access_(issuer_invalid|audience_invalid|token_expired)/);
   }
   const fixture = accessFixture();
-  const tampered = `${fixture.token.slice(0, -2)}aa`;
+  const [header, payload, signature] = fixture.token.split(".");
+  const changedFirstCharacter = signature[0] === "A" ? "B" : "A";
+  const tampered = `${header}.${payload}.${changedFirstCharacter}${signature.slice(1)}`;
   await assert.rejects(() => verifyAccessJwt(tampered, fixture.env, {
     fetchImpl: fixture.fetchImpl, now: fixture.now * 1000,
   }), /access_signature_invalid/);

@@ -1,0 +1,8 @@
+# Local reviewer demo only — never deploy these values.
+# Copy to .dev.vars (gitignored) for `npm run dev:review` + `npm run e2e:reviewer`.
+
+REVIEW_DEMO_MODE=1
+DEMO_REVIEWER_1_ID=reviewer_demo_one
+DEMO_REVIEWER_1_TOKEN=demo-token-one-7f3a
+DEMO_REVIEWER_2_ID=reviewer_demo_two
+DEMO_REVIEWER_2_TOKEN=demo-token-two-9c1e

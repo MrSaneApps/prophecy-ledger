@@ -1,8 +1,12 @@
-import { processQueueBatch, scannerStatus, startFirstPartyArchiveIngest, startScan,
-  reprocessTranscriptAnalysis, startTranscriptCanary, startVideoAnalysisCanary } from "./jobs.js";
+import { persistOperationReceipt, processQueueBatch, scannerStatus,
+  startFirstPartyArchiveIngest, startScan, queueOperationsStatus,
+  readTranscriptAnalysisSectionLineages, readTranscriptAnalysisSectionStatuses,
+  reconcileStaleTranscriptAnalysisSection, reprocessTranscriptAnalysis, reprocessTranscriptAnalysisSection,
+  startTranscriptCanary, startVideoAnalysisCanary } from "./jobs.js";
 import {
-  repairLegacyStitchedTranscriptBatchItem, resumeScheduledTranscriptBatch, resumeTranscriptBatch,
-  startTranscriptBatch, syncArchiveLinkedTranscriptBatch, transcriptBatchStatus,
+  quarantinePendingTranscriptItem, repairLegacyStitchedTranscriptBatchItem,
+  resumeScheduledTranscriptBatch, resumeTranscriptBatch,
+  skipActiveTranscriptItem, startTranscriptBatch, syncArchiveLinkedTranscriptBatch, transcriptBatchStatus,
 } from "./transcript-batch.js";
 
 function json(value, status = 200) {
@@ -33,9 +37,11 @@ async function fetchHandler(request, env, { durationFetcher = fetch } = {}) {
     const byok = env.AI_GATEWAY_BYOK === "1";
     const aiGateway = Boolean(env.AI_GATEWAY_ACCOUNT_ID && env.AI_GATEWAY_ID && env.AI_GATEWAY_TOKEN &&
       (byok || env.GEMINI_API_KEY));
+    const textAnalysisGateway = Boolean(aiGateway && env.GEMINI_ANALYSIS_MODEL);
     return json({ ok: db?.ok === 1, scannerEnabled: env.SCAN_ENABLED === "1",
       transcriptBatchEnabled: env.TRANSCRIPT_BATCH_ENABLED === "1", bindings: {
       d1: Boolean(env.DB), queue: Boolean(env.INGESTION_QUEUE), ai: Boolean(env.AI), aiGateway,
+      textAnalysisGateway,
       aiGatewayByok: byok, directGemini: Boolean(env.GEMINI_API_KEY),
       youtubeDataApi: Boolean(env.YOUTUBE_DATA_API_KEY), artifacts: Boolean(env.ARTIFACTS),
     } });
@@ -62,6 +68,15 @@ async function fetchHandler(request, env, { durationFetcher = fetch } = {}) {
     const result = await scannerStatus(env, runId);
     return result ? json(result) : json({ error: "run_not_found" }, 404);
   }
+  if (request.method === "GET" && ["/admin/operations-status", "/admin/queue-status"].includes(url.pathname)) {
+    try {
+      const result = await queueOperationsStatus(env);
+      return json(result, result.healthy ? 200 : 503);
+    } catch {
+      return json({ schemaVersion: 1, contract: "queue-operations-status-v1",
+        healthy: false, error: "queue_observation_persistence_failed" }, 503);
+    }
+  }
   if (request.method === "POST" && url.pathname === "/admin/video-canary") {
     const body = await request.json().catch(() => ({}));
     if (body.force !== undefined && typeof body.force !== "boolean") return json({ error: "invalid_force" }, 400);
@@ -82,6 +97,87 @@ async function fetchHandler(request, env, { durationFetcher = fetch } = {}) {
   }
   if (request.method === "POST" && url.pathname === "/admin/transcript-analysis") {
     const body = await request.json().catch(() => ({}));
+    if (body.action === "persist_operation_receipt") {
+      if (Object.keys(body).sort().join(",") !== "action,itemFinals,kind,summary") {
+        return json({ error: "invalid_action_fields" }, 400);
+      }
+      try {
+        const result = await persistOperationReceipt(env, {
+          kind: body.kind, summary: body.summary, itemFinals: body.itemFinals,
+          idempotencyKey: request.headers.get("idempotency-key") || "",
+        });
+        return json(result, result.reused ? 200 : 201);
+      } catch (error) {
+        const status = Number(error?.status) || 503;
+        return json({ error: status === 503 ? "operation_receipt_persistence_failed" :
+          error?.code || "invalid_operation_receipt" }, status);
+      }
+    }
+    if (body.action === "read_section_lineages") {
+      if (Object.keys(body).sort().join(",") !== "action,analysisSectionIds") {
+        return json({ error: "invalid_action_fields" }, 400);
+      }
+      try {
+        return json(await readTranscriptAnalysisSectionLineages(env, {
+          analysisSectionIds: body.analysisSectionIds,
+        }));
+      } catch (error) {
+        const status = Number(error?.status) || 503;
+        return json({ error: error?.code || "analysis_section_lineage_read_failed" }, status);
+      }
+    }
+    if (body.action === "reconcile_stale_section") {
+      if (Object.keys(body).sort().join(",") !== "action,analysisSectionId,expectedAttemptCount") {
+        return json({ error: "invalid_action_fields" }, 400);
+      }
+      try {
+        const result = await reconcileStaleTranscriptAnalysisSection(env, {
+          analysisSectionId: body.analysisSectionId,
+          expectedAttemptCount: body.expectedAttemptCount,
+          idempotencyKey: request.headers.get("idempotency-key") || "",
+          retryCurrentSection: (retry) => reprocessTranscriptAnalysisSection(env, retry),
+        });
+        const invalid = ["invalid_analysis_section_id", "invalid_expected_attempt_count",
+          "invalid_idempotency_key"].includes(result.reason);
+        const status = invalid ? 400 : result.reason === "analysis_section_not_found" ? 404 :
+          result.reason === "queue_dispatch_failed" ? 503 :
+          result.terminal || result.reused ? 200 : result.dispatched ? 202 : 409;
+        return json(result, status);
+      } catch (error) {
+        const status = Number(error?.status) || 503;
+        return json({ schemaVersion: 1, contract: "analysis-stale-section-reconciliation-v1",
+          terminal: false, reason: error?.code || "stale_section_reconciliation_failed" }, status);
+      }
+    }
+    if (body.action === "read_section_statuses") {
+      if (Object.keys(body).sort().join(",") !== "action,analysisSectionIds") {
+        return json({ error: "invalid_action_fields" }, 400);
+      }
+      try {
+        return json(await readTranscriptAnalysisSectionStatuses(env, {
+          analysisSectionIds: body.analysisSectionIds,
+        }));
+      } catch (error) {
+        const status = Number(error?.status) || 503;
+        return json({ error: status === 503 ? "analysis_section_status_read_failed" :
+          error?.code || "invalid_analysis_section_ids" }, status);
+      }
+    }
+    if (body.action === "reprocess_section") {
+      if (Object.keys(body).sort().join(",") !== "action,analysisSectionId,expectedAttemptCount") {
+        return json({ error: "invalid_action_fields" }, 400);
+      }
+      const result = await reprocessTranscriptAnalysisSection(env, {
+        analysisSectionId: body.analysisSectionId,
+        expectedAttemptCount: body.expectedAttemptCount,
+        idempotencyKey: request.headers.get("idempotency-key") || "",
+      });
+      const status = result.dispatched ? (result.reused ? 200 : 202) :
+        ["invalid_analysis_section_id", "invalid_expected_attempt_count", "invalid_idempotency_key"]
+          .includes(result.reason) ? 400 : result.reason === "analysis_section_not_found" ? 404 :
+          result.reason === "queue_dispatch_failed" ? 503 : 409;
+      return json(result, status);
+    }
     if (body.action !== "reprocess") return json({ error: "invalid_action" }, 400);
     const result = await reprocessTranscriptAnalysis(env, { transcriptId: body.transcriptId });
     const status = result.started ? (result.reused ? 200 : 202) :
@@ -98,8 +194,29 @@ async function fetchHandler(request, env, { durationFetcher = fetch } = {}) {
     try { body = await request.json(); }
     catch { return json({ error: "invalid_json" }, 400); }
     if (!body || typeof body !== "object" || Array.isArray(body) ||
-        !["start", "resume", "sync_archive_items", "repair_legacy_stitch"].includes(body.action)) {
+        !["start", "resume", "skip_active_item", "quarantine_pending_item",
+          "sync_archive_items", "repair_legacy_stitch"].includes(body.action)) {
       return json({ error: "invalid_action" }, 400);
+    }
+    if (body.action === "quarantine_pending_item") {
+      const result = await quarantinePendingTranscriptItem(env, {
+        batchId: body.batchId, batchItemId: body.batchItemId,
+        idempotencyKey: request.headers.get("idempotency-key") || "",
+        expectedTransitionCount: body.expectedTransitionCount,
+        reasonCode: body.reasonCode, observedErrorCode: body.observedErrorCode,
+        durationFetcher,
+      });
+      const status = result.quarantined ? 200 :
+        ["invalid_batch_id", "invalid_batch_item_id", "invalid_idempotency_key",
+          "invalid_transition_count", "invalid_disposition_reason"].includes(result.reason) ? 400 :
+          ["batch_not_found", "batch_item_not_found"].includes(result.reason) ? 404 : 409;
+      return json(result, status);
+    }
+    if (body.action === "skip_active_item") {
+      const result = await skipActiveTranscriptItem(env, { batchId: body.batchId, durationFetcher });
+      const status = result.skipped ? 200 : result.reason === "invalid_batch_id" ? 400 :
+        result.reason === "batch_not_found" ? 404 : 409;
+      return json(result, status);
     }
     if (body.action === "sync_archive_items") {
       const result = await syncArchiveLinkedTranscriptBatch(env, { batchId: body.batchId });

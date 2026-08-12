@@ -1,5 +1,15 @@
 # Development
 
+## Current verification contract (2026-08-03)
+
+Run repository work on the Mac Mini. Keep acquisition, analysis, human review,
+and publication assertions separate: a green acquisition receipt does not prove
+analysis, a green model/research receipt does not prove human review, and no
+deployment is complete without exact artifact, deployment, stable-alias,
+public-route, queue, and reviewer read-backs. Stateful production operations use
+the canonical runners only; never substitute ad-hoc D1, Queue, Worker, Pages, or
+email commands when their runner is missing or incomplete.
+
 ## Requirements
 
 - Node.js 24
@@ -14,15 +24,18 @@ npm test
 npm run check
 npm run dev
 npm run dev:review
-npm run deploy:pages
+npm run deploy:runtime
 ```
 
 `npm run check` runs all tests plus syntax/import checks. The development server
 is temporary: stop it after QA and verify its port is closed.
 
-`npm run deploy:pages` is the project-local preview deployment command. It is a
-maintainer-controlled operation and requires separately configured Wrangler
-credentials; credentials never belong in the repository.
+`npm run deploy:runtime` is the canonical plan-only deployment preflight. It
+freezes the source manifests, requires counted tests/imports and a dry Worker
+artifact, and performs no remote apply. The maintainer-controlled apply path is
+`node scripts/deploy-runtime.mjs --apply`; it requires separately configured
+Wrangler credentials and must finish with the complete deployment receipt and
+post-deploy parity checks. Credentials never belong in the repository.
 
 ## Local D1
 
@@ -54,6 +67,22 @@ Migration 0014 adds reviewer assignments, expiring leases, append-only candidate
 decisions, promotion receipts, blinded claim-adjudication work, and content-free
 review audit events. Apply migrations in filename order. Remote migration state,
 backup paths, and run receipts are maintainer-only operational records.
+Migration 0042 recreates the candidate-readiness insert trigger so a candidate's
+section must belong to the same completed extraction run. Archive review tests
+also prove that source receipt matching, the archive decision, conveyor rows,
+assignment submission, and work completion commit atomically or not at all.
+Migrations 0043–0048 add append-only pending-source dispositions, incident and
+notification events, physical Gemini request/debit/result ledgers, Workers AI
+started/terminal receipts, counted operations-run receipts, queue observations,
+deployment receipts, and the durable analysis-reprocess dispatch outbox. Tests
+must prove those migrations preserve completed counts, transcript artifacts,
+candidate/reviewer/publication history, and the isolated acquisition/analysis
+queue boundary.
+Migrations 0049–0056 add canonical source-unavailable reasons, exact
+analysis-generation lineage/dispositions, recovery of historical manual holds,
+provider-aware text-AI attempt receipts, and immutable Gemini generations through
+v13. Deployed generations and receipts are never edited or replayed; a repair
+must create an exact sparse successor under the next registered generation.
 
 ## Test coverage
 
@@ -70,9 +99,11 @@ backup paths, and run receipts are maintainer-only operational records.
   five-minute non-overlapping planning, full-text stitching, duration provenance,
   daily atomic reservations, retryable chunk jobs, private R2 artifacts, and
   `gemini_generated_needs_human_check` quality labeling
-- Workers AI transcript extraction with structured-output fallback, exact unique
+- Abortable Gemini transcript extraction through Cloudflare AI Gateway with a
+  mode-bounded schema-HTTP400-to-plain fallback, fenced-JSON parsing, exact unique
   quote enforcement, deterministic offset correction, per-suggestion rejection,
-  bounded-deadline policy, and no public rating path
+  bounded-deadline policy, binding-native JSON Schema placement, explicit output
+  budget, supported fallback-model configuration, and no public rating path
 - Provider-native Gemini Interactions routed through Cloudflare AI Gateway with
   strict public-video output, cache bypass, one upstream attempt, immutable
   primary/verifier/tie-breaker audit rows, full-body timeout, metadata-only
@@ -147,13 +178,17 @@ The separate Worker is configured by `scanner/wrangler.toml` and deployed as
 
 - Queue producer/consumer `prophecy-ledger-ingestion`
 - dead-letter queue `prophecy-ledger-ingestion-dlq`
+- Queue producer/consumer `prophecy-ledger-analysis`
+- dead-letter queue `prophecy-ledger-analysis-dlq`
 - private R2 bucket `prophecy-ledger-artifacts`
-- Workers AI binding `AI`
-- provider-native Cloudflare AI Gateway transport for Gemini video analysis
+- Workers AI binding `AI` retained for fail-closed compatibility tests
+- provider-native Cloudflare AI Gateway transport for Gemini video and structured text analysis
 - direct Google Gemini API transport for private transcript acquisition
 
-The deployed consumer uses `max_batch_size=5`, `max_concurrency=5`, and
-`max_retries=3`.
+The acquisition and analysis consumers are operationally isolated. Their
+current batch/concurrency/retry settings remain declared in
+`scanner/wrangler.toml`; changing those settings requires a fresh bounded-load
+and queue-observation receipt.
 
 Root `wrangler.toml` intentionally has no Queue producer. Public `/api/intake`
 only saves `ingest_requests.status='pending_identity'`; it neither creates an
@@ -161,6 +196,11 @@ ingestion run/job nor calls the scanner. Queue jobs originate inside the
 secret-gated scanner after a registered-source lookup. A trusted
 `video_metadata` job must carry both the validated YouTube ID and the stable
 source-item ID created by that discovery path.
+
+Pages binds the main ledger as `DB`, the separate transcript index as
+`SEARCH_DB`, and the private artifact bucket as `ARTIFACTS`. These non-secret
+bindings stay in `wrangler.toml` so a deploy cannot silently drop the reviewer
+search, capture, or archive-conveyor dependencies.
 
 `SCAN_ENABLED=0` is the committed and deployed default. The scheduled handler
 does no work in that state. Manual `/admin/start`, `/admin/status`, and
@@ -171,9 +211,12 @@ Video analysis additionally requires `AI_GATEWAY_ACCOUNT_ID`,
 `AI_GATEWAY_ID`, and secret `AI_GATEWAY_TOKEN`. When
 `AI_GATEWAY_BYOK=1`, Gemini is stored in Cloudflare and the Worker omits
 `GEMINI_API_KEY`; otherwise the Worker must also have that provider secret.
-The committed default remains BYOK off until Cloudflare is configured and one
-provider-native Interactions canary passes. Never deploy the video path with a
-missing gateway Run token, and never silently fall back to direct Gemini.
+The committed production default is BYOK on after a provider-native Interactions
+canary. `GEMINI_ANALYSIS_MODEL` and `GEMINI_ANALYSIS_FALLBACK_MODEL` route text
+analysis through the same secret without exposing a provider key. Gateway and
+client timeouts make that fetch abortable; only `ai_timeout_confirmed` may advance
+to the fallback. Never deploy either path with a missing gateway Run token, and
+never silently fall back to direct Gemini.
 
 The scanner fetcher only permits the registered public website hosts, validates
 DNS and every redirect, caps time and bytes, and saves parsed metadata rather
@@ -195,16 +238,29 @@ resume an existing eligible batch only when `TRANSCRIPT_BATCH_ENABLED=1`; it doe
 not create batches or discover sources. `SCAN_ENABLED=0` remains independent and
 continues to prohibit scheduled source scanning.
 
+A terminally failed active item is never retried after its transcript plan has
+changed. The authenticated `skip_active_item` action is allowed only while the
+batch is paused and the active run has a terminal failed job. It preserves the
+failed job, appends an `item_skipped` event, and activates exactly one successor
+under the current plan version.
+
+An unavailable pending source uses the canonical quarantine action only when an
+operator explicitly supplies the exact batch/item/transition binding. The action
+appends one disposition and may activate one successor; it does not delete or
+complete the unavailable item. The daily watchdog never enters that mode by
+default.
+
 Every transcript section is labeled `GEMINI-GENERATED, NEEDS HUMAN CHECK`.
 Exact claim extraction may run only against that private artifact; a candidate
 is retained only when its exact quote occurs uniquely. No generated transcript
 or raw AI output is public.
 
 The direct transcript path requires secret `GEMINI_API_KEY`; authenticated
-health reports binding booleans without exposing keys. The deployed daily cap is
-28,800 media seconds and `SCAN_ENABLED=0` remains unchanged. Gemini clip
-boundaries are approximate locators and must not be presented as word-level
-timestamps.
+health reports binding booleans without exposing keys. The daily cap is 86,400
+physical request seconds. Every root/split/retry call reserves before fetch and
+writes a terminal physical result; a one-time cutover debit fails closed for
+legacy usage. `SCAN_ENABLED=0` remains unchanged. Gemini clip boundaries are
+approximate locators and must not be presented as word-level timestamps.
 
 ### Operational receipts
 
@@ -212,6 +268,39 @@ Keep full-scan, idempotency, transcript, model-usage, pricing, database-backup,
 and private-artifact receipts outside Git. Public documentation should describe
 the invariant being tested rather than copying live run IDs, counts, hashes,
 private storage keys, or controller-specific paths.
+
+Canonical completion boundaries are machine-readable and fail closed:
+
+- Analysis reconciliation emits `ANALYSIS_RECONCILIATION_ITEM_FINAL` for every
+  discovered section, then `ANALYSIS_RECONCILIATION_SUMMARY` and
+  `ANALYSIS_RECONCILIATION_EXIT`; failed or manual-required work is not success.
+  Its implicit limit is five so one 15-minute receipt window remains bounded;
+  operators may explicitly select 1 through 25, and deadline finals remain real
+  failures rather than accepted or hidden pending work. The canonical
+  `npm run reconcile:analysis` shortcut inherits this implicit limit.
+- Research emits one `RESEARCH_WORKER_CLAIM` per discovered claim plus
+  `RESEARCH_WORKER_SUMMARY` and `RESEARCH_WORKER_EXIT`. `draft=false` is a
+  completed manual-research result, not a silent success.
+- The conveyor emits one `MACHINE_CONVEYOR_ITEM_FINAL` per considered candidate,
+  then counted `MACHINE_CONVEYOR_SUMMARY` and `MACHINE_CONVEYOR_EXIT` receipts;
+  pending promotions or failed preservation/read-back make the run fail.
+  Discovery must exclude every candidate with a human decision so completed
+  rejections and atomic promotions cannot be requeued or counted as pending;
+  existing ready work without a decision remains eligible for receipt recovery.
+- Deployment emits `DEPLOY_RUNTIME_SUMMARY` and `DEPLOY_RUNTIME_EXIT`. Apply is
+  complete only with Worker version/deployment and Pages deployment IDs, exact
+  scanner artifact hash, complete migrations, four queue read-backs, deployment
+  URL and stable-alias asset parity, public-route parity, and both deployment and
+  stable reviewer-smoke receipts.
+- The watchdog's `batch-watchdog-v2` receipt distinguishes current/recovered
+  incidents and accepted-pending/delivered/bounced opening notices. Pending
+  opening delivery is nonblocking but `deliveryComplete=false`; bounced/failed
+  opening delivery persists as a blocker until manually resolved. Recovery is
+  append-only D1/receipt state and does not send email, because owner email is
+  reserved for current error-level alerts.
+
+An HTTP 2xx, provider acceptance, process exit zero, heading, or partial JSON is
+never a substitute for the final marker set and agreeing durable read-back.
 
 ## Reviewer authentication and demo security
 
@@ -231,6 +320,23 @@ Local requests also require an `x-demo-reviewer-token` matching one configured
 `DEMO_REVIEWER_N_ID` / `DEMO_REVIEWER_N_TOKEN` pair. The stable reviewer
 principal always comes from that credential, never the request body. Missing or
 invalid configuration returns 404 so a private surface is not advertised.
+
+## Reviewer click E2E (durable)
+
+Click-testing as a reviewer is documented in `docs/REVIEWER_CLICK_E2E.md`.
+
+- Local (no Access OTP): `npm run e2e:reviewer` creates a fresh migrated temporary
+  D1 and loopback Pages server, then removes only that isolated test state.
+- Live prod (reuse Mini Brave Access session, no new tabs): `npm run e2e:reviewer:live`
+- API-only gate remains `npm run test:reviewer-workflows`; deploy smoke is `npm run smoke:reviewer`
+
+The click runner must select only `claim_adjudication` assignments or openable
+claim rows for its Accept/Send-back assertion. A candidate-verification assignment
+has a different terminal form and must never be used as a generic fallback, or the
+test creates a false UI failure while the reviewer workspace is working correctly.
+
+Demo tokens live in gitignored `.dev.vars` (see `.dev.vars.example`). Playwright injects
+`x-demo-reviewer-token` on loopback only; the static UI never sends that header.
 
 ## Data ethics
 

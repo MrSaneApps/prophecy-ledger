@@ -127,12 +127,19 @@ async function submitArchiveReview(event, assignmentId) {
   status.textContent = "Appending this source check…";
   button.disabled = true;
   try {
-    const result = await responseJson(await fetch(`/api/review/${encodeURIComponent(assignmentId)}`, {
+    const result = await responseJson(await fetch(`/api/review/archive/${encodeURIComponent(assignmentId)}`, {
       method: "POST", headers: { "content-type": "application/json", accept: "application/json" },
       body: JSON.stringify(body),
     }));
-    status.textContent = `Source check appended: ${String(result.decision || result.state).replaceAll("_", " ")}. No claim or rating was created.`;
+    const id = result.decisionId || result.observationId || "";
+    if (!id && !result.state && !result.decision) {
+      throw new Error("The server did not confirm the source check. Retry or send feedback.");
+    }
+    status.classList.add("success");
+    status.textContent = `Source check saved${id ? ` (${id})` : ""}: ${String(result.decision || result.state || "recorded").replaceAll("_", " ")}. No claim or rating was created.`;
+    // Keep the reviewer on this receipt; do not auto-advance archive work.
   } catch (error) {
+    status.classList.remove("success");
     status.textContent = error instanceof Error ? error.message : "The source check could not be saved.";
     button.disabled = false;
   }

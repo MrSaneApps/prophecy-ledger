@@ -5,7 +5,8 @@ import { join } from "node:path";
 import { makeEnv, ROOT } from "./helpers/d1.mjs";
 import { dispatchSuccessors, makeEnvelope, processEnvelope, processQueueBatch, scannerStatus,
   startFirstPartyArchiveIngest, startScan, validateEnvelope } from "../scanner/src/jobs.js";
-import { claimJob, createRun, persistFirstPartyArchive, registerJob, upsertSourceItem } from "../scanner/src/repository.js";
+import { claimJob, createRun, persistFirstPartyArchive, recordSourceMediaMetadata,
+  recordWorkersAiAttempt, registerJob, upsertSourceItem } from "../scanner/src/repository.js";
 import { fetchHandler } from "../scanner/src/index.js";
 import { getSourceCatalogue } from "../functions/lib/repository.js";
 
@@ -40,6 +41,60 @@ test("envelopes and IDs are deterministic and reject arbitrary job fields", asyn
   assert.throws(() => validateEnvelope({ ...one, payload: { page: 251 } }), /invalid_archive_page/);
 });
 
+test("provider-aware attempt receipts preserve confirmed Gemini aborts append-only", async () => {
+  const env = makeEnv();
+  env.DB.db.exec(`INSERT INTO ingestion_runs
+    (run_id,person_id,trigger_type,scope,status,created_at)
+    VALUES ('run_text_receipt','person_troy_black','manual','text-receipt','running','2026-08-04');
+    INSERT INTO ingestion_jobs
+    (job_id,run_id,job_type,stable_key,payload_json,status,attempt_count,claimed_at)
+    VALUES ('job_text_receipt','run_text_receipt','description_triage','text-receipt','{}',
+      'processing',1,'2026-08-04');`);
+  const common = { attemptId: "attempt_text_receipt", workKind: "description_triage",
+    jobId: "job_text_receipt", jobAttempt: 1, modelName: "gemini-test",
+    providerName: "gemini-ai-gateway", mode: "json_schema", ordinal: 0,
+    startedAt: "2026-08-04T05:00:00.000Z" };
+  await recordWorkersAiAttempt(env.DB, { ...common, status: "started",
+    safeCauseCode: null, fallbackEligible: false });
+  await assert.rejects(() => recordWorkersAiAttempt(env.DB, { ...common,
+    providerName: "workers-ai", status: "failed", safeCauseCode: "provider_5xx",
+    fallbackEligible: true, completedAt: "2026-08-04T05:00:00.500Z", latencyMs: 500 }),
+  /terminal missing started receipt/);
+  await recordWorkersAiAttempt(env.DB, { ...common, status: "failed",
+    safeCauseCode: "ai_timeout_confirmed", fallbackEligible: true,
+    completedAt: "2026-08-04T05:00:01.000Z", latencyMs: 1_000 });
+  assert.deepEqual(env.DB.db.prepare(`SELECT provider_name,status,safe_cause_code
+    FROM text_ai_attempt_receipt_history ORDER BY status`).all().map((row) => ({ ...row })), [
+    { provider_name: "gemini-ai-gateway", status: "failed",
+      safe_cause_code: "ai_timeout_confirmed" },
+    { provider_name: "gemini-ai-gateway", status: "started", safe_cause_code: null },
+  ]);
+  assert.equal(env.DB.db.prepare("SELECT COUNT(*) count FROM workers_ai_attempt_receipts").get().count, 0);
+
+  env.DB.db.prepare(`INSERT INTO workers_ai_attempt_receipts
+    (receipt_id,attempt_id,work_kind,job_id,job_attempt,analysis_run_id,analysis_section_id,
+     model_name,mode,ordinal,status,safe_cause_code,http_status,fallback_eligible,
+     started_at,completed_at,latency_ms)
+    VALUES ('legacy_started_receipt','attempt_legacy_bridge','description_triage',
+      'job_text_receipt',1,NULL,NULL,'gemini-test','json_schema',1,'started',NULL,NULL,0,
+      '2026-08-04T05:01:00.000Z',NULL,NULL)`).run();
+  await recordWorkersAiAttempt(env.DB, {
+    ...common, receiptId: "new_terminal_receipt", attemptId: "attempt_legacy_bridge", ordinal: 1,
+    startedAt: "2026-08-04T05:01:00.000Z", status: "failed",
+    safeCauseCode: "ai_timeout_confirmed", fallbackEligible: true,
+    completedAt: "2026-08-04T05:01:01.000Z", latencyMs: 1_000,
+  });
+  assert.deepEqual(env.DB.db.prepare(`SELECT provider_name,status
+    FROM text_ai_attempt_receipt_history WHERE attempt_id='attempt_legacy_bridge'
+    ORDER BY status`).all().map((row) => ({ ...row })), [
+    { provider_name: "gemini-ai-gateway", status: "failed" },
+    { provider_name: "legacy-unspecified", status: "started" },
+  ]);
+  assert.throws(() => env.DB.db.exec("UPDATE text_ai_attempt_receipts SET model_name='changed'"),
+    /append-only/);
+  assert.throws(() => env.DB.db.exec("DELETE FROM text_ai_attempt_receipts"), /append-only/);
+});
+
 test("disabled scanner blocks scheduled scans but allows authenticated manual work, and malformed Queue messages are acknowledged", async () => {
   const env = scannerEnv();
   env.SCAN_ENABLED = "0";
@@ -56,6 +111,100 @@ test("disabled scanner blocks scheduled scans but allows authenticated manual wo
   await processQueueBatch({ messages: [{ body: { version: 99 }, ack: () => { acked = true; }, retry: () => { retried = true; } }] }, env);
   assert.equal(acked, true);
   assert.equal(retried, false);
+});
+
+test("analysis work is rejected from the acquisition queue without being processed", async () => {
+  const env = scannerEnv(); let acked = false; let retried = false;
+  await processQueueBatch({ queue: "prophecy-ledger-ingestion", messages: [{
+    body: { type: "transcript_extract", payload: { phase: "analyze" } },
+    ack: () => { acked = true; }, retry: ({ delaySeconds }) => { retried = delaySeconds === 60; },
+  }] }, env);
+  assert.equal(acked, false);
+  assert.equal(retried, true);
+  assert.equal(env.DB.statementCount, 0);
+});
+
+test("every full-video Gemini call reserves the physical fuse before fetch and cap exhaustion prevents another call", async () => {
+  const env = scannerEnv(); env.GEMINI_DAILY_MEDIA_SECONDS = "60";
+  env.GEMINI_API_KEY = "provider-secret";
+  env.AI_GATEWAY_ACCOUNT_ID = "2c267ab06352ba2522114c3081a8c5fa";
+  env.AI_GATEWAY_ID = "default"; env.AI_GATEWAY_TOKEN = "gateway-secret";
+  const source = await upsertSourceItem(env.DB, { personId: "person_troy_black", platform: "youtube",
+    platformItemId: "VideoFuse01", canonicalUrl: "https://www.youtube.com/watch?v=VideoFuse01" });
+  await recordSourceMediaMetadata(env.DB, { sourceItemId: source.source_item_id,
+    durationSeconds: 60, responseSha256: "a".repeat(64), observedAt: "2026-08-03T12:00:00.000Z" });
+  let calls = 0;
+  env.GEMINI_FETCH = async () => {
+    calls += 1;
+    assert.equal(env.DB.db.prepare("SELECT COUNT(*) count FROM gemini_physical_request_reservations").get().count, 1);
+    return new Response(JSON.stringify({ id: "interaction-fuse", model: "gemini-test", status: "completed",
+      steps: [{ type: "model_output", content: [{ type: "text", text: JSON.stringify({ claims: [] }) }] }],
+    }), { status: 200, headers: { "cf-aig-log-id": "safe-log-id" } });
+  };
+  const firstRun = "run_video_fuse_one";
+  await createRun(env.DB, { runId: firstRun, personId: "person_troy_black", triggerType: "canary",
+    scope: "video-fuse-one", createdAt: "2026-08-03T12:00:00.000Z" });
+  const first = await makeEnvelope({ runId: firstRun, type: "video_analysis_primary",
+    stableKey: "youtube:VideoFuse01:primary", payload: { youtubeId: "VideoFuse01", sourceItemId: source.source_item_id } });
+  await processEnvelope(env, first, { at: "2026-08-03T12:00:00.000Z",
+    physicalNow: () => "2026-08-03T12:00:00.100Z" });
+  assert.equal(calls, 1);
+  assert.equal(env.DB.db.prepare("SELECT COUNT(*) count FROM gemini_physical_request_results WHERE status='completed'").get().count, 1);
+  const secondRun = "run_video_fuse_two";
+  await createRun(env.DB, { runId: secondRun, personId: "person_troy_black", triggerType: "canary",
+    scope: "video-fuse-two", createdAt: "2026-08-03T12:01:00.000Z" });
+  const second = await makeEnvelope({ runId: secondRun, type: "video_analysis_primary",
+    stableKey: "youtube:VideoFuse01:primary:retry", payload: { youtubeId: "VideoFuse01", sourceItemId: source.source_item_id } });
+  await assert.rejects(() => processEnvelope(env, second, { at: "2026-08-03T12:01:00.000Z",
+    physicalNow: () => "2026-08-03T12:01:00.100Z" }), /gemini_video_budget_deferred/);
+  assert.equal(calls, 1);
+  assert.equal(env.DB.db.prepare("SELECT COUNT(*) count FROM gemini_physical_request_reservations").get().count, 1);
+});
+
+test("authenticated operations status persists complete metrics for acquisition, analysis, and both DLQs", async () => {
+  const env = scannerEnv(); env.SCANNER_ADMIN_TOKEN = "admin-secret";
+  const observed = new Date("2026-08-03T10:00:00.000Z");
+  const binding = (backlogCount, backlogBytes) => ({ metrics: async () => ({
+    backlogCount, backlogBytes, oldestMessageTimestamp: backlogCount ? observed : null,
+  }) });
+  env.INGESTION_QUEUE = binding(2, 400);
+  env.ANALYSIS_QUEUE = binding(1, 200);
+  env.INGESTION_DLQ = binding(0, 0);
+  env.ANALYSIS_DLQ = binding(0, 0);
+  const response = await fetchHandler(new Request("https://scanner.example/admin/operations-status", {
+    headers: { authorization: "Bearer admin-secret" },
+  }), env);
+  assert.equal(response.status, 200);
+  const receipt = await response.json();
+  assert.equal(receipt.contract, "queue-operations-status-v1");
+  assert.equal(receipt.healthy, true);
+  assert.equal(receipt.queues.length, 4);
+  assert.deepEqual(receipt.queues.map((queue) => [queue.queueName, queue.backlogCount,
+    queue.backlogBytes, queue.oldestMessageTimestamp]), [
+    ["prophecy-ledger-ingestion", 2, 400, observed.toISOString()],
+    ["prophecy-ledger-analysis", 1, 200, observed.toISOString()],
+    ["prophecy-ledger-ingestion-dlq", 0, 0, null],
+    ["prophecy-ledger-analysis-dlq", 0, 0, null],
+  ]);
+  assert.equal(env.DB.db.prepare("SELECT COUNT(*) count FROM queue_observation_receipts").get().count, 4);
+});
+
+test("operations status fails closed and receipts an unavailable queue metric", async () => {
+  const env = scannerEnv(); env.SCANNER_ADMIN_TOKEN = "admin-secret";
+  const binding = { metrics: async () => ({ backlogCount: 0, backlogBytes: 0,
+    oldestMessageTimestamp: null }) };
+  env.INGESTION_QUEUE = binding; env.ANALYSIS_QUEUE = binding; env.INGESTION_DLQ = binding;
+  const response = await fetchHandler(new Request("https://scanner.example/admin/queue-status", {
+    headers: { authorization: "Bearer admin-secret" },
+  }), env);
+  assert.equal(response.status, 503);
+  const receipt = await response.json();
+  assert.equal(receipt.healthy, false);
+  const unavailable = receipt.queues.find((queue) => queue.queueName === "prophecy-ledger-analysis-dlq");
+  assert.equal(unavailable.status, "unavailable");
+  assert.equal(unavailable.safeReasonCode, "queue_binding_missing");
+  assert.equal(env.DB.db.prepare(`SELECT COUNT(*) count FROM queue_observation_receipts
+    WHERE status='unavailable'`).get().count, 1);
 });
 
 test("manual full start reuses an existing queued or running full scan", async () => {
@@ -203,7 +352,7 @@ test("untrusted video intake fails closed without attributing an arbitrary sourc
   assert.equal(env.DB.db.prepare("SELECT count(*) count FROM transcript_attempts").get().count, 0);
 });
 
-test("trusted discovered video becomes needs-transcript and remains exactly idempotent", async () => {
+test("trusted discovered video exposes truthful phase status and remains exactly idempotent", async () => {
   const env = scannerEnv();
   const youtubeId = "ZidiIdg3U4M";
   await createRun(env.DB, { runId: "run_video_trusted", personId: "person_troy_black", triggerType: "manual", scope: "video" });
@@ -221,7 +370,17 @@ test("trusted discovered video becomes needs-transcript and remains exactly idem
   assert.equal(env.DB.db.prepare("SELECT count(*) count FROM transcript_artifacts WHERE source_item_id=?").get(source.source_item_id).count, 0);
   assert.equal(env.DB.db.prepare("SELECT count(*) count FROM claim_candidates WHERE source_item_id=?").get(source.source_item_id).count, 0);
   const catalogue = await getSourceCatalogue(env.DB, "troy-black", { platform: "youtube" });
-  assert.equal(catalogue.sources[0].status, "needs_transcript");
+  assert.deepEqual({ status: catalogue.sources[0].status,
+    acquisitionStatus: catalogue.sources[0].acquisitionStatus,
+    analysisStatus: catalogue.sources[0].analysisStatus,
+    humanReviewStatus: catalogue.sources[0].humanReviewStatus,
+    publicStatus: catalogue.sources[0].publicStatus }, {
+    status: "ready_for_human_check",
+    acquisitionStatus: "not_started",
+    analysisStatus: "not_started",
+    humanReviewStatus: "ready",
+    publicStatus: "not_published",
+  });
 
   await createRun(env.DB, { runId: "run_video_repeat", personId: "person_troy_black", triggerType: "manual", scope: "video" });
   const repeated = await makeEnvelope({
@@ -323,6 +482,15 @@ test("detail enrichment preserves the archive publication date when detail metad
 
 test("description triage stores a paraphrased lead with no quotation or verdict", async () => {
   const env = scannerEnv();
+  env.AI.run = async () => {
+    env.aiCalls += 1;
+    const inFlight = env.DB.db.prepare(`SELECT work_kind,status,analysis_run_id,analysis_section_id
+      FROM text_ai_attempt_receipt_history ORDER BY receipt_id`).all().map((row) => ({ ...row }));
+    assert.deepEqual(inFlight, [{ work_kind: "description_triage", status: "started",
+      analysis_run_id: null, analysis_section_id: null }]);
+    return { response: JSON.stringify({ category: "testable_prediction",
+      neutralParaphrase: "The description may contain a prediction." }) };
+  };
   await startScan(env, { canary: true, runId: "run_triage" });
   await processEnvelope(env, env.sent.shift(), { fetcher: async () => ({ html: archiveHtml }) });
   const detail = env.sent.find((job) => job.type === "post_detail" && job.payload.platformItemId === "101");
@@ -335,6 +503,8 @@ test("description triage stores a paraphrased lead with no quotation or verdict"
   assert.equal(lead.requires_transcript, 1);
   assert.equal(lead.requires_human_review, 1);
   assert.equal(env.aiCalls, 1);
+  assert.deepEqual(env.DB.db.prepare(`SELECT status FROM text_ai_attempt_receipt_history
+    ORDER BY status`).all().map((row) => row.status), ["completed", "started"]);
 
   // A new ingestion run reaches the same immutable revision. This bypasses
   // Queue job deduplication and proves the extraction itself avoids AI cost.
@@ -345,6 +515,7 @@ test("description triage stores a paraphrased lead with no quotation or verdict"
   });
   await processEnvelope(env, repeated);
   assert.equal(env.aiCalls, 1);
+  assert.equal(env.DB.db.prepare("SELECT count(*) count FROM text_ai_attempt_receipt_history").get().count, 2);
   assert.equal(env.DB.db.prepare("SELECT count(*) count FROM extraction_runs").get().count, 1);
   assert.equal(env.DB.db.prepare("SELECT count(*) count FROM claim_candidates").get().count, 1);
 });
@@ -486,7 +657,7 @@ test("an early reconcile cannot strand a run after the later terminal job drains
   assert.equal(env.DB.db.prepare("SELECT status FROM ingestion_runs WHERE run_id='run_early_reconcile'").get().status, "complete");
 });
 
-test("a timed-out primary AI call falls back and cannot strand the run", async () => {
+test("a timed-out primary AI call stays retryable and never overlaps a fallback", async () => {
   const env = scannerEnv();
   env.AI_TIMEOUT_MS = "5";
   env.AI.run = (model) => {
@@ -507,11 +678,17 @@ test("a timed-out primary AI call falls back and cannot strand the run", async (
     runId: "run_ai_timeout", type: "description_triage", stableKey: "revision:rev_timeout",
     payload: { sourceItemId: sourceId, revisionId: "rev_timeout" },
   });
-  await processEnvelope(env, triage);
-  assert.equal(env.aiCalls, 2);
-  assert.equal(env.DB.db.prepare("SELECT status FROM ingestion_jobs WHERE job_id=?").get(triage.jobId).status, "completed");
-  assert.equal(env.DB.db.prepare("SELECT status FROM ingestion_runs WHERE run_id='run_ai_timeout'").get().status, "complete");
-  assert.equal(env.DB.db.prepare("SELECT count(*) count FROM claim_candidates WHERE source_item_id=?").get(sourceId).count, 1);
+  await assert.rejects(() => processEnvelope(env, triage),
+    (error) => error.code === "ai_timeout_unconfirmed" && error.final === false);
+  assert.equal(env.aiCalls, 1);
+  assert.equal(env.DB.db.prepare("SELECT status FROM ingestion_jobs WHERE job_id=?").get(triage.jobId).status, "queued");
+  assert.equal(env.DB.db.prepare("SELECT status FROM ingestion_runs WHERE run_id='run_ai_timeout'").get().status, "running");
+  assert.equal(env.DB.db.prepare("SELECT count(*) count FROM claim_candidates WHERE source_item_id=?").get(sourceId).count, 0);
+  assert.deepEqual(env.DB.db.prepare(`SELECT status,safe_cause_code FROM text_ai_attempt_receipt_history
+    ORDER BY status`).all().map((row) => ({ ...row })), [
+    { status: "failed", safe_cause_code: "ai_timeout_unconfirmed" },
+    { status: "started", safe_cause_code: null },
+  ]);
 });
 
 test("authenticated status recovery requeues an expired lease exactly once and completes without duplicate successors", async () => {

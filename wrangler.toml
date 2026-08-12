@@ -15,6 +15,15 @@ database_id = "48bae920-b741-4214-a1e0-de1410d9223e"
 migrations_dir = "migrations"
 migrations_pattern = "migrations/[0-9][0-9][0-9][0-9]_*.sql"
 
-# Local commands retain --local --persist-to .wrangler/state and do not mutate D1.
-# No reviewer secrets, AI bindings, R2 buckets, or donation providers are stored.
+[[d1_databases]]
+binding = "SEARCH_DB"
+database_name = "prophecy-ledger-search"
+database_id = "2ce816ac-6443-4a27-8e4d-4d25ce416b0e"
+
+[[r2_buckets]]
+binding = "ARTIFACTS"
+bucket_name = "prophecy-ledger-artifacts"
+
+# Local commands retain --local --persist-to .wrangler/state and do not mutate remote data.
+# No reviewer secrets, AI bindings, or donation providers are stored.
 # REVIEW_DEMO_MODE remains disabled unless explicitly overridden.

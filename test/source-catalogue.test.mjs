@@ -20,7 +20,7 @@ function seedInventory(env) {
     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)`);
   const rows = [
     ["source_a", "wp-a", "https://troyblackvideos.com/a/", "available", "2024-01-01", "100% Prophecy", null],
-    ["source_b", "wp-b", "https://troyblackvideos.com/b/", "available", "2023-01-01", "Another public word", "https://www.youtube.com/watch?v=ZidiIdg3U4M"],
+    ["source_b", "wp-b", "https://troyblackvideos.com/b/", "available", "2023-01-01", "Another public word", null],
     ["source_c", "wp-c", "https://troyblackvideos.com/c/", "unavailable", "2022-01-01", "Removed public post", null],
     ["source_d", "wp-d", "https://troyblackvideos.com/d/", "available", "2021-01-01", "Video-linked post", "https://www.youtube.com/watch?v=ZidiIdg3U4M"],
   ];
@@ -154,7 +154,7 @@ test("profile coverage exposes archive leads, original videos, and completed sou
   assert.equal(directory.people[0].corpusCoverage.archiveSourceChecksCompleted, 1);
 });
 
-test("public profile, directory, and source state count only the latest eligible candidate assessment", async () => {
+test("public counts eligible candidates without inventing human-review readiness", async () => {
   const env = makeEnv(); seedInventory(env);
   seedExactCandidateAssessment(env, "eligible", "2026-07-20T10:00:00Z", "eligible");
   let profile = await jsonBody(await personGet(context({ env, url: "https://example.test/api/people/troy-black",
@@ -163,7 +163,8 @@ test("public profile, directory, and source state count only the latest eligible
   let catalogue = await jsonBody(await sourceGet(sourceContext(env, "?q=100%25")));
   assert.equal(profile.corpusCoverage.specificClaimCandidates, 1);
   assert.equal(directory.people[0].corpusCoverage.specificClaimCandidates, 1);
-  assert.equal(catalogue.sources[0].status, "ready_for_human_check");
+  assert.equal(catalogue.sources[0].status, "possible_claim");
+  assert.equal(catalogue.sources[0].humanReviewStatus, "not_ready");
 
   seedExactCandidateAssessment(env, "quarantined", "2026-07-20T11:00:00Z", "quarantined");
   profile = await jsonBody(await personGet(context({ env, url: "https://example.test/api/people/troy-black",
@@ -192,20 +193,32 @@ test("source catalogue is public-safe, keyset paged, filter-bound, and capped at
   const first = await jsonBody(firstResponse);
   assert.deepEqual(first.sources.map((source) => source.id), ["source_a", "source_b"]);
   assert.equal(first.sources[0].status, "possible_claim");
-  assert.equal(first.sources[1].status, "ready_for_human_check");
+  assert.deepEqual({
+    acquisition: first.sources[1].acquisitionStatus,
+    analysis: first.sources[1].analysisStatus,
+    humanReview: first.sources[1].humanReviewStatus,
+    publication: first.sources[1].publicStatus,
+    compatibility: first.sources[1].status,
+  }, {
+    acquisition: "acquired", analysis: "not_started", humanReview: "not_ready",
+    publication: "not_published", compatibility: "analysis_pending",
+  });
   assert.ok(first.nextCursor);
-  assert.doesNotMatch(JSON.stringify(first), /Private description|Private draft|private-reviewer|r2_key|exact_quote/);
+  assert.doesNotMatch(JSON.stringify(first),
+    /Private description|Private draft|private-reviewer|r2_key|exact_quote|error_code|model_family/);
 
   const second = await jsonBody(await sourceGet(sourceContext(env, `?limit=2&cursor=${encodeURIComponent(first.nextCursor)}`)));
   assert.deepEqual(second.sources.map((source) => source.id), ["source_c", "source_d"]);
   assert.equal(second.sources[0].status, "source_unavailable");
-  assert.equal(second.sources[1].status, "needs_transcript");
+  assert.equal(second.sources[1].status, "ready_for_human_check");
+  assert.equal(second.sources[1].humanReviewStatus, "ready");
   assert.ok(second.nextCursor);
 
   const third = await jsonBody(await sourceGet(sourceContext(env,
     `?limit=2&cursor=${encodeURIComponent(second.nextCursor)}`)));
   assert.deepEqual(third.sources.map((source) => source.id), ["source_e"]);
-  assert.equal(third.sources[0].status, "needs_transcript");
+  assert.equal(third.sources[0].status, "ready_for_human_check");
+  assert.equal(third.sources[0].humanReviewStatus, "ready");
   assert.equal(third.sources[0].availability, "unknown");
   assert.equal(third.sources[0].title, "Linked YouTube video");
   assert.equal(third.nextCursor, null);
@@ -214,7 +227,66 @@ test("source catalogue is public-safe, keyset paged, filter-bound, and capped at
     `?limit=2&status=possible_claim&cursor=${encodeURIComponent(first.nextCursor)}`));
   assert.equal(mismatch.status, 400);
   assert.equal((await jsonBody(mismatch)).code, "cursor_mismatch");
+  const staleCursor = Buffer.from(JSON.stringify({
+    version: 1, personId: "person_troy_black", status: "all", platform: "all", sort: "newest",
+    query: "", date: "2023-01-01", group: 0, id: "source_b",
+  })).toString("base64url");
+  const stale = await sourceGet(sourceContext(env, `?limit=2&cursor=${staleCursor}`));
+  assert.equal(stale.status, 400);
+  assert.equal((await jsonBody(stale)).code, "cursor_mismatch");
   assert.equal((await sourceGet(sourceContext(env, "?limit=51"))).status, 400);
+});
+
+test("analysis failures stay separate from acquisition and never create review readiness", async () => {
+  const env = makeEnv(); seedInventory(env);
+  const db = env.DB.db;
+  db.prepare(`INSERT INTO ingestion_runs
+    (run_id,person_id,trigger_type,scope,status,started_at,completed_at,error_count,created_at)
+    VALUES (?,?,?,?,?,?,?,?,?)`).run("run_analysis_b", "person_troy_black", "manual", "analysis:test",
+      "complete_with_errors", "2026-07-20", "2026-07-20", 1, "2026-07-20");
+  db.prepare(`INSERT INTO transcript_analysis_runs
+    (analysis_run_id,ingestion_run_id,transcript_id,source_item_id,transcript_sha256,prompt_version,
+     section_count,completed_section_count,failed_section_count,status,created_at,completed_at)
+    VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`).run("analysis_b", "run_analysis_b", "transcript_b", "source_b",
+      "b".repeat(64), "test-v1", 1, 0, 1, "failed", "2026-07-20", "2026-07-20");
+
+  const source = (await jsonBody(await sourceGet(sourceContext(env, "?q=Another")))).sources[0];
+  assert.equal(source.acquisitionStatus, "acquired");
+  assert.equal(source.analysisStatus, "needs_attention");
+  assert.equal(source.humanReviewStatus, "not_ready");
+  assert.equal(source.status, "analysis_pending");
+});
+
+test("a disposition reports unavailable acquisition without leaking its internal reason", async () => {
+  const env = makeEnv(); const db = env.DB.db;
+  db.prepare(`INSERT INTO source_items
+    (source_item_id,person_id,platform,platform_item_id,canonical_url,first_discovered_at,last_seen_at,availability)
+    VALUES (?,?,?,?,?,?,?,?)`).run("source_quarantine", "person_troy_black", "youtube", "Unavailable1",
+      "https://www.youtube.com/watch?v=Unavailable1", "2026-07-20", "2026-07-20", "unknown");
+  db.prepare(`INSERT INTO transcript_batches
+    (batch_id,idempotency_key,person_id,status,item_count,completed_item_count,pause_reason,resume_after,
+     created_at,started_at,paused_at,transition_count)
+    VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`).run("batch_quarantine", "idem_quarantine", "person_troy_black",
+      "paused", 1, 0, "youtube_data_api_video_not_found", "2026-07-21", "2026-07-20",
+      "2026-07-20", "2026-07-20", 0);
+  db.prepare(`INSERT INTO transcript_batch_items
+    (batch_item_id,batch_id,source_item_id,youtube_id,ordinal,status)
+    VALUES (?,?,?,?,?,?)`).run("batch_item_quarantine", "batch_quarantine", "source_quarantine",
+      "Unavailable1", 1, "pending");
+  db.prepare(`INSERT INTO transcript_batch_item_dispositions
+    (disposition_id,batch_id,batch_item_id,source_item_id,disposition,link_availability,reason_code,
+     observed_error_code,expected_transition_count,applied_transition_count,created_at)
+    VALUES (?,?,?,?,?,?,?,?,?,?,?)`).run("disposition_quarantine", "batch_quarantine",
+      "batch_item_quarantine", "source_quarantine", "source_unavailable", "unavailable",
+      "youtube_video_not_found", "youtube_data_api_video_not_found", 0, 1, "2026-07-20");
+
+  const source = (await jsonBody(await sourceGet(sourceContext(env, "?platform=youtube")))).sources[0];
+  assert.deepEqual({ acquisition: source.acquisitionStatus, analysis: source.analysisStatus,
+    humanReview: source.humanReviewStatus, publication: source.publicStatus, status: source.status }, {
+    acquisition: "quarantined_source_unavailable", analysis: "not_started",
+    humanReview: "not_ready", publication: "not_published", status: "source_unavailable",
+  });
+  assert.doesNotMatch(JSON.stringify(source), /youtube_data_api|reason|disposition|batch_item|idempotency/i);
 });
 
 test("source filters and search treat wildcard characters literally", async () => {
@@ -222,6 +294,8 @@ test("source filters and search treat wildcard characters literally", async () =
   seedInventory(env);
   const possible = await jsonBody(await sourceGet(sourceContext(env, "?status=possible_claim")));
   assert.deepEqual(possible.sources.map((source) => source.id), ["source_a"]);
+  const pendingAnalysis = await jsonBody(await sourceGet(sourceContext(env, "?status=analysis_pending")));
+  assert.deepEqual(pendingAnalysis.sources.map((source) => source.id), ["source_b"]);
   const percent = await jsonBody(await sourceGet(sourceContext(env, "?q=%25")));
   assert.deepEqual(percent.sources.map((source) => source.id), ["source_a"]);
   const badCursor = await sourceGet(sourceContext(env, "?cursor=not-json"));

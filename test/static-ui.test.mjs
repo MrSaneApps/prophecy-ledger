@@ -5,13 +5,16 @@ import { join } from "node:path";
 import { ROOT } from "./helpers/d1.mjs";
 import { onRequest as securityMiddleware } from "../functions/_middleware.js";
 import {
-  archiveDecisionPayload, archiveDecisionReadiness, candidateDecisionPayload,
-  promotedCandidateAtGlance, promotionReadiness,
+  candidateDecisionPayload, promotedCandidateAtGlance, promotionReadiness,
 } from "../public/review.js";
+import {
+  archiveDecisionPayload, archiveDecisionReadiness,
+} from "../public/archive-review.js";
 
 const shell = readFileSync(join(ROOT, "public", "index.html"), "utf8");
 const app = readFileSync(join(ROOT, "public", "app.js"), "utf8");
 const review = readFileSync(join(ROOT, "public", "review.js"), "utf8");
+const reviewUi = readFileSync(join(ROOT, "public", "review-ui.js"), "utf8");
 const archiveReview = readFileSync(join(ROOT, "public", "archive-review.js"), "utf8");
 const css = readFileSync(join(ROOT, "public", "styles.css"), "utf8");
 const biblical = readFileSync(join(ROOT, "public", "biblical-prophecy.js"), "utf8");
@@ -21,6 +24,10 @@ const robots = readFileSync(join(ROOT, "public", "robots.txt"), "utf8");
 const redirects = readFileSync(join(ROOT, "public", "_redirects"), "utf8");
 const intake = readFileSync(join(ROOT, "functions", "api", "intake.js"), "utf8");
 const pagesConfig = readFileSync(join(ROOT, "wrangler.toml"), "utf8");
+const reviewerClickE2e = readFileSync(join(ROOT, "scripts", "reviewer-click-e2e.mjs"), "utf8");
+const reviewerClickWrapper = readFileSync(join(ROOT, "scripts", "run-reviewer-click-e2e.sh"), "utf8");
+const packageJson = readFileSync(join(ROOT, "package.json"), "utf8");
+const reviewerSmoke = readFileSync(join(ROOT, "scripts", "reviewer-smoke.mjs"), "utf8");
 
 test("static shell has semantic landmarks, skip navigation, and live form status", () => {
   assert.match(shell, /<header[\s>]/);
@@ -35,6 +42,48 @@ test("static shell has semantic landmarks, skip navigation, and live form status
   assert.match(app, /function renderPrivacy\(\)/);
   assert.match(app, /if \(path === "\/privacy"\) return renderPrivacy\(\)/);
   assert.match(redirects, /^\/privacy \/ 200$/m);
+});
+
+test("live reviewer click verification fails closed and is nonmutating by default", () => {
+  assert.match(reviewerClickE2e, /ALLOW_LIVE_FEEDBACK/);
+  assert.match(reviewerClickE2e, /ALLOW_LIVE_QUEUE/);
+  assert.match(reviewerClickE2e, /if \(!ALLOW_LIVE_QUEUE\)/);
+  assert.match(reviewerClickE2e, /MODE === "local"/);
+  assert.match(reviewerClickE2e, /checking session/i);
+  assert.match(reviewerClickE2e, /note\("fail", "claim", "No openable claim row"\)/);
+  assert.doesNotMatch(reviewerClickE2e,
+    /querySelector\("#review-queue \[data-assignment-id\]"\)/);
+  assert.doesNotMatch(reviewerClickE2e,
+    /locator\("#review-queue \[data-assignment-id\]"\)/);
+  assert.match(reviewerClickE2e, /if \(d\.error\) return 1/);
+  assert.match(reviewerClickE2e, /input\[name="verdict"\]\[value="disagree"\]/);
+  assert.match(reviewerClickE2e, /selectOption\('select\[name="disagreeOutcome"\]', "undetermined"\)/);
+  assert.match(archiveReview, /\/api\/review\/archive\/\$\{encodeURIComponent\(assignmentId\)\}/);
+});
+
+test("local reviewer click verification uses a fresh isolated migrated D1", () => {
+  assert.match(packageJson, /run-reviewer-click-e2e\.sh --mode local/);
+  assert.match(reviewerClickWrapper, /mktemp -d/);
+  assert.match(reviewerClickWrapper, /wrangler d1 migrations apply DB --local --persist-to/);
+  assert.match(reviewerClickWrapper, /wrangler pages dev public --persist-to/);
+  assert.match(reviewerClickWrapper, /trap cleanup EXIT/);
+  assert.match(reviewerClickWrapper, /trash "\$E2E_STATE_DIR"/);
+  assert.doesNotMatch(reviewerClickWrapper, /rm\s+-r/);
+});
+
+test("Pages config preserves every non-secret reviewer data binding", () => {
+  assert.match(pagesConfig, /binding = "DB"/);
+  assert.match(pagesConfig, /binding = "SEARCH_DB"/);
+  assert.match(pagesConfig, /database_name = "prophecy-ledger-search"/);
+  assert.match(pagesConfig, /binding = "ARTIFACTS"/);
+  assert.match(pagesConfig, /bucket_name = "prophecy-ledger-artifacts"/);
+});
+
+test("reviewer smoke accepts a ready renewable lease without impersonating the reviewer", () => {
+  assert.match(reviewerSmoke, /work\.status AS work_status/);
+  assert.match(reviewerSmoke, /const joshRenewable/);
+  assert.match(reviewerSmoke, /!joshLive\.length && !joshRenewable\.length/);
+  assert.doesNotMatch(reviewerSmoke, /INSERT INTO review_assignments|UPDATE review_assignments/);
 });
 
 test("public static projection contains neutral catalogue metadata but no draft verdict", () => {
@@ -53,15 +102,21 @@ test("reviewer workspace handles all three queue work types and the complete sta
   assert.match(review, /archive_lead_verification/);
   assert.match(review, /candidate_verification/);
   assert.match(review, /claim_adjudication/);
-  assert.match(review, /Archive checks/);
-  assert.match(review, /Verify candidates/);
-  assert.match(review, /Review claims/);
+  assert.match(review, /Your atomic claims/);
+  assert.match(review, /Notes for this prophetic claim/);
+  assert.match(review, /Save note on this claim/);
+  assert.match(review, /AI research response/);
+  assert.match(review, /id="feedback-panel" open/);
+  assert.match(review, /General notes and feedback history/);
+  assert.match(review, /AI-extracted claim to confirm/);
+  assert.match(review, /Accept or send back/);
+  assert.match(review, /data-archive-work-item/);
   assert.match(review, /bundle\.subject/);
   assert.match(review, /priorInformationReceipts/);
   assert.match(review, /originalSourceVerified/);
   assert.match(review, /decision.*promote/s);
   assert.match(review, /decision.*reject/s);
-  assert.match(review, /workType = "claim_adjudication"/);
+  assert.match(review, /workType: "claim_adjudication"/);
   assert.match(review, /name="reasonCode"/);
   assert.match(review, /context_changes_meaning/);
   assert.match(review, /generic_advice_or_commentary/);
@@ -70,8 +125,10 @@ test("reviewer workspace handles all three queue work types and the complete sta
   assert.match(review, /name="deadline"[^>]+type="date"/);
   for (const type of [
     "testable_prediction", "present_or_past_factual_claim", "conditional_prediction",
-    "symbolic_statement", "general_encouragement", "theological_claim", "personal_interpretation",
   ]) assert.match(review, new RegExp(type));
+  for (const excluded of [
+    "symbolic_statement", "general_encouragement", "theological_claim", "personal_interpretation",
+  ]) assert.doesNotMatch(review, new RegExp(`value="${excluded}"`));
 });
 
 test("archive review keeps first-party assertions separate and checks exactly one source version", () => {
@@ -149,7 +206,8 @@ test("candidate review starts fail-safe and does not legitimize machine suggesti
   assert.match(review, /id="candidate-submit" type="submit" disabled/);
   assert.doesNotMatch(review, /value="promote"[^>]*(?:checked|selected)/);
   assert.doesNotMatch(review, /value="\$\{escapeHtml\(candidate\.title/);
-  assert.doesNotMatch(review, /atomicPropositionDraft|atomic_proposition_draft|proposedStatementType|proposed_statement_type/);
+  assert.match(reviewUi, /atomicPropositionDraft|atomic_proposition_draft/);
+  assert.match(reviewUi, /AI-extracted draft\. The source, not the draft, controls every word/);
   assert.doesNotMatch(review, /Transcript quality/);
 });
 
@@ -159,6 +217,8 @@ const completePromotion = {
   title: "A bounded public event",
   statementType: "testable_prediction",
   atomicProposition: "The named event will occur by the deadline.",
+  verifiedTimestampSeconds: "75",
+  contextNote: "The surrounding source context preserves the same bounded meaning.",
   deadline: "2027-01-01",
   who: "The named institution", whoSourceBasis: "the institution",
   what: "will publish the result", whatSourceBasis: "will publish the result",
@@ -329,10 +389,20 @@ test("source browser uses the paged public endpoint and has useful reader states
   assert.match(app, /No matching public posts/);
   assert.match(app, /We could not load the public posts/);
   assert.match(app, /Show more posts/);
-  assert.match(app, /Transcript not available/);
-  assert.match(app, /Not checked for a claim yet/);
+  for (const label of ["Transcript acquisition", "Machine analysis", "Human review", "Public decision"]) {
+    assert.match(app, new RegExp(label));
+  }
+  assert.match(app, /Transcript acquired/);
+  assert.match(app, /Analysis needs attention/);
+  assert.match(app, /Not ready for human review/);
+  assert.match(app, /Original video unavailable/);
+  assert.match(app, /Transcript not acquired/);
+  assert.match(app, /Preserved public decisions and review history remain available/);
   assert.match(app, /name="status"/);
+  assert.match(app, /value="analysis_pending">Transcript acquired; analysis pending/);
   assert.match(app, /value="ready_for_human_check"/);
+  assert.match(app, /class="source-phases" aria-label="Source processing status"/);
+  assert.doesNotMatch(app, /r2_key|transcript_body|model_response|reviewer_id|reviewer rationale/i);
   assert.match(app, /<details id="source-archive">/);
   assert.match(app, /if \(!details\.open \|\| details\.dataset\.loaded\) return/);
   assert.match(app, /details\.dataset\.loaded = "true"/);
@@ -408,8 +478,8 @@ test("the public profile shows first-party archive progress without calling it v
 test("public UI does not expose private transcript bodies or raw AI analysis", () => {
   assert.doesNotMatch(app, /transcriptBody|transcript_body|rawTranscript|raw_transcript/);
   assert.doesNotMatch(app, /rawAi|raw_ai|modelResponse|model_response|analysisJson|analysis_json/);
-  assert.match(app, /Transcript available/);
-  assert.match(app, /exact transcript candidates ready for human checking/i);
+  assert.match(app, /Transcript acquired/);
+  assert.match(app, /Review readiness is shown separately for each source/i);
   assert.match(app, /First-party rows preserved as leads/);
 });
 
@@ -434,7 +504,9 @@ test("SaneUI color and typography invariants are explicit", () => {
   assert.doesNotMatch(css, /--muted|\.secondary|#f2eadb|#dfd2bd/i);
   assert.doesNotMatch(css, /font-size:\s*(?:[0-9]|1[0-2])px\b/);
   const textColors = [...css.matchAll(/(?:^|[;{])\s*color:\s*([^;}\n]+)/gm)].map((match) => match[1].trim());
-  assert.deepEqual([...new Set(textColors)], ["var(--white)"]);
+  assert.deepEqual([...new Set(textColors)], [
+    "var(--white)", "color-mix(in srgb, #1f9d55 80%, white)",
+  ]);
 });
 
 test("reviewer helper text and inline links keep mobile-accessible computed sizes", () => {
@@ -454,7 +526,7 @@ test("reviewer helper text and inline links keep mobile-accessible computed size
 });
 
 test("UI copy does not make personal or theological-office judgments", () => {
-  const visible = `${shell}\n${app}\n${review}\n${archiveReview}`;
+  const visible = `${shell}\n${app}\n${review}\n${reviewUi}\n${archiveReview}`;
   assert.doesNotMatch(visible, /\b(?:fraudster|false prophet|con artist|liar)\b/i);
   assert.match(visible, /not anyone's faith, motives, or character/i);
 

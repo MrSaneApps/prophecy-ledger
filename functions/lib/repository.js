@@ -208,7 +208,7 @@ const COVERAGE_EMPTY = Object.freeze({
 });
 
 function ingestionTablesMissing(error) {
-  return /no such table:\s*(source_items|source_item_revisions|source_scan_receipts|transcript_artifacts|claim_candidates|eligible_claim_candidates|ingestion_runs|ingestion_jobs|first_party_archive_leads|first_party_archive_lead_revisions|first_party_archive_revision_links|archive_verification_work_items)/i
+  return /no such (?:table|view):\s*(source_items|source_item_revisions|source_scan_receipts|transcript_artifacts|claim_candidates|eligible_claim_candidates|ingestion_runs|ingestion_jobs|first_party_archive_leads|first_party_archive_lead_revisions|first_party_archive_revision_links|archive_verification_work_items|transcript_analysis_runs|transcript_batch_items|effective_transcript_batch_item_dispositions|review_work_items|review_assignments|candidate_review_decisions)/i
     .test(String(error?.message || error));
 }
 
@@ -351,7 +351,8 @@ export async function releaseIntakeDispatch(db, jobId) {
   ).bind(jobId).run();
 }
 
-const SOURCE_STATES = new Set(["all", "possible_claim", "needs_transcript", "ready_for_human_check", "checked", "source_unavailable"]);
+const SOURCE_CURSOR_VERSION = 2;
+const SOURCE_STATES = new Set(["all", "possible_claim", "needs_transcript", "analysis_pending", "ready_for_human_check", "checked", "source_unavailable"]);
 const SOURCE_PLATFORMS = new Set(["all", "official_site", "youtube", "rumble", "facebook", "instagram", "x", "other"]);
 const SOURCE_SORTS = new Set(["newest", "oldest"]);
 
@@ -396,7 +397,7 @@ export async function getSourceCatalogue(db, slug, input = {}) {
   if (cursor) {
     const keys = Object.keys(cursor).sort().join(",");
     const actual = [cursor.version, cursor.personId, cursor.status, cursor.platform, cursor.sort, cursor.query];
-    const expected = [1, person.person_id, options.status, options.platform, options.sort, options.query];
+    const expected = [SOURCE_CURSOR_VERSION, person.person_id, options.status, options.platform, options.sort, options.query];
     if (keys !== "date,group,id,personId,platform,query,sort,status,version" ||
         actual.some((value, index) => value !== expected[index]) || typeof cursor.date !== "string" ||
         typeof cursor.id !== "string" || !cursor.id || ![0, 1].includes(cursor.group) ||
@@ -411,25 +412,88 @@ export async function getSourceCatalogue(db, slug, input = {}) {
     `WITH latest_revisions AS (
        SELECT revision.* FROM source_item_revisions revision WHERE NOT EXISTS (
          SELECT 1 FROM source_item_revisions newer WHERE newer.source_item_id=revision.source_item_id
-           AND (newer.fetched_at>revision.fetched_at OR (newer.fetched_at=revision.fetched_at AND newer.revision_id>revision.revision_id))))
-     SELECT * FROM (
+           AND (newer.fetched_at>revision.fetched_at OR (newer.fetched_at=revision.fetched_at AND newer.revision_id>revision.revision_id)))),
+     latest_analysis AS (
+       SELECT analysis.* FROM transcript_analysis_runs analysis WHERE NOT EXISTS (
+         SELECT 1 FROM transcript_analysis_runs newer WHERE newer.source_item_id=analysis.source_item_id
+           AND (newer.created_at>analysis.created_at OR
+             (newer.created_at=analysis.created_at AND newer.analysis_run_id>analysis.analysis_run_id)))),
+     source_claim_links AS (
+       SELECT DISTINCT item.source_item_id,claim.claim_id,claim.visibility
+       FROM source_items item
+       LEFT JOIN latest_revisions revision ON revision.source_item_id=item.source_item_id
+       JOIN claims claim ON claim.person_id=item.person_id AND
+         (claim.source_url=item.canonical_url OR claim.source_url=revision.embedded_url)),
+     source_work_items AS (
+       SELECT work.work_item_id,candidate.source_item_id
+       FROM review_work_items work JOIN claim_candidates candidate ON candidate.candidate_id=work.candidate_id
+       UNION
+       SELECT work.work_item_id,link.source_item_id
+       FROM review_work_items work JOIN source_claim_links link ON link.claim_id=work.claim_id),
+     review_facts AS (
+       SELECT mapped.source_item_id,
+         MAX(CASE WHEN EXISTS (SELECT 1 FROM candidate_review_decisions decision
+               WHERE decision.work_item_id=work.work_item_id)
+             OR EXISTS (SELECT 1 FROM moderator_reviews review WHERE review.claim_id=work.claim_id)
+           THEN 1 ELSE 0 END) reviewed,
+         MAX(CASE WHEN EXISTS (SELECT 1 FROM review_assignments assignment
+               WHERE assignment.work_item_id=work.work_item_id AND assignment.status='leased')
+           THEN 1 ELSE 0 END) in_progress,
+         MAX(CASE WHEN work.status='ready' THEN 1 ELSE 0 END) ready
+       FROM source_work_items mapped JOIN review_work_items work ON work.work_item_id=mapped.work_item_id
+       GROUP BY mapped.source_item_id),
+     phases AS (
        SELECT item.source_item_id,item.platform,item.canonical_url,item.availability,
          revision.public_title,revision.publication_date,revision.embedded_url,
          COALESCE(revision.publication_date,item.first_discovered_at,'') sort_date,
          CASE WHEN item.platform='official_site' THEN 0 ELSE 1 END sort_group,
          CASE
-           WHEN item.availability IN ('unavailable','blocked') THEN 'source_unavailable'
-           WHEN EXISTS (SELECT 1 FROM claims claim JOIN moderator_reviews review ON review.claim_id=claim.claim_id
-             WHERE claim.person_id=item.person_id AND
-               (claim.source_url=item.canonical_url OR claim.source_url=revision.embedded_url)) THEN 'checked'
-           WHEN EXISTS (SELECT 1 FROM eligible_claim_candidates candidate WHERE candidate.source_item_id=item.source_item_id
-             AND candidate.candidate_kind='exact_transcript_claim') THEN 'ready_for_human_check'
-           WHEN EXISTS (SELECT 1 FROM claim_candidates candidate WHERE candidate.source_item_id=item.source_item_id
-             AND candidate.candidate_kind='description_lead') THEN 'possible_claim'
-           WHEN EXISTS (SELECT 1 FROM transcript_artifacts artifact WHERE artifact.source_item_id=item.source_item_id) THEN 'ready_for_human_check'
-           ELSE 'needs_transcript' END public_state
+           WHEN EXISTS (SELECT 1 FROM transcript_artifacts artifact WHERE artifact.source_item_id=item.source_item_id)
+             OR EXISTS (SELECT 1 FROM transcript_batch_items batch_item
+               WHERE batch_item.source_item_id=item.source_item_id AND batch_item.status='completed') THEN 'acquired'
+           WHEN EXISTS (SELECT 1 FROM effective_transcript_batch_item_dispositions disposition
+               WHERE disposition.source_item_id=item.source_item_id) THEN 'quarantined_source_unavailable'
+           WHEN EXISTS (SELECT 1 FROM transcript_batch_items batch_item
+               WHERE batch_item.source_item_id=item.source_item_id AND batch_item.status='active') THEN 'active'
+           WHEN EXISTS (SELECT 1 FROM transcript_batch_items batch_item
+               WHERE batch_item.source_item_id=item.source_item_id AND batch_item.status='pending') THEN 'pending'
+           WHEN EXISTS (SELECT 1 FROM transcript_batch_items batch_item
+               WHERE batch_item.source_item_id=item.source_item_id AND batch_item.status='skipped') THEN 'skipped_terminal_failure'
+           ELSE 'not_started' END acquisition_status,
+         CASE
+           WHEN NOT EXISTS (SELECT 1 FROM transcript_artifacts artifact
+               WHERE artifact.source_item_id=item.source_item_id) THEN 'not_started'
+           WHEN analysis.status='queued' THEN 'queued'
+           WHEN analysis.status='running' THEN 'running'
+           WHEN analysis.status='partial' THEN 'partial'
+           WHEN analysis.status='completed' THEN 'completed'
+           WHEN analysis.status='failed' THEN 'needs_attention'
+           ELSE 'not_started' END analysis_status,
+         CASE WHEN COALESCE(review.reviewed,0)=1 THEN 'reviewed'
+           WHEN COALESCE(review.in_progress,0)=1 THEN 'in_progress'
+           WHEN COALESCE(review.ready,0)=1 THEN 'ready'
+           ELSE 'not_ready' END human_review_status,
+         CASE WHEN EXISTS (SELECT 1 FROM source_claim_links link
+             WHERE link.source_item_id=item.source_item_id AND link.visibility='published')
+           THEN 'published' ELSE 'not_published' END public_status,
+         CASE WHEN EXISTS (SELECT 1 FROM claim_candidates candidate
+             WHERE candidate.source_item_id=item.source_item_id AND candidate.candidate_kind='description_lead')
+           THEN 1 ELSE 0 END has_description_lead
        FROM source_items item LEFT JOIN latest_revisions revision ON revision.source_item_id=item.source_item_id
-       WHERE item.person_id=?1) catalogue
+       LEFT JOIN latest_analysis analysis ON analysis.source_item_id=item.source_item_id
+       LEFT JOIN review_facts review ON review.source_item_id=item.source_item_id
+       WHERE item.person_id=?1),
+     catalogue AS (
+       SELECT phases.*,
+         CASE WHEN availability IN ('unavailable','blocked')
+               OR acquisition_status='quarantined_source_unavailable' THEN 'source_unavailable'
+           WHEN human_review_status='reviewed' THEN 'checked'
+           WHEN human_review_status IN ('ready','in_progress') THEN 'ready_for_human_check'
+           WHEN acquisition_status='acquired' THEN 'analysis_pending'
+           WHEN has_description_lead=1 THEN 'possible_claim'
+           ELSE 'needs_transcript' END public_state
+       FROM phases)
+     SELECT * FROM catalogue
      WHERE (?2='all' OR catalogue.platform=?2) AND (?3='all' OR catalogue.public_state=?3)
        AND (?4='' OR catalogue.public_title LIKE '%' || ?4 || '%' ESCAPE '\\' OR catalogue.canonical_url LIKE '%' || ?4 || '%' ESCAPE '\\')
        AND (?5='' OR catalogue.sort_group>?7 OR (catalogue.sort_group=?7 AND
@@ -444,8 +508,10 @@ export async function getSourceCatalogue(db, slug, input = {}) {
     sources: page.map((row) => ({ id: row.source_item_id,
       title: row.public_title || (row.platform === "youtube" ? "Linked YouTube video" : "Untitled source"),
       publishedAt: row.publication_date, platform: row.platform, originalUrl: row.canonical_url,
-      linkedVideoUrl: row.embedded_url, status: row.public_state, availability: row.availability })),
-    nextCursor: rows.length > options.limit && last ? encodeCursor({ version: 1, personId: person.person_id,
+      linkedVideoUrl: row.embedded_url, status: row.public_state, availability: row.availability,
+      acquisitionStatus: row.acquisition_status, analysisStatus: row.analysis_status,
+      humanReviewStatus: row.human_review_status, publicStatus: row.public_status })),
+    nextCursor: rows.length > options.limit && last ? encodeCursor({ version: SOURCE_CURSOR_VERSION, personId: person.person_id,
       status: options.status, platform: options.platform, sort: options.sort, query: options.query,
       date: last.sort_date, group: last.sort_group, id: last.source_item_id }) : null,
   };
