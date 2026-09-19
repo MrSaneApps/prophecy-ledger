@@ -80,7 +80,11 @@ async function fetchHandler(request, env, { durationFetcher = fetch } = {}) {
   if (request.method === "POST" && url.pathname === "/admin/video-canary") {
     const body = await request.json().catch(() => ({}));
     if (body.force !== undefined && typeof body.force !== "boolean") return json({ error: "invalid_force" }, 400);
-    const result = await startVideoAnalysisCanary(env, { youtubeId: body.youtubeId, force: body.force === true });
+    const result = await startVideoAnalysisCanary(env, {
+      youtubeId: body.youtubeId,
+      force: body.force === true,
+      durationFetcher,
+    });
     const status = result.started ? 202 : result.reason === "trusted_source_item_not_found" ? 404 :
       result.reason === "invalid_youtube_id" ? 400 : 503;
     return json(result, status);

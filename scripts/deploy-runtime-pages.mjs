@@ -17,13 +17,20 @@ function sha256(value) {
 
 async function defaultFetch(url, timeoutMs) {
   const response = await fetch(url, { redirect: "manual", signal: AbortSignal.timeout(timeoutMs) });
-  return { status: response.status, body: await response.text() };
+  return { status: response.status, body: Buffer.from(await response.arrayBuffer()) };
+}
+
+export function pagesAssetHash(body) {
+  const bytes = Buffer.isBuffer(body) ? body
+    : body instanceof Uint8Array ? Buffer.from(body)
+      : Buffer.from(String(body || ""), "utf8");
+  return { bodyBytes: bytes.length, bodySha256: sha256(bytes) };
 }
 
 function evidence(path, result, reasonCode = null) {
-  const bytes = Buffer.from(String(result?.body || ""));
+  const hashed = pagesAssetHash(result?.body);
   return { path, status: Number.isInteger(result?.status) ? result.status : null,
-    bodyBytes: bytes.length, bodySha256: sha256(bytes), reasonCode };
+    bodyBytes: hashed.bodyBytes, bodySha256: hashed.bodySha256, reasonCode };
 }
 
 function safeErrorField(value) {

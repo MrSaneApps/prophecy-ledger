@@ -1,11 +1,43 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import {
-  buildResearchWorkerTerminal, clampBaseline, formatReviewerFeedbackNotes, formatSendbackLessons, draftEligibility,
+  adversarialConsensusProposal, buildResearchWorkerTerminal, clampBaseline, formatReviewerFeedbackNotes, formatSendbackLessons, draftEligibility,
   extractPublishedDate, findPdfPage, locateExcerpt, orchestrateResearchWorker,
   outcomeSourceAcceptable, parseModelJson, priorSourceAcceptable,
   researchWorkerTerminalLines, sqlQuote, validateResearchWorkerTerminal,
 } from "../scripts/research-lib.mjs";
+import { callCloudflare } from "../scripts/research-providers.mjs";
+
+test("Cloudflare adversarial inference is disabled before network access unless explicitly enabled", async () => {
+  const prior = process.env.RESEARCH_CLOUDFLARE_ADVERSARIAL_ENABLED;
+  delete process.env.RESEARCH_CLOUDFLARE_ADVERSARIAL_ENABLED;
+  let networkCalls = 0;
+  try {
+    await assert.rejects(callCloudflare("test", { fetchImpl: async () => {
+      networkCalls += 1;
+      throw new Error("network must not be reached");
+    } }), /cloudflare_adversarial_disabled_no_charge/);
+    assert.equal(networkCalls, 0);
+  } finally {
+    if (prior === undefined) delete process.env.RESEARCH_CLOUDFLARE_ADVERSARIAL_ENABLED;
+    else process.env.RESEARCH_CLOUDFLARE_ADVERSARIAL_ENABLED = prior;
+  }
+});
+
+test("adversarial consensus requires a valid critic and resolving judge", () => {
+  const primary = { outcomeStatus: "false", noveltyStatus: "widely_expected" };
+  const critic = { outcomeStatus: "partial", noveltyStatus: "widely_expected",
+    challenge: "Excerpt two narrows the timeframe and creates a material partial-outcome argument." };
+  const judge = { consensusStatus: "resolved", outcomeStatus: "false",
+    noveltyStatus: "widely_expected", baselineProbability: 0.9,
+    reasoning: "Excerpt one fixes the deadline, while excerpt two shows the event occurred only afterward, resolving the critique." };
+  const result = adversarialConsensusProposal({ primary, critic, judge });
+  assert.equal(result.ok, true);
+  assert.equal(result.proposal.outcomeStatus, "false");
+  assert.equal(adversarialConsensusProposal({ primary, critic,
+    judge: { ...judge, consensusStatus: "unresolved" } }).reason,
+  "adversarial_consensus_unresolved");
+});
 
 test("locateExcerpt returns the verbatim capture slice across whitespace differences", () => {
   const capture = "Intro.\n  Production   tumbled to\n4.86 million boepd in 2021, down from 5.06.\nOutro.";

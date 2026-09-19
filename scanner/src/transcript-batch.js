@@ -1,3 +1,4 @@
+import { GEMINI_FREE_TIER_MEDIA_SECONDS_MAX, geminiDailyMediaSeconds } from "./gemini-free-tier.js";
 import { sha256, stableId } from "./hash.js";
 import { nowIso, recordSourceMediaMetadata, registerJob } from "./repository.js";
 import {
@@ -16,15 +17,16 @@ function changed(result) {
   return Boolean(result?.meta?.changes);
 }
 async function currentPhysicalMedia(env, at) {
-  const mediaDay = new Date(at).toISOString().slice(0, 10), configured = Number(env.GEMINI_DAILY_MEDIA_SECONDS);
-  const limitSeconds = Number.isInteger(configured) && configured >= 1 && configured <= 86_400
-    ? configured : 86_400;
+  const mediaDay = new Date(at).toISOString().slice(0, 10);
+  const limitSeconds = geminiDailyMediaSeconds(env);
   const tables = await env.DB.prepare(`SELECT name FROM sqlite_master WHERE type='table'
     AND name IN ('gemini_physical_request_reservations','gemini_physical_day_debits')`).all();
   const available = new Set((tables.results || []).map((row) => row.name)).size === 2;
   const usage = available ? await env.DB.prepare(`SELECT (SELECT COALESCE(SUM(reserved_seconds),0) FROM
-    gemini_physical_request_reservations WHERE media_day=?1) request_seconds,(SELECT COALESCE(SUM(reserved_seconds),0)
-    FROM gemini_physical_day_debits WHERE media_day=?1) debit_seconds`).bind(mediaDay).first() : null;
+    gemini_physical_request_reservations WHERE media_day=?1) request_seconds,(SELECT COALESCE(SUM(CASE
+      WHEN reason='legacy_cutover_fail_closed' AND reserved_seconds>=86400 AND ?2<=?3 THEN 0 ELSE reserved_seconds END),0)
+    FROM gemini_physical_day_debits WHERE media_day=?1) debit_seconds`)
+    .bind(mediaDay, limitSeconds, GEMINI_FREE_TIER_MEDIA_SECONDS_MAX).first() : null;
   const mediaSeconds = Number(usage?.request_seconds || 0) + Number(usage?.debit_seconds || 0);
   return { mediaDay, mediaSeconds, mediaLimitSeconds: limitSeconds, exhausted: available && mediaSeconds >= limitSeconds, available };
 }
@@ -752,7 +754,8 @@ export async function resumeTranscriptBatch(env, { idempotencyKey, at = nowIso()
   const transition = Number(batch.transition_count) + 1;
   const eventId = await stableId("txbe", `${batch.batch_id}:transition:${transition}:resumed`);
   const fuseClause = media.available ? `AND ((SELECT COALESCE(SUM(reserved_seconds),0) FROM gemini_physical_request_reservations
-    WHERE media_day=substr(?2,1,10)) + (SELECT COALESCE(SUM(reserved_seconds),0)
+    WHERE media_day=substr(?2,1,10)) + (SELECT COALESCE(SUM(CASE WHEN reason='legacy_cutover_fail_closed' AND reserved_seconds>=86400
+      AND ${media.mediaLimitSeconds}<=${GEMINI_FREE_TIER_MEDIA_SECONDS_MAX} THEN 0 ELSE reserved_seconds END),0)
     FROM gemini_physical_day_debits WHERE media_day=substr(?2,1,10))) < ${media.mediaLimitSeconds}` : "";
   const statements = [
     env.DB.prepare(`UPDATE transcript_batches SET status='running',pause_reason=NULL,resume_after=NULL,paused_at=NULL,

@@ -1,4 +1,5 @@
 import { textAnalysisRuntime, triageDescription } from "./ai.js";
+import { gemini429ResumeAfter, geminiDailyMediaSeconds, geminiTranscriptFallbackModel } from "./gemini-free-tier.js";
 import { fetchHtml } from "./fetch.js";
 import { stableId, sha256 } from "./hash.js";
 import {
@@ -227,9 +228,10 @@ function transcriptSettings(env) {
   return {
     chunkSeconds: integer(env.TRANSCRIPT_CHUNK_SECONDS, 300, 60, 300),
     overlapSeconds: integer(env.TRANSCRIPT_OVERLAP_SECONDS, 0, 0, 30),
-    budgetLimitSeconds: integer(env.GEMINI_DAILY_MEDIA_SECONDS, 86_400, 1, 86_400),
+    budgetLimitSeconds: geminiDailyMediaSeconds(env),
     timeoutMs: integer(env.GEMINI_TRANSCRIPT_TIMEOUT_MS, 120_000, 10_000, 300_000),
     model: env.GEMINI_TRANSCRIPT_MODEL || TRANSCRIPT_MODEL,
+    fallbackModel: geminiTranscriptFallbackModel(env, env.GEMINI_TRANSCRIPT_MODEL || TRANSCRIPT_MODEL),
   };
 }
 async function trustedTranscriptItem(env, envelope) {
@@ -294,7 +296,8 @@ async function transcriptChunkHandler(env, envelope, job, geminiFetcher,
   try {
     const result = await requestTranscriptChunkWithSplit({ apiKey: env.GEMINI_API_KEY,
       videoUrl: `https://www.youtube.com/watch?v=${envelope.payload.youtubeId}`, window,
-      model: settings.model, fetcher: geminiFetcher, timeoutMs: settings.timeoutMs,
+      model: settings.model, fallbackModel: settings.fallbackModel,
+      fetcher: geminiFetcher, timeoutMs: settings.timeoutMs,
       beforePhysicalRequest: async ({ splitPath, window: physicalWindow }) => {
         // A root call and recursive children can cross midnight; meter each call
         // against the UTC day observed immediately before that provider fetch.
@@ -341,7 +344,10 @@ async function transcriptChunkHandler(env, envelope, job, geminiFetcher,
       outputTokens: error.outputTokens ?? null,
       status: "failed", errorCode: error.message || "transcript_chunk_failed" });
     if (envelope.payload.batchId && error.message === "gemini_http_429") {
-      error.defer = true; error.batchPaused = true; error.eligibleAt = nextTranscriptBatchDay(createdAt);
+      error.defer = true; error.batchPaused = true;
+      const nextDay = nextTranscriptBatchDay(createdAt);
+      const shortResume = gemini429ResumeAfter(createdAt, error.retryAfterSeconds);
+      error.eligibleAt = shortResume < nextDay ? shortResume : nextDay;
       await pauseTranscriptBatch(env, { batchId: envelope.payload.batchId,
         batchItemId: envelope.payload.batchItemId, reason: "gemini_429", at: createdAt,
         resumeAfter: error.eligibleAt, jobId: envelope.jobId, httpStatus: 429 });

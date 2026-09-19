@@ -2,7 +2,17 @@
 export PATH=/opt/homebrew/bin:/opt/homebrew/opt/node@24/bin:/usr/bin:/bin:/usr/sbin:/sbin
 source "$HOME/.config/nv/env"
 cd /Users/stephansmac/SaneApps/websites/prophecy-ledger || exit 1
-mkdir -p outputs/batch-watchdog
+mkdir -p outputs/batch-watchdog outputs/gemini-no-charge
+receipt="outputs/gemini-no-charge/latest.json"
+need_billing_check=1
+if [[ -f "$receipt" ]]; then
+  age=$(( $(date +%s) - $(stat -f %m "$receipt") ))
+  if (( age < 72000 )); then need_billing_check=0; fi
+fi
+if (( need_billing_check )); then
+  /bin/zsh scripts/gemini-no-charge-check.sh >> outputs/gemini-no-charge/launchd.log 2>&1 || true
+fi
+export GEMINI_NO_CHARGE_REQUIRED=1
 output=$(/opt/homebrew/opt/node@24/bin/node scripts/batch-watchdog.mjs 2>&1)
 watchdog_exit_code=$?
 print -r -- "$output" >> outputs/batch-watchdog/launchd.log

@@ -101,6 +101,31 @@ const NOVELTY = new Set([
   "no_precursor_found", "not_assessed",
 ]);
 
+export function adversarialConsensusProposal({ primary, critic, judge }) {
+  if (!primary || !OUTCOMES.has(primary.outcomeStatus) || !NOVELTY.has(primary.noveltyStatus)) {
+    return { ok: false, reason: "adversarial_primary_invalid", proposal: null };
+  }
+  const challenge = normalizeWhitespace(critic?.challenge || critic?.reasoning);
+  if (!critic || challenge.length < 40 || !OUTCOMES.has(critic.outcomeStatus)
+      || !NOVELTY.has(critic.noveltyStatus)) {
+    return { ok: false, reason: "adversarial_critic_invalid", proposal: null };
+  }
+  if (!judge || !["unanimous", "resolved"].includes(judge.consensusStatus)
+      || !OUTCOMES.has(judge.outcomeStatus) || !NOVELTY.has(judge.noveltyStatus)) {
+    return { ok: false, reason: "adversarial_consensus_unresolved", proposal: null };
+  }
+  const reasoning = normalizeWhitespace(judge.reasoning);
+  if (reasoning.length < 40 || reasoning.length > 3800) {
+    return { ok: false, reason: "adversarial_judge_invalid", proposal: null };
+  }
+  return { ok: true, reason: null, proposal: {
+    outcomeStatus: judge.outcomeStatus,
+    noveltyStatus: judge.noveltyStatus,
+    baselineProbability: judge.baselineProbability,
+    reasoning,
+  } };
+}
+
 // The fail-closed gate: a draft may exist only when the verified record can
 // carry it. Anything else stays awaiting manual research, with the reason.
 export function formatSendbackLessons(sendbacks = [], { limit = 12 } = {}) {

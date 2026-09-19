@@ -11,7 +11,7 @@
  */
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { mkdirSync, readFileSync, writeFileSync, existsSync } from "node:fs";
+import { mkdirSync, readFileSync, writeFileSync, existsSync, statSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import {
@@ -25,6 +25,7 @@ import {
   validateAnalysisDebtMetrics, validateDailyAction, validateOperationsStatus,
   validateQuarantineReceipt,
 } from "./batch-watchdog-core.mjs";
+import { evaluateGeminiNoChargeReceipt } from "./gemini-no-charge.js";
 
 const ROOT = new URL("..", import.meta.url).pathname;
 const OUT_DIR = join(ROOT, "outputs", "batch-watchdog");
@@ -35,7 +36,7 @@ const ALERT_FROM = process.env.PROPHECY_ALERT_FROM || "Prophecy Ledger Ops <hi@s
 const STALL_HOURS = Number(process.env.PROPHECY_STALL_HOURS || 20);
 const DRY_RUN = process.argv.includes("--dry-run");
 const QUARANTINE_MODE = process.argv.includes("--quarantine-pending-item");
-const MEDIA_BUDGET_SECONDS = 86400;
+const MEDIA_BUDGET_SECONDS = 25200;
 
 function loadEnvFile() {
   // Caller should already have sourced nv/env; keep a tiny fallback for cron.
@@ -208,7 +209,8 @@ function snapshotNow() {
     FROM transcript_batch_items WHERE batch_id=${quotedBatchId} GROUP BY status`) : [];
   const byStatus = Object.fromEntries(counts.map((r) => [r.status, r.n]));
   const today = new Date().toISOString().slice(0, 10);
-  const media = d1(physicalMediaSql(today))[0] || { request_seconds: 0, debit_seconds: 0 };
+  const media = d1(physicalMediaSql(today, { ignoreLegacyCutover: MEDIA_BUDGET_SECONDS <= 27000 }))[0]
+    || { request_seconds: 0, debit_seconds: 0 };
   const requestSeconds = Number(media.request_seconds || 0);
   const debitSeconds = Number(media.debit_seconds || 0);
   const active = batchId ? d1(`SELECT batch_item_id, youtube_id, duration_seconds, started_at,
@@ -240,9 +242,26 @@ function snapshotNow() {
   };
 }
 
-function evaluate(prev, cur) {
+function loadGeminiNoChargeAlert() {
+  const required = process.env.GEMINI_NO_CHARGE_REQUIRED === "1";
+  const path = process.env.GEMINI_NO_CHARGE_RECEIPT
+    || join(ROOT, "outputs", "gemini-no-charge", "latest.json");
+  if (!existsSync(path)) {
+    return required ? evaluateGeminiNoChargeReceipt(null) : null;
+  }
+  try {
+    const receipt = JSON.parse(readFileSync(path, "utf8"));
+    return evaluateGeminiNoChargeReceipt(receipt, { mtimeMs: statSync(path).mtimeMs });
+  } catch (error) {
+    return { level: "error", code: "gemini_no_charge_unreadable",
+      detail: String(error?.message || error).slice(0, 180) };
+  }
+}
+
+function evaluate(prev, cur, { billingAlert = null } = {}) {
   const alerts = [];
   const actions = [];
+  if (billingAlert) alerts.push(billingAlert);
   if (!cur.batch) {
     alerts.push({ level: "warn", code: "no_batch", detail: "No transcript batch row found." });
     return { alerts, actions, healthy: false, progressed: false };
@@ -703,7 +722,7 @@ function formatReport(cur, verdict, repairResult) {
     `Batch: ${b.batch_id || "none"} status=${b.status || "n/a"}`,
     `Progress: ${b.completed_item_count || 0}/${b.item_count || 0}`,
     `Items: ${JSON.stringify(cur.byStatus)}`,
-    `Media today: ${cur.mediaToday.used}/${cur.mediaToday.budget || 86400}s`,
+    `Media today: ${cur.mediaToday.used}/${cur.mediaToday.budget || 25200}s`,
     `Analysis debt: active=${cur.analysisDebt?.activeSections || 0}/${cur.analysisDebt?.activeVideos || 0} ` +
       `in_progress=${cur.analysisDebt?.inProgressSections || 0}/${cur.analysisDebt?.inProgressVideos || 0} ` +
       `manual=${cur.analysisDebt?.manualSections || 0}/${cur.analysisDebt?.manualVideos || 0} ` +
@@ -761,8 +780,9 @@ if (isMainModule()) {
     try {
       mkdirSync(OUT_DIR, { recursive: true });
       const prev = readState();
+      const billingAlert = loadGeminiNoChargeAlert();
       const pre = snapshotNow();
-      const preVerdict = evaluate(prev, pre);
+      const preVerdict = evaluate(prev, pre, { billingAlert });
       const action = [...new Set(preVerdict.actions)][0] || null;
       let actionResponse = null;
       let actionError = null;
@@ -776,7 +796,7 @@ if (isMainModule()) {
         catch (error) { actionError = error; }
       }
       const post = snapshotNow();
-      const verdict = evaluate(prev, post);
+      const verdict = evaluate(prev, post, { billingAlert });
       const actionReceipt = validateDailyAction(pre, post, DRY_RUN ? null : action,
         actionResponse, actionError);
       if (!actionReceipt.ok) {

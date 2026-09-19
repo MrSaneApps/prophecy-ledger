@@ -2,6 +2,7 @@ import {
   compareVideoClaims, extractPublicVideoClaims, primaryVideoPrompt, tiebreakPublicVideoClaims,
   tiebreakerVideoPrompt, verifierVideoPrompt, verifyPublicVideoClaims,
 } from "./ai.js";
+import { GEMINI_FREE_TIER_MODEL, geminiDailyMediaSeconds } from "./gemini-free-tier.js";
 import { sha256, stableId } from "./hash.js";
 import {
   disputedVideoCandidateIds, latestCompletedVideoAttempt, nowIso, primaryVideoCandidates,
@@ -19,9 +20,9 @@ function timeoutMs(env) {
 }
 
 function modelFor(env, stage) {
-  if (stage === "primary") return env.GEMINI_PRIMARY_MODEL || "gemini-3.5-flash";
-  if (stage === "verifier") return env.GEMINI_VERIFIER_MODEL || "gemini-3.1-pro-preview";
-  return env.GEMINI_TIEBREAKER_MODEL || "gemini-3.1-flash-lite";
+  if (stage === "primary") return env.GEMINI_PRIMARY_MODEL || GEMINI_FREE_TIER_MODEL;
+  if (stage === "verifier") return env.GEMINI_VERIFIER_MODEL || GEMINI_FREE_TIER_MODEL;
+  return env.GEMINI_TIEBREAKER_MODEL || GEMINI_FREE_TIER_MODEL;
 }
 
 function gatewayOptions(env) {
@@ -131,8 +132,7 @@ async function callMeteredGeminiVideo(env, { envelope, job, sourceItemId, stage,
   // The day is deliberately derived here, immediately before this physical provider call.
   const createdAt = physicalNow();
   const mediaDay = createdAt.slice(0, 10);
-  const budgetLimitSeconds = Math.min(86_400,
-    Math.max(1, Number(env.GEMINI_DAILY_MEDIA_SECONDS) || 86_400));
+  const budgetLimitSeconds = geminiDailyMediaSeconds(env);
   const logicalReservationId = await stableId("gmr",
     `${envelope.jobId}:${job.attempt_count}:video:${stage}`);
   const logicalReserved = await reserveGeminiMedia(env.DB, {

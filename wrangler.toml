@@ -4,6 +4,7 @@ compatibility_date = "2026-06-30"
 
 [vars]
 REVIEW_DEMO_MODE = "0"
+REVIEW_LEASE_SECONDS = "3600"
 CF_ACCESS_ISSUER = "https://cold-violet-458e.cloudflareaccess.com"
 CF_ACCESS_AUD = "f43b2e8d76b69aa1e02cd5c2626169274bc34c278c47f58324f411d55947889e"
 CF_ACCESS_JWKS_URL = "https://cold-violet-458e.cloudflareaccess.com/cdn-cgi/access/certs"

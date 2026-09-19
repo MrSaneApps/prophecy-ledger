@@ -151,7 +151,7 @@ test("Gemini transcript request uses the documented clipping metadata and reject
   const window = transcriptPlan(360)[1];
   const result = await requestTranscriptChunk({ apiKey: "secret", videoUrl: "https://www.youtube.com/watch?v=c3vf85nk1O0", window, fetcher });
   assert.equal(calls.length, 1);
-  assert.match(calls[0].url, /gemini-3\.1-flash-lite:generateContent$/);
+  assert.match(calls[0].url, /gemini-3\.5-flash-lite:generateContent$/);
   assert.deepEqual(calls[0].body.contents[0].parts[0].videoMetadata, { startOffset: "180s", endOffset: "360s" });
   assert.deepEqual(calls[0].body.generationConfig.thinkingConfig, { thinkingLevel: "minimal" });
   assert.match(calls[0].body.contents[0].parts[1].text, /plain text/i);

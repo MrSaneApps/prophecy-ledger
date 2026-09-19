@@ -1,8 +1,9 @@
 import { extractTranscriptClaims, textAnalysisRuntime } from "./ai.js";
 import { sha256, stableId } from "./hash.js";
 import { nowIso, recordWorkersAiAttempt } from "./repository.js";
+import { parseGeminiRetryAfterSeconds } from "./gemini-free-tier.js";
 
-export const TRANSCRIPT_MODEL = "gemini-3.1-flash-lite";
+export const TRANSCRIPT_MODEL = "gemini-3.5-flash-lite";
 export const TRANSCRIPT_PROMPT_VERSION = "youtube-clip-text-v1";
 /** Below this, Gemini clipping is unreliable (hallucinates or 400). Never call the API. */
 export const MIN_TRANSCRIPT_WINDOW_SECONDS = 15;
@@ -87,7 +88,7 @@ function safeGeminiCause(error) {
 }
 
 export async function requestTranscriptChunk({ apiKey, videoUrl, window, model = TRANSCRIPT_MODEL,
-  fetcher = fetch, timeoutMs = 120_000, splitPath = "root",
+  fallbackModel = null, fetcher = fetch, timeoutMs = 120_000, splitPath = "root",
   beforePhysicalRequest = null, afterPhysicalRequest = null }) {
   if (!apiKey) throw new Error("gemini_key_required");
   const duration = Number(window.requestEnd) - Number(window.requestStart);
@@ -137,12 +138,26 @@ export async function requestTranscriptChunk({ apiKey, videoUrl, window, model =
     await finishPhysicalRequest({ status: "failed", safeCauseCode: safeGeminiCause(error) });
     throw error;
   } finally { clearTimeout(timer); }
+  if (!response.ok && response.status === 429 && fallbackModel && fallbackModel !== model) {
+    const fallback = await fetcher(`https://generativelanguage.googleapis.com/v1beta/models/${fallbackModel}:generateContent`, {
+      method: "POST", signal: controller.signal,
+      headers: { "content-type": "application/json", "x-goog-api-key": apiKey }, body: JSON.stringify(requestBody),
+    }).catch(() => null);
+    if (fallback?.ok) {
+      response = fallback;
+      payload = await response.json().catch(() => null);
+    } else if (fallback) {
+      response = fallback;
+      payload = await response.json().catch(() => null);
+    }
+  }
   if (!response.ok) {
     // Public YouTube URL ingestion intermittently returns 400; treat as retryable except clearly-invalid windows (handled above).
     const error = new Error(`gemini_http_${response.status}`);
     error.retryable = response.status === 429 || response.status === 400 || response.status >= 500;
     error.requestSha256 = requestSha256; error.responseId = payload?.responseId || null;
     error.httpStatus = response.status;
+    if (response.status === 429) error.retryAfterSeconds = parseGeminiRetryAfterSeconds(response);
     await finishPhysicalRequest({ status: "failed", safeCauseCode: safeGeminiCause(error),
       httpStatus: response.status, responseId: error.responseId });
     throw error;

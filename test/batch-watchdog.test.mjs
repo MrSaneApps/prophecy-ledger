@@ -104,6 +104,15 @@ test("paused terminal error with past resume_after queues auto-heal and stays wa
   assert.equal(verdict.alerts.every((a) => a.level !== "error"), true);
 });
 
+test("an injected Gemini billing blocker fails the watchdog without filesystem coupling", () => {
+  const billingAlert = { level: "error", code: "gemini_no_charge_stale",
+    detail: "The no-charge receipt is stale." };
+  const verdict = evaluate(null,
+    snap({ status: "running", pause_reason: null, resume_after: null }), { billingAlert });
+  assert.equal(verdict.healthy, false);
+  assert.equal(verdict.alerts.some((alert) => alert.code === billingAlert.code), true);
+});
+
 test("paused terminal/retry_exhausted before resume_after still auto-heals via skip", () => {
   const verdict = evaluate(null, snap({
     pause_reason: "transcript_retry_exhausted",
@@ -457,6 +466,9 @@ test("physical media SQL charges physical reservations plus cutover debit only",
       1,'root',0,40,40,86400,?)`).run("2026-08-03T00:02:00.000Z");
   const row = db.prepare(physicalMediaSql("2026-08-03")).get();
   assert.deepEqual({ request: row.request_seconds, debit: row.debit_seconds }, { request: 40, debit: 10 });
+  assert.deepEqual({ request: db.prepare(physicalMediaSql("2026-08-03", { ignoreLegacyCutover: true })).get().request_seconds,
+    debit: db.prepare(physicalMediaSql("2026-08-03", { ignoreLegacyCutover: true })).get().debit_seconds },
+    { request: 40, debit: 10 });
 });
 
 test("Resend acceptance stays pending until an official delivery event", () => {

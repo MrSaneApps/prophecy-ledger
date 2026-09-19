@@ -173,13 +173,16 @@ export function currentAcquisitionSql(batchId) {
       job.completed_at DESC,job.job_id DESC`;
 }
 
-export function physicalMediaSql(day) {
+export function physicalMediaSql(day, { ignoreLegacyCutover = false } = {}) {
   const daySql = sqlLiteral(day, /^\d{4}-\d{2}-\d{2}$/, "media_day");
+  const debitWhere = ignoreLegacyCutover
+    ? `${daySql} AND NOT (reason = 'legacy_cutover_fail_closed' AND reserved_seconds >= 86400)`
+    : daySql;
   return `SELECT
     (SELECT COALESCE(SUM(reserved_seconds),0)
       FROM gemini_physical_request_reservations WHERE media_day=${daySql}) AS request_seconds,
     (SELECT COALESCE(SUM(reserved_seconds),0)
-      FROM gemini_physical_day_debits WHERE media_day=${daySql}) AS debit_seconds`;
+      FROM gemini_physical_day_debits WHERE media_day=${debitWhere}) AS debit_seconds`;
 }
 
 export function hoursBetween(a, b) {

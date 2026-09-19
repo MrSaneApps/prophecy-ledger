@@ -11,12 +11,18 @@
  * Secrets from env only. Never log key material.
  */
 
-export const GEMINI_DEFAULT_MODEL = process.env.RESEARCH_MODEL || "gemini-3.5-flash";
+export const GEMINI_DEFAULT_MODEL = process.env.RESEARCH_MODEL || "gemini-3.5-flash-lite";
 export const OPENROUTER_DEFAULT_MODEL = process.env.RESEARCH_OPENROUTER_MODEL
   || "meta-llama/llama-3.3-70b-instruct";
 /** Verified responding on NVIDIA Build chat (free tier). */
 export const NVIDIA_DEFAULT_MODEL = process.env.RESEARCH_NVIDIA_MODEL
   || "mistralai/mistral-nemotron";
+export const CLOUDFLARE_CRITIC_MODEL = process.env.RESEARCH_CLOUDFLARE_CRITIC_MODEL
+  || "@cf/nvidia/nemotron-3-120b-a12b";
+export const CLOUDFLARE_JUDGE_MODEL = process.env.RESEARCH_CLOUDFLARE_JUDGE_MODEL
+  || "@cf/qwen/qwen3-30b-a3b-fp8";
+
+let cloudflareAccountId = null;
 
 /**
  * Only aliases that map to LIVE, chat-callable NVIDIA / known OR ids.
@@ -69,6 +75,67 @@ function openAiMessageText(data) {
   // Some NVIDIA reasoning models put usable text only in reasoning fields when max_tokens is tight.
   const reasoning = String(msg.reasoning_content || msg.reasoning || "").trim();
   return reasoning;
+}
+
+async function resolveCloudflareAccountId(fetchImpl = fetch) {
+  if (process.env.RESEARCH_CLOUDFLARE_ACCOUNT_ID || process.env.CLOUDFLARE_ACCOUNT_ID) {
+    return process.env.RESEARCH_CLOUDFLARE_ACCOUNT_ID || process.env.CLOUDFLARE_ACCOUNT_ID;
+  }
+  if (cloudflareAccountId) return cloudflareAccountId;
+  const token = process.env.CLOUDFLARE_API_TOKEN;
+  if (!token) throw new Error("CLOUDFLARE_API_TOKEN missing from environment");
+  const response = await fetchImpl("https://api.cloudflare.com/client/v4/accounts?per_page=50", {
+    headers: { authorization: `Bearer ${token}`, accept: "application/json" },
+  });
+  const data = await response.json();
+  if (!response.ok || data?.success !== true || !Array.isArray(data.result)) {
+    throw new Error(`cloudflare_accounts_${response.status}`);
+  }
+  if (data.result.length !== 1) throw new Error("cloudflare_account_id_required");
+  cloudflareAccountId = data.result[0].id;
+  return cloudflareAccountId;
+}
+
+export async function callCloudflare(prompt, {
+  model = CLOUDFLARE_CRITIC_MODEL, temperature = 0.1, maxTokens = 1200,
+  fetchImpl = fetch,
+} = {}) {
+  if (process.env.RESEARCH_CLOUDFLARE_ADVERSARIAL_ENABLED !== "1") {
+    throw new Error("cloudflare_adversarial_disabled_no_charge");
+  }
+  const apiKey = process.env.CLOUDFLARE_API_TOKEN;
+  if (!apiKey) throw new Error("CLOUDFLARE_API_TOKEN missing from environment");
+  const accountId = await resolveCloudflareAccountId(fetchImpl);
+  const modelId = resolveModelId(model);
+  const started = Date.now();
+  const response = await fetchImpl(
+    `https://api.cloudflare.com/client/v4/accounts/${accountId}/ai/run/${modelId}`,
+    {
+      method: "POST",
+      headers: { "content-type": "application/json", authorization: `Bearer ${apiKey}` },
+      body: JSON.stringify({
+        messages: [{ role: "user", content: prompt }], temperature,
+        max_tokens: maxTokens,
+      }),
+      signal: AbortSignal.timeout(120_000),
+    },
+  );
+  const data = await response.json();
+  if (!response.ok || data?.success === false) throw new Error(`cloudflare_${response.status}`);
+  const result = data.result || data;
+  const text = String(result.response || openAiMessageText(result) || "").trim();
+  if (!text) throw new Error("cloudflare_empty_response");
+  const usage = result.usage || {};
+  return {
+    provider: "cloudflare", model: modelId, text,
+    latencyMs: Date.now() - started,
+    usage: {
+      promptTokens: usage.prompt_tokens ?? usage.input_tokens ?? null,
+      completionTokens: usage.completion_tokens ?? usage.output_tokens ?? null,
+      totalTokens: usage.total_tokens ?? null,
+    },
+    costUsd: null, tier: "cloudflare_free_allocation",
+  };
 }
 
 export async function callGemini(prompt, {
@@ -197,7 +264,7 @@ export async function callOpenRouter(prompt, {
 
 /**
  * Cost-first research call.
- * provider=auto|gemini|nvidia|openrouter (env RESEARCH_PROVIDER overrides default auto).
+ * provider=auto|gemini|nvidia|openrouter|cloudflare (env RESEARCH_PROVIDER overrides default auto).
  */
 export async function callResearchModel(prompt, options = {}) {
   const provider = String(options.provider || process.env.RESEARCH_PROVIDER || "auto").toLowerCase();
@@ -206,6 +273,7 @@ export async function callResearchModel(prompt, options = {}) {
   if (provider === "gemini") return callGemini(prompt, options);
   if (provider === "nvidia" || provider === "nv") return callNvidia(prompt, options);
   if (provider === "openrouter" || provider === "grok") return callOpenRouter(prompt, options);
+  if (provider === "cloudflare" || provider === "cf") return callCloudflare(prompt, options);
 
   if (provider !== "auto") throw new Error(`research_provider_unsupported:${provider}`);
 

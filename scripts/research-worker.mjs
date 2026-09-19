@@ -23,22 +23,25 @@ import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { mkdirSync, readFileSync, writeFileSync, writeSync } from "node:fs";
 import {
-  clampBaseline, draftEligibility, extractPublishedDate, findPdfPage,
+  adversarialConsensusProposal, clampBaseline, draftEligibility, extractPublishedDate, findPdfPage,
   formatReviewerFeedbackNotes, formatSendbackLessons, locateExcerpt, outcomeSourceAcceptable,
   parseModelJson, priorSourceAcceptable,
   orchestrateResearchWorker, researchWorkerTerminalLines, sqlQuote,
 } from "./research-lib.mjs";
-import { callResearchModel } from "./research-providers.mjs";
+import {
+  callResearchModel, CLOUDFLARE_CRITIC_MODEL, CLOUDFLARE_JUDGE_MODEL,
+} from "./research-providers.mjs";
 
 const ARGS = process.argv.slice(2);
 const LOCAL = ARGS.includes("--local");
 const DRY_RUN = ARGS.includes("--dry-run");
 const ALL = ARGS.includes("--all");
 const CLAIM_IDS = ARGS.flatMap((arg, index) => arg === "--claim" ? [ARGS[index + 1]] : []);
-const MODEL = process.env.RESEARCH_MODEL || "gemini-3.5-flash";
+const MODEL = process.env.RESEARCH_MODEL || "gemini-3.5-flash-lite";
 const UA = "Mozilla/5.0 (prophecy-ledger research worker)";
 const BRAVE = "/Applications/Brave Browser.app/Contents/MacOS/Brave Browser";
 const OUT_DIR = "outputs/research-worker";
+const CLOUDFLARE_NEURON_LIMIT = 7800;
 mkdirSync(OUT_DIR, { recursive: true });
 
 function sha256(buffer) { return createHash("sha256").update(buffer).digest("hex"); }
@@ -85,6 +88,29 @@ async function gemini(prompt, { search = false } = {}) {
     console.log(`  llm ${result.provider}/${result.model} ${result.latencyMs}ms tier=${result.tier}`);
   }
   return result.text;
+}
+
+function reserveCloudflareNeurons(claimId, role, model) {
+  const usageDay = nowIso().slice(0, 10);
+  const reservedNeurons = role === "critic" ? 1000 : 300;
+  const reservationId = `cfai_${sha256(Buffer.from(`${usageDay}:${claimId}:${role}`)).slice(0, 24)}`;
+  d1Write(`INSERT OR IGNORE INTO workers_ai_neuron_reservations
+    (reservation_id,usage_day,claim_id,role,model_name,reserved_neurons,limit_neurons,created_at)
+    VALUES (${sqlQuote(reservationId)},${sqlQuote(usageDay)},${sqlQuote(claimId)},
+      ${sqlQuote(role)},${sqlQuote(model)},${reservedNeurons},${CLOUDFLARE_NEURON_LIMIT},${sqlQuote(nowIso())});`,
+  `cfai-${role}`);
+  return { reservationId, reservedNeurons, limitNeurons: CLOUDFLARE_NEURON_LIMIT };
+}
+
+async function cloudflareReasoner(prompt, model, { claimId, role }) {
+  const budget = reserveCloudflareNeurons(claimId, role, model);
+  const result = await callResearchModel(prompt, {
+    provider: "cloudflare", model, temperature: 0.1,
+  });
+  console.log(`  llm ${result.provider}/${result.model} ${result.latencyMs}ms tier=${result.tier}`);
+  return { parsed: parseModelJson(result.text), receipt: {
+    provider: result.provider, model: result.model, usage: result.usage, budget,
+  } };
 }
 
 async function fetchSource(url) {
@@ -289,6 +315,7 @@ Never use the speaker's own sites or channels. Respond with STRICT JSON only:
   }
   const today = nowIso().slice(0, 10);
   let proposal = null;
+  let consensusGate = { ok: false, reason: "adversarial_consensus_not_run" };
   if (lanes.outcome.length || lanes.prior.length) {
     const evidenceBlock = [...lanes.prior, ...lanes.outcome].map((source, index) =>
       `[${index + 1}] (${source.lane}, published ${source.publishedAt}) "${source.excerpt}" — ${source.title}`).join("\n");
@@ -296,7 +323,7 @@ Never use the speaker's own sites or channels. Respond with STRICT JSON only:
       formatSendbackLessons(claimLessons, { limit: 8 }),
       formatSendbackLessons(globalLessons, { limit: 8 }),
     ].filter(Boolean).join("\n");
-    const draftPrompt = `You draft a PENDING decision for two blinded human reviewers on a claim ledger.
+    const draftPrompt = `You draft a PENDING decision for one accountable human reviewer on a claim ledger.
 Judge only the frozen proposition against the verified excerpts below. Cite only these excerpts.
 Read each excerpt literally. If an excerpt states the predicted event occurred, choose true;
 if it states it failed, choose false; if only part held, choose partial. Do NOT choose pending
@@ -314,14 +341,62 @@ Respond with STRICT JSON only:
  "noveltyStatus":"already_public|widely_expected|strong_signals|emerging_signals|no_precursor_found|not_assessed",
  "baselineProbability":0.0,
  "reasoning":"one neutral paragraph citing the numbered excerpts"}`;
-    try { proposal = parseModelJson(await gemini(draftPrompt)); } catch (error) {
+    let primary = null;
+    try { primary = parseModelJson(await gemini(draftPrompt)); } catch (error) {
       console.log(`  draft synthesis failed: ${String(error).slice(0, 80)}`);
     }
+    if (primary) {
+      try {
+        const criticPrompt = `Act as the adversarial evidence critic for a public claim ledger.
+Challenge the proposed decision below. Find omitted counterevidence in the supplied verified excerpts,
+date/cutoff mistakes, overclaiming, weak causal language, and the strongest reasonable case for a
+different outcome. Do not add facts outside the excerpts. Never judge faith, motive, or character.
+Proposition: ${claim.atomic_proposition}
+Criteria: ${claim.criteria}
+Verified excerpts:\n${evidenceBlock}
+Primary proposal: ${JSON.stringify(primary)}
+Respond with STRICT JSON only:
+{"outcomeStatus":"true|false|partial|pending|undetermined|not_falsifiable",
+ "noveltyStatus":"already_public|widely_expected|strong_signals|emerging_signals|no_precursor_found|not_assessed",
+ "baselineProbability":0.0,"challenge":"at least one neutral paragraph naming the strongest weaknesses and numbered excerpts"}`;
+        const criticResult = await cloudflareReasoner(criticPrompt, CLOUDFLARE_CRITIC_MODEL,
+          { claimId: claim.claim_id, role: "critic" });
+        const judgePrompt = `Act as the independent consensus judge for a public claim ledger.
+Reconcile the primary proposal and adversarial critique using only the verified excerpts. Resolve a
+disagreement only when the numbered evidence supports one side. Otherwise mark consensusStatus
+unresolved. The human reviewer, not you, makes the final decision.
+Proposition: ${claim.atomic_proposition}
+Criteria: ${claim.criteria}
+Verified excerpts:\n${evidenceBlock}
+Primary proposal: ${JSON.stringify(primary)}
+Adversarial critique: ${JSON.stringify(criticResult.parsed)}
+Respond with STRICT JSON only:
+{"consensusStatus":"unanimous|resolved|unresolved",
+ "outcomeStatus":"true|false|partial|pending|undetermined|not_falsifiable",
+ "noveltyStatus":"already_public|widely_expected|strong_signals|emerging_signals|no_precursor_found|not_assessed",
+ "baselineProbability":0.0,"reasoning":"one neutral paragraph citing numbered excerpts and explaining how the critique was resolved"}`;
+        const judgeResult = await cloudflareReasoner(judgePrompt, CLOUDFLARE_JUDGE_MODEL,
+          { claimId: claim.claim_id, role: "judge" });
+        consensusGate = adversarialConsensusProposal({
+          primary, critic: criticResult.parsed, judge: judgeResult.parsed,
+        });
+        proposal = consensusGate.proposal;
+        receipts.adversarial = {
+          status: consensusGate.ok ? "consensus" : "manual_required",
+          reason: consensusGate.reason,
+          critic: criticResult.receipt, judge: judgeResult.receipt,
+        };
+      } catch (error) {
+        consensusGate = { ok: false, reason: "adversarial_consensus_unavailable" };
+        receipts.adversarial = { status: "manual_required", reason: consensusGate.reason };
+        console.log(`  adversarial consensus failed: ${String(error).slice(0, 100)}`);
+      }
+    }
   }
-  const gate = draftEligibility({
+  const gate = consensusGate.ok ? draftEligibility({
     verifiedPrior: lanes.prior.length, verifiedOutcome: lanes.outcome.length,
     deadline: claim.deadline, today, proposal,
-  });
+  }) : consensusGate;
   writeReceipts(claim, lanes, receipts, gate, proposal, today);
   return { claim: claim.claim_id, prior: lanes.prior.length, outcome: lanes.outcome.length,
     draft: gate.ok, reason: gate.ok ? null : gate.reason };
@@ -394,7 +469,7 @@ function writeReceipts(claim, lanes, receipts, gate, proposal, today) {
        ${sqlQuote(JSON.stringify(evidenceIds))},
        ${lanes.prior.length ? sqlQuote(`receipt_rw_${base}`) : "NULL"},
        ${sqlQuote(String(proposal.reasoning).slice(0, 3800))},
-       'ai_generated_needs_human_check',${sqlQuote(now)});`);
+       'ai_adversarial_consensus_needs_human_check',${sqlQuote(now)});`);
   }
   d1Write(statements.join("\n"), claim.claim_id.slice(0, 24));
   receipts.finishedAt = nowIso();

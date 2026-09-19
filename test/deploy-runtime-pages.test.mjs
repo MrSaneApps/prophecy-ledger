@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { pollPagesPropagation, PROTECTED_REVIEW_PATHS, reviewerSmokeReceipt,
+import { pagesAssetHash, pollPagesPropagation, PROTECTED_REVIEW_PATHS, reviewerSmokeReceipt,
   runStableReviewerSmoke, validatePagesPropagationReceipt }
   from "../scripts/deploy-runtime-pages.mjs";
 import { expectedPagesAssets } from "../scripts/deploy-runtime.mjs";
@@ -184,4 +184,12 @@ test("canonical reviewer smoke runs exactly once against stable alias", () => {
     args: ["scripts/reviewer-smoke.mjs", "--base", STABLE] }]);
   assert.equal(receipt.status, "completed");
   assert.equal(JSON.stringify(calls).includes(PREVIEW), false);
+});
+
+test("png bytes are hashed as binary, not UTF-8 text", () => {
+  const png = Buffer.from([137, 80, 78, 71, 13, 10, 26, 10, 0, 255, 1, 2]);
+  const hashed = pagesAssetHash(png);
+  assert.equal(hashed.bodyBytes, png.length);
+  assert.equal(hashed.bodySha256, sha256(png));
+  assert.notEqual(hashed.bodySha256, sha256(Buffer.from(String(png))));
 });
