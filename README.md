@@ -6,7 +6,7 @@ was said, what happened, what was already publicly known, and what still needs
 checking. Internal safeguards remain strict, but reader-facing language stays
 ordinary.
 
-A noindex live preview is available at https://prophecy-ledger.pages.dev. The
+The live site is available at https://prophecy-ledger.pages.dev. The
 public site runs on Cloudflare Pages and D1; a separate secret-gated Worker owns
 background ingestion. Deployment identifiers and run receipts are maintainer
 operational state, not repository documentation.
@@ -158,21 +158,20 @@ without an explicitly supplied `SCANNER_ADMIN_TOKEN`, and do not change
 Pages/API, scanner fetch guards, parsers, Queue leases and retries, AI output
 validation, ordered migrations, public source projection, UI, and PDF.
 
-## Preview indexing and security
+## Indexing and security
 
-The preview is intentionally blocked from indexing by the HTML robots meta,
-`robots.txt`, and `X-Robots-Tag`. `public/_headers` protects static Pages files;
-the root Functions middleware applies the same policy to APIs and PDF downloads.
-Before a public launch, remove the three noindex controls deliberately; do not
-weaken the security headers. Once a public repository URL exists, add a visible
-`Source` link to that exact revision or repository before publishing a modified
-network deployment.
+Public HTML is indexable. `/review` and `/api/` stay noindex via `robots.txt`,
+`X-Robots-Tag`, and the root Functions middleware. `public/_headers` still
+protects static Pages files with the restrictive security headers. Do not weaken
+those headers. Social preview tags follow the SaneBar card contract in
+`scripts/automation/social_card_audit.py`.
 
 
 ## Routes
 
 - `/` — reusable public people directory
 - `/people/troy-black` — Troy pilot profile, coverage, sources, and video intake
+- `/people/troy-black/method` — essay on the repeating pattern in the fulfilled archive
 - `/people/troy-black/claims/southeast-asia-oil-2021` — full oil claim review
 - `/people/troy-black/claims/russia-spring-2022` — full Russia claim review
 - `/claims/:id` — legacy-compatible claim route

@@ -6,8 +6,9 @@ Read this file before changing the project.
 
 - Assess public statements and evidence, never character, motive, sincerity,
   salvation, prophetic office, fraud, or divine causation.
-- AI may draft; only two distinct matching human reviews can publish an
-  adjudication. Community submissions add evidence, not votes.
+- AI may research, challenge, and draft; one authenticated, publicly named
+  human reviewer owns the final adjudication. Community submissions add
+  evidence, not votes.
 - Preserve exact quotations, source dates and URLs, deadlines, evidence roles,
   contemporaneous-information search receipts, and append-only history.
 - Keep outcomes and prior-information novelty separate.
@@ -25,7 +26,7 @@ Read this file before changing the project.
 ## Operating boundaries
 
 - Canonical machine is the Mac Mini. Build, test, and browser-QA there only.
-- The live noindex MVP uses Cloudflare Pages plus a separate Queue-producing and
+- The live site uses Cloudflare Pages plus a separate Queue-producing and
   Queue-consuming Worker. Public Pages has no Queue binding.
 - Public `/api/intake` is save-only: it records a normalized video link as
   `pending_identity`. It must not dispatch work or attach an unconfirmed video
@@ -45,10 +46,10 @@ Read this file before changing the project.
   leads only. Description text is never an exact quotation or a rating.
 - Exact claim extraction requires a private quality-labeled artifact and a quote
   that occurs uniquely in it. Clip bounds are approximate locators, not exact
-  word timestamps. A rating still requires two distinct matching authenticated
-  human reviews.
-- Do not collect donations or claim nonprofit status. Keep the preview noindex
-  until public indexing is explicitly approved.
+  word timestamps. A rating requires one authenticated, publicly named human
+  decision after adversarial AI research.
+- Do not collect donations or claim nonprofit status. Public HTML is indexable.
+  Keep `/review` and `/api/` noindex.
 - Use numbered D1 migrations and keep ledger/review rows append-only.
 - Keep the five standard docs current. Do not create orphan documentation.
 - Prefer Node built-ins and small Pages Function modules.

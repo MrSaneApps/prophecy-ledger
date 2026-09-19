@@ -397,8 +397,8 @@ Protestant Edition, pinned to a retrieval date and checksum across its 66 books.
 
 The page publishes an explicitly unmeasured common-elements matrix until
 reviewed pairs exist. Candidate pairs, 5W1H provenance, linkage types, and
-element comparisons require two independent matching human reviews; AI may
-suggest passage pairs only. Repeated or parallel sources are deduplicated before
+element comparisons require one authenticated, publicly named human decision
+after adversarial AI review; AI may suggest passage pairs only. Repeated or parallel sources are deduplicated before
 metrics, unresolved links remain outside results, and every published result
 must show its numerator, denominator, corpus version, and audit coverage.
 

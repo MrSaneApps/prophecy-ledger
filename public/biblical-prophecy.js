@@ -111,7 +111,7 @@ function exampleCard(example) {
   return html`<article class="study-example">
     <div class="study-example-number" aria-hidden="true">${example.number}</div>
     <div>
-      <p class="study-method-label">Worked derivation</p>
+      <p class="study-method-label">Example from Scripture</p>
       <h3>${example.title}</h3>
       <div class="passage-pair">
         <a href="${example.source[1]}" rel="noreferrer">Prophecy: ${example.source[0]} <span aria-hidden="true">↗</span></a>
@@ -147,7 +147,7 @@ export function renderBiblicalProphecy(main) {
 
       <section class="section-wrap study-elements" aria-labelledby="elements-title">
         <header class="study-section-heading">
-          <div><p class="eyebrow">The derived claim anatomy</p><h2 id="elements-title">What must be clear enough to test.</h2></div>
+          <div><p class="eyebrow">What a clear claim includes</p><h2 id="elements-title">The details must be specific enough to check.</h2></div>
           <p>The details may appear in the statement or its immediate source context. How is recorded when stated, but its absence does not disqualify a claim.</p>
         </header>
         <dl class="element-matrix">
@@ -158,24 +158,24 @@ export function renderBiblicalProphecy(main) {
 
       <section class="section-wrap study-examples" aria-labelledby="examples-title">
         <header class="study-section-heading">
-          <div><p class="eyebrow">Worked fulfillment examples</p><h2 id="examples-title">How the criteria are extracted from the text.</h2></div>
-          <p>These are examples of the derivation. They show the source, outcome, and the exact kinds of facts a fair modern test must preserve.</p>
+          <div><p class="eyebrow">Examples from Scripture</p><h2 id="examples-title">How these rules apply to the text.</h2></div>
+          <p>Each example shows the statement, the reported outcome, and the details that a fair modern review must preserve.</p>
         </header>
         <div class="study-example-list">${EXAMPLES.map(exampleCard).join("")}</div>
       </section>
 
       <section class="section-wrap study-method" aria-labelledby="modern-gate-title">
         <header class="study-section-heading">
-          <div><p class="eyebrow">Therefore, our modern test</p><h2 id="modern-gate-title">A public claim must survive the same source-to-outcome discipline.</h2></div>
+          <div><p class="eyebrow">How we apply this today</p><h2 id="modern-gate-title">A public claim must match its original words and the evidence.</h2></div>
           <p>We test only what was publicly stated before the outcome. We do not judge faith, motives, sincerity, calling, or spiritual office.</p>
         </header>
         <div class="pair-flow" aria-label="Modern prophecy review sequence">
-          <span>Exact dated statement</span><i aria-hidden="true">→</i><span>Who · What · Why · Where · When</span><i aria-hidden="true">→</i><span>How and conditions, if stated</span><i aria-hidden="true">→</i><span>Public pass and fail evidence</span><i aria-hidden="true">→</i><span>Two independent reviews</span>
+          <span>Exact dated statement</span><i aria-hidden="true">→</i><span>Who · What · Why · Where · When</span><i aria-hidden="true">→</i><span>How and conditions, if stated</span><i aria-hidden="true">→</i><span>Evidence for and against</span><i aria-hidden="true">→</i><span>One named human decision</span>
         </div>
         <div class="study-metric-rules">
-          <article><strong>Admit</strong><p>A specific claim with a frozen source and an observable outcome.</p></article>
-          <article><strong>Exclude</strong><p>General encouragement, elastic symbolism, private feelings, and statements with no public pass or fail condition.</p></article>
-          <article><strong>Preserve</strong><p>Every stated condition, purpose, deadline, and mechanism without adding details later.</p></article>
+          <article><strong>Include</strong><p>A specific claim with a saved original source and an observable outcome.</p></article>
+          <article><strong>Leave out</strong><p>General encouragement, flexible symbolism, private feelings, and statements with no public way to tell whether they happened.</p></article>
+          <article><strong>Keep intact</strong><p>Every stated condition, purpose, deadline, and mechanism without adding details later.</p></article>
         </div>
       </section>
 

@@ -38,16 +38,28 @@ function sourceLink(url, label = url) {
 }
 
 function notice() {
-  return html`<aside class="notice" aria-label="Review status"><strong>Still being checked</strong>
-    <p>This is an early review of selected claims, not a final decision or a full review of the channel. We show what still needs checking.</p></aside>`;
+  return html`<aside class="notice" aria-label="Profile scope"><strong>This profile is still growing</strong>
+    <p>Each published claim decision is final and names the person who made it. The profile is not yet a complete review of the channel.</p></aside>`;
 }
 
 function displayDate(value) {
   if (!value) return "Date unavailable";
-  const date = new Date(`${value}T12:00:00Z`);
+  const text = String(value);
+  const date = new Date(/^\d{4}-\d{2}-\d{2}$/.test(text) ? `${text}T12:00:00Z` : text);
   return Number.isNaN(date.valueOf())
-    ? String(value)
+    ? text
     : new Intl.DateTimeFormat("en-US", { month: "long", day: "numeric", year: "numeric", timeZone: "UTC" }).format(date);
+}
+
+function displayTimestamp(value) {
+  const seconds = Number(value);
+  if (!Number.isInteger(seconds) || seconds < 0) return "Not confirmed yet";
+  const hours = Math.floor(seconds / 3600);
+  const minutes = Math.floor((seconds % 3600) / 60);
+  const remainder = seconds % 60;
+  return hours
+    ? `${hours}:${String(minutes).padStart(2, "0")}:${String(remainder).padStart(2, "0")}`
+    : `${minutes}:${String(remainder).padStart(2, "0")}`;
 }
 
 function personFallback(slug) {
@@ -67,7 +79,7 @@ function fallbackResearchRecords(slug = DEFAULT_PERSON_SLUG) {
     currentEvidenceSummary: "The full claim review could not be loaded.",
     priorPublicInformationSummary: "Information published before the claim could not be loaded.",
     corpusWarning: "These selected claims are not a complete review of the channel or its track record.",
-    missingGates: ["Restore the full claim review.", "Check the exact words and context.", "Get agreement from two independent reviewers."],
+    missingGates: ["Restore the full claim review.", "Check the exact words and context.", "Get one named human decision after the evidence is challenged."],
     supportingReferences: [],
   }));
 }
@@ -82,17 +94,26 @@ function sourceRoleLabel(role) {
   })[role] || "Source";
 }
 
+function outcomeLabel(outcome) {
+  return ({ true: "Happened", false: "Did not happen", partial: "Partly happened",
+    pending: "Still pending", undetermined: "Undetermined",
+    not_falsifiable: "Cannot be tested" })[outcome] || String(outcome || "Not decided");
+}
+
 function researchBrief(record, index, slug = DEFAULT_PERSON_SLUG) {
   const label = String(index + 1).padStart(2, "0");
-  const strength = record.evidenceStrength === "material_provisional"
+  const decision = record.humanDecision;
+  const strength = decision ? `${outcomeLabel(decision.outcomeStatus)} · ${decision.reviewerName}`
+    : record.evidenceStrength === "material_provisional"
     ? "Useful evidence found" : "More checking needed";
-  const gates = Array.isArray(record.missingGates) ? record.missingGates : [];
+  const gates = decision ? [] : Array.isArray(record.missingGates) ? record.missingGates : [];
   return html`<article class="claim-brief" aria-labelledby="brief-title-${escapeHtml(record.id)}">
     <div class="brief-index"><span>${label}</span><i></i><small>${escapeHtml(displayDate(record.sourceDate))}</small></div>
     <div class="brief-main">
-      <div class="brief-topline"><p class="eyebrow">Public claim</p><span class="status ${record.evidenceStrength === "material_provisional" ? "status-warning" : ""}">${strength}</span></div>
-      <h3 id="brief-title-${escapeHtml(record.id)}">${escapeHtml(record.headline || record.title)}</h3>
+      <div class="brief-topline"><p class="eyebrow">Public claim</p><span class="status ${decision ? "" : record.evidenceStrength === "material_provisional" ? "status-warning" : ""}">${escapeHtml(strength)}</span></div>
+      <h3 id="brief-title-${escapeHtml(record.id)}">${escapeHtml(record.title)}</h3>
       <blockquote>“${escapeHtml(record.exactArchivedQuote)}”</blockquote>
+      <p class="test-framing"><span>What the evidence shows</span>${escapeHtml(record.headline)}</p>
       <p class="test-framing"><span>What would count</span>${escapeHtml(record.testFraming)}</p>
       <div class="brief-evidence">
         <div><span>What happened</span><p>${escapeHtml(record.currentEvidenceSummary)}</p></div>
@@ -100,7 +121,9 @@ function researchBrief(record, index, slug = DEFAULT_PERSON_SLUG) {
       </div>
       <p class="brief-source">${sourceLink(record.originalSourceUrl, "Watch original video ↗")} · ${escapeHtml(displayDate(record.sourceDate))}</p>
     </div>
-    <aside class="missing-gates"><span>What still needs checking</span><ul>${gates.slice(0, 2).map((gate) => `<li>${escapeHtml(gate)}</li>`).join("")}</ul><a href="/people/${encodeURIComponent(slug)}/claims/${encodeURIComponent(record.id)}">Read the full claim review <span aria-hidden="true">→</span></a></aside>
+    ${decision
+      ? `<aside class="missing-gates"><span>Final decision</span><strong>${escapeHtml(outcomeLabel(decision.outcomeStatus))}</strong><p>${escapeHtml(decision.rationale)}</p><small>Decided by ${escapeHtml(decision.reviewerName)} on ${escapeHtml(displayDate(decision.decidedAt))}</small><a href="/people/${encodeURIComponent(slug)}/claims/${encodeURIComponent(record.id)}">Read the evidence and decision <span aria-hidden="true">→</span></a></aside>`
+      : `<aside class="missing-gates"><span>What still needs checking</span><ul>${gates.slice(0, 2).map((gate) => `<li>${escapeHtml(gate)}</li>`).join("")}</ul><a href="/people/${encodeURIComponent(slug)}/claims/${encodeURIComponent(record.id)}">Read the full claim review <span aria-hidden="true">→</span></a></aside>`}
   </article>`;
 }
 
@@ -142,8 +165,8 @@ function directoryPersonCard(entry, index) {
   const coverage = coverageModel(entry);
   return html`<article class="person-row" data-person-row data-search="${escapeHtml(`${name} ${slug}`.toLowerCase())}">
     <div class="person-index" aria-hidden="true"><span>${String(index + 1).padStart(2, "0")}</span><i></i></div>
-    <div class="person-copy"><p class="eyebrow">First public profile</p><h2>${escapeHtml(name)}</h2><p>${escapeHtml(person.corpusLabel || person.corpus_label || "Public sources are being catalogued and checked.")}</p><a class="button-link" href="/people/${encodeURIComponent(slug)}">Open public record <span aria-hidden="true">→</span></a></div>
-    <dl class="person-measures"><div><dt>Sources</dt><dd>${escapeHtml(countLabel(coverage.posts))}</dd></div><div><dt>Archive claims</dt><dd>${escapeHtml(countLabel(coverage.archiveClaims))}</dd></div><div><dt>Transcripts</dt><dd>${escapeHtml(countLabel(coverage.transcripts))}</dd></div><div><dt>Human reviews</dt><dd>${escapeHtml(countLabel(coverage.humanChecked))}</dd></div><div><dt>Final ratings</dt><dd>${escapeHtml(countLabel(coverage.finalRatings))}</dd></div></dl>
+    <div class="person-copy"><p class="eyebrow">First public profile</p><h2>${escapeHtml(name)}</h2><p>Selected public claims are being checked. This is not yet a complete review of the channel.</p><a class="button-link" href="/people/${encodeURIComponent(slug)}">See claims and decisions <span aria-hidden="true">→</span></a></div>
+    <dl class="person-measures"><div><dt>Public posts found</dt><dd>${escapeHtml(countLabel(coverage.posts))}</dd></div><div><dt>Claims found</dt><dd>${escapeHtml(countLabel(coverage.archiveClaims))}</dd></div><div><dt>Checked by people</dt><dd>${escapeHtml(countLabel(coverage.humanChecked))}</dd></div><div><dt>Published decisions</dt><dd>${escapeHtml(countLabel(coverage.finalRatings))}</dd></div></dl>
   </article>`;
 }
 
@@ -151,17 +174,17 @@ function renderDirectory(entries, loadError = "") {
   const people = entries.length ? entries : [{ person: { slug: DEFAULT_PERSON_SLUG, ...personFallback(DEFAULT_PERSON_SLUG) }, corpusCoverage: {} }];
   main.innerHTML = html`
     <section class="directory-hero paper" aria-labelledby="directory-title"><div class="case-rail" aria-hidden="true"><span>PUBLIC CLAIMS</span><i></i><span>LEDGER</span></div><div class="hero-copy">
-      <p class="eyebrow"><span class="signal-dot"></span>Independent public record</p><h1 id="directory-title">Testing Public Prophecy</h1>
-      <p class="lede">Start with a person. Follow the record from original sources and transcripts to specific claims, human reviews, and final ratings.</p>
+      <p class="eyebrow"><span class="signal-dot"></span>Independent public record</p><h1 id="directory-title">Did the public prophecy happen?</h1>
+      <p class="lede">Choose a person, read exactly what was said, inspect the evidence, and see the final decision from a named human reviewer.</p>
       <p class="hero-footnote"><span>Prophecies, not personalities</span> We test public prophecies and their stated details against evidence. We do not judge faith, motives, character, prophetic status, or divine causation.</p>
-    </div><div class="directory-seal" aria-hidden="true"><span>${escapeHtml(countLabel(people.length))}</span><small>public profile<br>open now</small></div></section>
+    </div><div class="directory-seal" aria-hidden="true"><span>${escapeHtml(countLabel(people.length))}</span><small>public ${people.length === 1 ? "profile" : "profiles"}<br>available</small></div></section>
     <section class="section-wrap people-directory" aria-labelledby="people-title">
       ${loadError ? `<aside class="load-warning" role="status"><strong>Directory update unavailable</strong><p>${escapeHtml(loadError)} Showing the first public profile.</p></aside>` : ""}
-      <header class="directory-heading"><div><p class="eyebrow">People directory</p><h2 id="people-title">Choose a public record.</h2></div><p>Troy Black is the first profile. Many more people will be added as their public sources can be catalogued and checked under the same rules.</p></header>
+      <header class="directory-heading"><div><p class="eyebrow">People directory</p><h2 id="people-title">Choose a person.</h2></div><p>Troy Black is the first profile. More people will be added as their public claims can be checked under the same rules.</p></header>
       <form id="people-search" class="people-search" role="search"><label for="people-query">Search people</label><div><input id="people-query" name="query" type="search" autocomplete="off" placeholder="Search by name"><button type="submit">Search</button></div></form>
       <p id="people-status" class="source-status" role="status" aria-live="polite">${people.length} ${people.length === 1 ? "profile" : "profiles"} available.</p>
       <div class="person-register">${people.map(directoryPersonCard).join("")}</div>
-      <aside class="directory-next"><span>More records are coming</span><p>Each new person will use the same evidence trail and the same separation between sources, transcripts, claims, human reviews, and final ratings.</p></aside>
+      <aside class="directory-next"><span>More profiles are coming</span><p>Every claim will show the original words, the evidence, and the named human who made the final decision.</p></aside>
     </section>`;
   bindDirectorySearch();
 }
@@ -204,15 +227,15 @@ function accessRows(coverage) {
 
 const SOURCE_PHASE_LABELS = Object.freeze({
   acquisition: {
-    not_started: "Transcript not acquired", pending: "Transcript queued",
-    active: "Transcript acquisition in progress", acquired: "Transcript acquired",
-    quarantined_source_unavailable: "Transcript not acquired",
-    skipped_terminal_failure: "Transcript not acquired",
+    not_started: "Transcript not ready", pending: "Transcript waiting",
+    active: "Transcript being prepared", acquired: "Transcript ready",
+    quarantined_source_unavailable: "Transcript unavailable",
+    skipped_terminal_failure: "Transcript unavailable",
   },
   analysis: {
-    not_started: "Analysis not started", queued: "Analysis queued", running: "Analysis in progress",
-    partial: "Analysis needs attention", completed: "Analysis completed",
-    needs_attention: "Analysis needs attention",
+    not_started: "Evidence check not started", queued: "Evidence check waiting", running: "Evidence check in progress",
+    partial: "Evidence check needs attention", completed: "Evidence check complete",
+    needs_attention: "Evidence check needs attention",
   },
   humanReview: {
     not_ready: "Not ready for human review", ready: "Ready for human review",
@@ -238,17 +261,17 @@ function sourceItem(item) {
   const publicDecision = item.publicStatus || item.public_status || "not_published";
   const compatibility = item.status || item.possibleClaimStatus || item.possible_claim_status;
   const compatibilityLabel = ({
-    possible_claim: "Description suggests a possible claim",
+    possible_claim: "This post may contain a claim",
     needs_transcript: "Transcript still needed",
-    analysis_pending: "Transcript acquired; analysis pending",
-    ready_for_human_check: "Eligible human review work exists",
-    checked: "Human review completed",
+    analysis_pending: "Transcript ready; evidence check pending",
+    ready_for_human_check: "Ready for a human reviewer",
+    checked: "Checked by a human reviewer",
     source_unavailable: "Original source unavailable",
-  })[compatibility] || "Source processing has not started";
+  })[compatibility] || "This source has not been checked yet";
   const sourceUnavailable = ["unavailable", "blocked"].includes(String(item.availability || "").toLowerCase())
     || acquisition === "quarantined_source_unavailable";
   const unavailableLabel = platform === "youtube" ? "Original video unavailable" : "Original source unavailable";
-  return html`<li class="source-item"><div class="source-date"><span>${escapeHtml(displayDate(date))}</span><small>${escapeHtml(platform)}</small></div><div class="source-copy"><h3>${escapeHtml(title)}</h3>${sourceUnavailable ? `<p class="source-availability-warning"><strong>${unavailableLabel}</strong><span>Preserved public decisions and review history remain available.</span></p>` : ""}<p class="source-state-summary">${escapeHtml(compatibilityLabel)}</p><div class="source-phases" aria-label="Source processing status">${sourcePhase("acquisition", "Transcript acquisition", acquisition)}${sourcePhase("analysis", "Machine analysis", analysis)}${sourcePhase("humanReview", "Human review", humanReview)}${sourcePhase("publicDecision", "Public decision", publicDecision)}</div></div><div class="source-actions">${url ? sourceLink(url, "Open post ↗") : ""}${videoUrl ? sourceLink(videoUrl, "Watch video ↗") : ""}</div></li>`;
+  return html`<li class="source-item"><div class="source-date"><span>${escapeHtml(displayDate(date))}</span><small>${escapeHtml(platform)}</small></div><div class="source-copy"><h3>${escapeHtml(title)}</h3>${sourceUnavailable ? `<p class="source-availability-warning"><strong>${unavailableLabel}</strong><span>Published decisions and their history remain available.</span></p>` : ""}<p class="source-state-summary">${escapeHtml(compatibilityLabel)}</p><div class="source-phases" aria-label="Source review status">${sourcePhase("acquisition", "Transcript", acquisition)}${sourcePhase("analysis", "Evidence check", analysis)}${sourcePhase("humanReview", "Human review", humanReview)}${sourcePhase("publicDecision", "Decision", publicDecision)}</div></div><div class="source-actions">${url ? sourceLink(url, "Open post ↗") : ""}${videoUrl ? sourceLink(videoUrl, "Watch video ↗") : ""}</div></li>`;
 }
 
 const sourceBrowser = { slug: DEFAULT_PERSON_SLUG, cursor: "", query: "", platform: "official_site", status: "all", loading: false };
@@ -305,6 +328,27 @@ function bindSourceBrowser(slug) {
   });
 }
 
+function normalizeTitle(title) {
+  return String(title || "").toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
+}
+
+function undecidedCatalogue(profile, researchRecords) {
+  const records = Array.isArray(profile?.catalogueRecords) ? profile.catalogueRecords : [];
+  const shown = new Set((researchRecords || []).map((record) => record.id));
+  const publishedKeys = new Set(records
+    .filter((row) => row.record_status === "published" || row.recordStatus === "published")
+    .map((row) => `${row.source_url || row.sourceUrl || ""}|${normalizeTitle(row.title)}`));
+  return records.filter((row) => {
+    const status = row.record_status || row.recordStatus;
+    const key = `${row.source_url || row.sourceUrl || ""}|${normalizeTitle(row.title)}`;
+    return status !== "published" && !shown.has(row.claim_id || row.claimId) && !publishedKeys.has(key);
+  });
+}
+
+function archiveCatalogRows(profile) {
+  return Array.isArray(profile?.archiveCatalog) ? profile.archiveCatalog : [];
+}
+
 function renderPerson(profile, slug, loadError = "") {
   const fallback = personFallback(slug);
   const person = profile?.person || {};
@@ -315,28 +359,42 @@ function renderPerson(profile, slug, loadError = "") {
   const independentCount = profile ? references.filter((reference) => reference.role === "independent_outcome").length : null;
   const priorCount = profile ? references.filter((reference) => reference.role === "prior_public_information").length : null;
   const coverage = coverageModel(profile);
+  const finalRatings = Number(coverage.finalRatings || 0);
+  const finalRatingSummary = finalRatings
+    ? `${countLabel(finalRatings)} final ${finalRatings === 1 ? "decision" : "decisions"} published.`
+    : "No final decisions yet.";
   const corpusWarning = researchRecords.find((record) => record.corpusWarning)?.corpusWarning
     || "These selected claims are not a complete review of the channel or its track record.";
   main.innerHTML = html`
     <section class="profile-hero paper" aria-labelledby="dossier-title">
-      <div class="profile-intro"><p class="eyebrow"><span class="signal-dot"></span>Public claim record</p><div class="profile-title"><h1 id="dossier-title">${escapeHtml(displayName)}</h1><span class="status status-warning">Review in progress</span></div>
-      <p class="lede"><strong>No final ratings yet.</strong> ${escapeHtml(countLabel(coverage.archiveClaims))} first-party archive claims catalogued; ${escapeHtml(countLabel(coverage.specificClaims))} exact transcript candidates found. Review readiness is shown separately for each source.</p>
-      <p>These examples show what is being checked and what remains unresolved. They do not establish an overall track record.</p>
-      <div class="hero-actions"><a class="button-link button-primary" href="#claim-briefs">Read the two examples <span aria-hidden="true">↓</span></a><a class="text-link" href="/api/people/${encodeURIComponent(slug)}/report">Download report <span aria-hidden="true">↗</span></a></div></div>
-      <dl class="profile-summary" aria-label="Review at a glance"><div><dt>Archive claims</dt><dd>${escapeHtml(countLabel(coverage.archiveClaims))}</dd></div><div><dt>Original videos</dt><dd>${escapeHtml(countLabel(coverage.archiveVideos))}</dd></div><div><dt>Source checks</dt><dd>${escapeHtml(countLabel(coverage.archiveChecks))}</dd></div><div><dt>Final ratings</dt><dd>${escapeHtml(countLabel(coverage.finalRatings))}</dd></div></dl>
-      <p class="score-boundary"><strong>Counts are not a score.</strong> Only a clear claim checked by two independent reviewers can receive a final rating.</p>
+      <div class="profile-intro"><p class="eyebrow"><span class="signal-dot"></span>Public claim record</p><div class="profile-title"><h1 id="dossier-title">${escapeHtml(displayName)}</h1><span class="status status-warning">Profile in progress</span></div>
+      <p class="lede"><strong>${escapeHtml(finalRatingSummary)}</strong> Read the claims below to see the original words, the evidence, and who made each decision.</p>
+      <p>${escapeHtml(countLabel(coverage.archiveClaims))} possible claims have been found so far, but only ${escapeHtml(countLabel(researchRecords.length))} are shown here with detailed evidence. This does not establish an overall track record.</p>${slug === "troy-black" ? `<p>There is also an essay on <a href="/people/troy-black/method">the pattern in the fulfilled archive</a>.</p>` : ""}
+      <div class="hero-actions"><a class="button-link button-primary" href="#claim-briefs">See claims and decisions <span aria-hidden="true">↓</span></a>${slug === "troy-black" ? `<a class="text-link" href="/people/troy-black/method">The pattern in the fulfilled archive</a>` : ""}<a class="text-link" href="/api/people/${encodeURIComponent(slug)}/report">Download evidence report <span aria-hidden="true">↗</span></a></div></div>
+      <dl class="profile-summary" aria-label="Review at a glance"><div><dt>Claims found</dt><dd>${escapeHtml(countLabel(coverage.archiveClaims))}</dd></div><div><dt>Claims shown</dt><dd>${escapeHtml(countLabel(researchRecords.length))}</dd></div><div><dt>Checked by people</dt><dd>${escapeHtml(countLabel(coverage.humanChecked))}</dd></div><div><dt>Published decisions</dt><dd>${escapeHtml(countLabel(coverage.finalRatings))}</dd></div></dl>
+      <p class="score-boundary"><strong>A profile count is not an accuracy score.</strong> Each published claim decision belongs to the named human reviewer who made it.</p>
     </section>
     <section class="section-wrap dossier" aria-labelledby="research-state-title">${notice()}
       ${loadError ? `<aside class="load-warning" role="status"><strong>Claim details unavailable</strong><p>${escapeHtml(loadError)} Showing the basic source information instead.</p></aside>` : ""}
-      <header class="section-heading selected-heading"><div><p class="eyebrow">Claims under review</p><h2 id="research-state-title">Two documented examples.</h2></div><p>Compact summaries of the evidence collected so far. Neither example has a final rating.</p></header>
+      <header class="section-heading selected-heading"><div><p class="eyebrow">Claims and decisions</p><h2 id="research-state-title">What was said, and what the evidence shows.</h2></div><p>Open any claim for its sources, decision, reviewer, and explanation.</p></header>
       <div id="claim-briefs" class="claim-briefs">${researchRecords.map((record, index) => researchBrief(record, index, slug)).join("")}</div>
-      <section class="evidence-timeline" aria-labelledby="timeline-title"><div class="timeline-copy"><p class="eyebrow">How a claim is checked</p><h2 id="timeline-title">We do not rush to a verdict.</h2><p>Every step must be clear enough for someone else to check.</p></div><ol><li class="complete"><span>1</span><div><strong>Find the claim</strong><small>Save the exact words, date, and source</small></div></li><li class="complete"><span>2</span><div><strong>Check what happened</strong><small>Use reliable sources independent from the speaker</small></div></li><li class="current"><span>3</span><div><strong>Check the full context</strong><small>Exact timestamps and surrounding words are still needed</small></div></li><li><span>4</span><div><strong>Publish a final decision</strong><small>Two independent reviewers must agree</small></div></li></ol></section>
+      ${(() => {
+        const pending = undecidedCatalogue(profile, researchRecords);
+        if (!pending.length) return "";
+        return `<section class="found-panel" aria-labelledby="found-title"><header class="section-heading"><div><p class="eyebrow">In the ledger, not yet decided</p><h2 id="found-title">These claims are saved, but no public decision is published yet.</h2></div><p>They are not ratings. They are waiting on a finished evidence packet and a named reviewer.</p></header><ol class="found-list">${pending.map((row) => `<li><strong>${escapeHtml(row.title)}</strong><small>${escapeHtml(displayDate(row.source_date || row.sourceDate))} · not decided yet</small>${row.source_url || row.sourceUrl ? `<a href="${escapeHtml(row.source_url || row.sourceUrl)}" rel="noreferrer">Original source ↗</a>` : ""}</li>`).join("")}</ol></section>`;
+      })()}
+      ${(() => {
+        const rows = archiveCatalogRows(profile);
+        if (!rows.length) return "";
+        return `<details class="found-archive" id="archive-found-list" open><summary><span>Claims found in the speaker's archive</span><small>${escapeHtml(countLabel(rows.length))} titles from the speaker's own list — not independent proof</small></summary><div class="disclosure-body"><p>This is the inventory being checked. A title here does not mean the claim happened, failed, or has been reviewed.</p><ol class="found-list archive-found-list">${rows.map((row) => `<li><strong>${escapeHtml(row.title)}</strong><small>${escapeHtml(displayDate(row.dateShared || row.date_shared))}</small></li>`).join("")}</ol></div></details>`;
+      })()}
+      <section class="evidence-timeline" aria-labelledby="timeline-title"><div class="timeline-copy"><p class="eyebrow">How a claim is checked</p><h2 id="timeline-title">Research first. Human decision last.</h2><p>Every step must be clear enough for someone else to check.</p></div><ol><li class="complete"><span>1</span><div><strong>Save the claim</strong><small>Keep the exact words, date, and original source</small></div></li><li class="complete"><span>2</span><div><strong>Challenge the evidence</strong><small>Several AI checks look for errors and disagreements</small></div></li><li class="current"><span>3</span><div><strong>Review the full record</strong><small>One human reviewer checks the claim, context, and evidence</small></div></li><li><span>4</span><div><strong>Publish the decision</strong><small>The reviewer signs and owns the final decision</small></div></li></ol></section>
       <div class="archive-disclosures" aria-label="Optional record details">
-        <details id="coverage-archive"><summary><span>Archive coverage</span><small>Counts, scan status, and access limits</small></summary><div class="disclosure-body"><aside class="corpus-warning"><span>Important</span><p>The publisher's archive is a first-party lead index, not proof that a prophecy was fulfilled. Each linked original video still needs an exact source check. ${fallback.archiveUrl ? sourceLink(fallback.archiveUrl, "Open the publisher's archive ↗") : ""}</p></aside><div class="coverage-grid" aria-label="${escapeHtml(displayName)} public source progress"><article><strong>${escapeHtml(countLabel(coverage.archiveClaims))}</strong><span>Archive claims</span><small>First-party rows preserved as leads</small></article><article><strong>${escapeHtml(countLabel(coverage.archiveVideos))}</strong><span>Original videos</span><small>Unique videos named in those rows</small></article><article><strong>${escapeHtml(countLabel(coverage.archiveChecks))}</strong><span>Source checks</span><small>Original-video checks completed</small></article><article><strong>${escapeHtml(countLabel(coverage.transcripts))}</strong><span>Transcripts</span><small>Exact words can be checked</small></article><article><strong>${escapeHtml(countLabel(coverage.specificClaims))}</strong><span>Specific candidates</span><small>Exact transcript candidates, not ratings</small></article><article><strong>${escapeHtml(countLabel(coverage.humanChecked))}</strong><span>Human reviews</span><small>Claims checked by a person</small></article><article class="coverage-final"><strong>${escapeHtml(countLabel(coverage.finalRatings))}</strong><span>Final ratings</span><small>Two reviewers agreed</small></article></div><section class="scan-note" aria-labelledby="scan-note-title"><div><p class="eyebrow">Latest scan</p><h3 id="scan-note-title">${escapeHtml(scanStatusLabel(coverage.status))}</h3><p>${escapeHtml(coverage.note || "The official website is counted first. Other public accounts are added when they can be checked reliably.")}</p><small>Last checked: ${escapeHtml(displayDate(coverage.lastScan))}</small></div><ul aria-label="Source access notes">${accessRows(coverage)}</ul></section></div></details>
-        <details id="source-archive"><summary><span>Browse full source archive</span><small>Search public posts in groups of 25</small></summary><div class="disclosure-body"><section id="source-browser" class="source-browser" aria-labelledby="source-browser-title"><header><div><p class="eyebrow">Original sources</p><h2 id="source-browser-title">Browse the public posts</h2></div><p>Search by title or web address, then open the original page or linked video yourself.</p></header><form id="source-search" class="source-search" role="search"><label>Search by title or web address<input name="query" type="search" placeholder="Try: election, economy, Russia…"></label><label>Source<select name="platform"><option value="all">All sources</option><option value="official_site" selected>Official website</option><option value="youtube">YouTube</option><option value="rumble">Rumble</option><option value="facebook">Facebook</option><option value="instagram">Instagram</option><option value="x">X</option></select></label><label>Show<select name="status"><option value="all">Everything found</option><option value="possible_claim">Possible claims</option><option value="needs_transcript">Needs a transcript</option><option value="analysis_pending">Transcript acquired; analysis pending</option><option value="ready_for_human_check">Ready for a person</option><option value="checked">Checked by a person</option><option value="source_unavailable">Source unavailable</option></select></label><button type="submit">Search</button></form><p id="source-status" class="source-status" role="status" aria-live="polite">Open this section to load public posts.</p><ol id="source-results" class="source-results"></ol><button id="source-more" class="source-more" type="button" hidden>Show more posts</button></section></div></details>
-        <details id="method-limits"><summary><span>Method and limits</span><small>What this page can and cannot establish</small></summary><div class="disclosure-body"><section class="evidence-boundary" aria-labelledby="boundary-title"><header><p class="eyebrow">What this page can tell you</p><h2 id="boundary-title">Useful facts, with honest limits.</h2></header><div class="boundary-columns"><article><span class="boundary-label positive">What we have</span><ul><li>Two quotations with dates and links to the original videos.</li><li>${independentCount ?? "Multiple"} independent sources about what happened.</li><li>${priorCount ?? "Multiple"} sources published before the claims were made.</li><li>A clear list of what still needs checking for each claim.</li></ul></article><article><span class="boundary-label caution">What we do not have yet</span><ul><li>No final true, false, or partly true decision.</li><li>No verified timestamp or full surrounding context from the original videos.</li><li>No complete review of the channel or meaningful overall score.</li><li>No judgment of motive, character, prophetic status, or divine causation.</li></ul></article></div></section></div></details>
+        <details id="coverage-archive"><summary><span>How complete is this profile?</span><small>What has and has not been checked</small></summary><div class="disclosure-body"><aside class="corpus-warning"><span>Important</span><p>The speaker's own archive helps us find claims, but it does not prove that they happened. We check each original video and independent evidence. ${fallback.archiveUrl ? sourceLink(fallback.archiveUrl, "Open the speaker's archive ↗") : ""}</p></aside><div class="coverage-grid" aria-label="${escapeHtml(displayName)} public source progress"><article><strong>${escapeHtml(countLabel(coverage.archiveClaims))}</strong><span>Claims found</span><small>Possible claims listed by the speaker</small></article><article><strong>${escapeHtml(countLabel(coverage.archiveVideos))}</strong><span>Original videos</span><small>Unique videos linked from that list</small></article><article><strong>${escapeHtml(countLabel(coverage.archiveChecks))}</strong><span>Videos checked</span><small>Original videos checked so far</small></article><article><strong>${escapeHtml(countLabel(coverage.transcripts))}</strong><span>Transcripts ready</span><small>Videos whose exact words can be searched</small></article><article><strong>${escapeHtml(countLabel(coverage.specificClaims))}</strong><span>Clear claims found</span><small>Statements specific enough to investigate</small></article><article><strong>${escapeHtml(countLabel(coverage.humanChecked))}</strong><span>Checked by people</span><small>Claims reviewed by a person</small></article><article class="coverage-final"><strong>${escapeHtml(countLabel(coverage.finalRatings))}</strong><span>Published decisions</span><small>Each signed by its human reviewer</small></article></div><section class="scan-note" aria-labelledby="scan-note-title"><div><p class="eyebrow">Latest source check</p><h3 id="scan-note-title">${escapeHtml(scanStatusLabel(coverage.status))}</h3><p>${escapeHtml(coverage.note || "The official website is counted first. Other public accounts are added when they can be checked reliably.")}</p><small>Last checked: ${escapeHtml(displayDate(coverage.lastScan))}</small></div><ul aria-label="Source access notes">${accessRows(coverage)}</ul></section></div></details>
+        <details id="source-archive"><summary><span>Browse original posts and videos</span><small>Search the sources we found</small></summary><div class="disclosure-body"><section id="source-browser" class="source-browser" aria-labelledby="source-browser-title"><header><div><p class="eyebrow">Original sources</p><h2 id="source-browser-title">Browse public posts and videos</h2></div><p>Search by title or web address, then open the original page or video yourself.</p></header><form id="source-search" class="source-search" role="search"><label>Search by title or web address<input name="query" type="search" placeholder="Try: election, economy, Russia…"></label><label>Source<select name="platform"><option value="all">All sources</option><option value="official_site" selected>Official website</option><option value="youtube">YouTube</option><option value="rumble">Rumble</option><option value="facebook">Facebook</option><option value="instagram">Instagram</option><option value="x">X</option></select></label><label>Show<select name="status"><option value="all">Everything found</option><option value="possible_claim">Possible claims</option><option value="needs_transcript">Needs a transcript</option><option value="analysis_pending">Evidence check in progress</option><option value="ready_for_human_check">Ready for a person</option><option value="checked">Checked by a person</option><option value="source_unavailable">Source unavailable</option></select></label><button type="submit">Search</button></form><p id="source-status" class="source-status" role="status" aria-live="polite">Open this section to load public posts.</p><ol id="source-results" class="source-results"></ol><button id="source-more" class="source-more" type="button" hidden>Show more posts</button></section></div></details>
+        <details id="method-limits"><summary><span>Method and limits</span><small>What this page can and cannot establish</small></summary><div class="disclosure-body"><section class="evidence-boundary" aria-labelledby="boundary-title"><header><p class="eyebrow">What this page can tell you</p><h2 id="boundary-title">Useful facts, with honest limits.</h2></header><div class="boundary-columns"><article><span class="boundary-label positive">What is available</span><ul><li>${escapeHtml(countLabel(researchRecords.length))} claim summaries with dates and links to original videos.</li><li>${independentCount ?? "Multiple"} independent sources about what happened.</li><li>${priorCount ?? "Multiple"} sources published before the claims were made.</li><li>${escapeHtml(countLabel(finalRatings))} published ${finalRatings === 1 ? "decision" : "decisions"}, each owned by a named human reviewer.</li></ul></article><article><span class="boundary-label caution">What remains incomplete</span><ul><li>The full channel has not been reviewed.</li><li>Some claims still need a confirmed timestamp or more surrounding context.</li><li>There is not enough coverage for a meaningful overall score.</li><li>This work does not judge motive, character, prophetic status, or divine causation.</li></ul></article></div></section></div></details>
       </div>
-      <section class="intake-panel" aria-labelledby="intake-title"><div><p class="eyebrow">Suggest another source</p><h2 id="intake-title">Submit a public video.</h2><p>We will save the link so its source and speaker identity can be confirmed. Submitting it does not start an automatic scan or decide whether any claim is true or false.</p></div><form id="intake-form" class="intake" novalidate><label for="youtube-url">Public YouTube URL</label><div class="input-row"><input id="youtube-url" name="youtubeUrl" type="url" inputmode="url" autocomplete="url" required placeholder="https://www.youtube.com/watch?v=…" aria-describedby="intake-help intake-status"><button type="submit">Submit video</button></div><p id="intake-help" class="help">We save the public link. We do not copy the video or create a claim automatically.</p><p id="intake-status" class="form-status" role="status" aria-live="polite"></p></form></section>
+      <section class="intake-panel" aria-labelledby="intake-title"><div><p class="eyebrow">Suggest another source</p><h2 id="intake-title">Send us a public video.</h2><p>Share a YouTube link that may contain a prophecy. We save it for review; submitting a link does not create a claim or decision.</p></div><form id="intake-form" class="intake" novalidate><label for="youtube-url">YouTube video link</label><div class="input-row"><input id="youtube-url" name="youtubeUrl" type="url" inputmode="url" autocomplete="url" required placeholder="https://www.youtube.com/watch?v=…" aria-describedby="intake-help intake-status"><button type="submit">Send video</button></div><p id="intake-help" class="help">We use the public link only to find and check the original words.</p><p id="intake-status" class="form-status" role="status" aria-live="polite"></p></form></section>
     </section>`;
   document.querySelector("#intake-form").addEventListener("submit", submitIntake);
   bindSourceBrowser(slug);
@@ -363,28 +421,47 @@ function renderClaim(id, publicRecord, { slug = DEFAULT_PERSON_SLUG, displayName
   const record = publicRecord || fallbackResearchRecords(slug).find((item) => item.id === id);
   const references = Array.isArray(record.supportingReferences) ? record.supportingReferences : [];
   const gates = Array.isArray(record.missingGates) ? record.missingGates : [];
+  const decision = record.humanDecision;
   const sourceCards = references.length ? references.map((reference) => html`<article class="evidence-item"><span>${escapeHtml(sourceRoleLabel(reference.role))}</span><h3>${escapeHtml(reference.title)}</h3><p>${escapeHtml(reference.note)}</p><small>${escapeHtml(reference.publishedAt || "Date not stated")}</small>${sourceLink(reference.url, "Open source ↗")}</article>`).join("") : `<p class="empty-evidence">Sources could not be loaded.</p>`;
-  main.innerHTML = html`<article class="section-wrap claim-page"><a class="back" href="/people/${encodeURIComponent(slug)}">← Back to ${escapeHtml(displayName)} public record</a>${notice()}
+  main.innerHTML = html`<article class="section-wrap claim-page"><a class="back" href="/people/${encodeURIComponent(slug)}">← Back to ${escapeHtml(displayName)} public record</a>${decision ? "" : notice()}
     ${loadError ? `<aside class="load-warning" role="status"><strong>Claim details unavailable</strong><p>${escapeHtml(loadError)} Showing the basic source information instead.</p></aside>` : ""}
-    <header class="claim-header"><div><p class="eyebrow">Claim review / ${escapeHtml(displayDate(record.asOf || "2026-07-19"))}</p><h1>${escapeHtml(record.headline || record.title)}</h1><p>${escapeHtml(record.title)}</p></div><span class="outcome-stamp">Still being checked</span></header>
-    <section class="quote-card" aria-labelledby="exact-words"><div class="section-number">01 / WHAT WAS SAID</div><div><h2 id="exact-words">Exact words in the archive</h2><blockquote>“${escapeHtml(record.exactArchivedQuote)}”</blockquote><dl class="meta-grid"><div><dt>Date</dt><dd>${escapeHtml(displayDate(record.sourceDate))}</dd></div><div><dt>Original video</dt><dd>${sourceLink(record.originalSourceUrl, "Watch on YouTube ↗")}</dd></div><div><dt>Exact timestamp</dt><dd>Still needs checking</dd></div><div><dt>Final decision</dt><dd>None yet</dd></div></dl><p class="warning"><strong>Still needed:</strong> Check the exact timestamp and the full words around this quote before making a final decision.</p></div></section>
-    <section class="ledger-section" aria-labelledby="test-question"><div class="section-number">02 / WHAT WOULD COUNT</div><div><h2 id="test-question">How we are checking the claim</h2><p class="ledger-lede">${escapeHtml(record.testFraming)}</p></div></section>
-    <section class="ledger-section evidence-finding" aria-labelledby="current-evidence"><div class="section-number">03 / WHAT HAPPENED</div><div><p class="eyebrow">What we found so far</p><h2 id="current-evidence">What happened afterward</h2><p class="ledger-lede">${escapeHtml(record.currentEvidenceSummary)}</p></div></section>
-    <section class="ledger-section prior-finding" aria-labelledby="prior-information"><div class="section-number">04 / WHAT WAS KNOWN</div><div><h2 id="prior-information">What was already public</h2><p class="ledger-lede">${escapeHtml(record.priorPublicInformationSummary)}</p><p class="warning"><strong>Still being checked:</strong> We are preserving the searches and sources used to show what was publicly known at the time.</p></div></section>
+    <header class="claim-header"><div><p class="eyebrow">Claim record · Updated ${escapeHtml(displayDate(record.asOf || "2026-07-19"))}</p><h1>${escapeHtml(record.title)}</h1><p>${escapeHtml(record.headline)}</p></div><span class="outcome-stamp">${escapeHtml(decision ? outcomeLabel(decision.outcomeStatus) : "Still being checked")}</span></header>
+    <section class="quote-card" aria-labelledby="exact-words"><div class="section-number">01 / WHAT WAS SAID</div><div><h2 id="exact-words">The speaker's exact words</h2><blockquote>“${escapeHtml(record.exactArchivedQuote)}”</blockquote><dl class="meta-grid"><div><dt>Date spoken</dt><dd>${escapeHtml(displayDate(record.sourceDate))}</dd></div><div><dt>Original video</dt><dd>${sourceLink(record.originalSourceUrl, "Watch on YouTube ↗")}</dd></div><div><dt>Time in video</dt><dd>${escapeHtml(displayTimestamp(record.exactTimestampSeconds))}</dd></div><div><dt>Decision</dt><dd>${escapeHtml(decision ? `${outcomeLabel(decision.outcomeStatus)} · ${decision.reviewerName}` : "Not decided yet")}</dd></div></dl>${decision ? "" : `<p class="warning"><strong>Still needed:</strong> Confirm the exact time and the surrounding words before a final decision.</p>`}</div></section>
+    <section class="ledger-section" aria-labelledby="test-question"><div class="section-number">02 / THE TEST</div><div><h2 id="test-question">What would count as happening?</h2><p class="ledger-lede">${escapeHtml(record.testFraming)}</p></div></section>
+    <section class="ledger-section evidence-finding" aria-labelledby="current-evidence"><div class="section-number">03 / WHAT HAPPENED</div><div><p class="eyebrow">Evidence after the claim</p><h2 id="current-evidence">What happened afterward</h2><p class="ledger-lede">${escapeHtml(record.currentEvidenceSummary)}</p></div></section>
+    <section class="ledger-section prior-finding" aria-labelledby="prior-information"><div class="section-number">04 / WHAT WAS KNOWN</div><div><h2 id="prior-information">What was already public</h2><p class="ledger-lede">${escapeHtml(record.priorPublicInformationSummary)}</p>${decision ? "" : `<p class="warning"><strong>Still being checked:</strong> We are preserving the searches and sources used to show what was publicly known at the time.</p>`}</div></section>
     <section class="ledger-section" aria-labelledby="sources"><div class="section-number">05 / SOURCES</div><div><h2 id="sources">Sources</h2><div class="evidence-register">${sourceCards}</div></div></section>
-    <section class="ledger-section" aria-labelledby="required"><div class="section-number">06 / STILL TO CHECK</div><div><h2 id="required">What is needed before a final decision</h2><ul class="checklist">${gates.map((gate) => `<li>${escapeHtml(gate)}</li>`).join("")}</ul><div class="claim-actions"><a class="button-link button-primary" href="/api/people/${encodeURIComponent(slug)}/report">Download full report</a></div></div></section>
+    ${decision ? `<section class="ledger-section" aria-labelledby="human-decision"><div class="section-number">06 / FINAL DECISION</div><div><h2 id="human-decision">${escapeHtml(outcomeLabel(decision.outcomeStatus))}</h2><p class="ledger-lede">${escapeHtml(decision.rationale)}</p><p><strong>Decided by ${escapeHtml(decision.reviewerName)}</strong> on ${escapeHtml(displayDate(decision.decidedAt))}. This reviewer owns this decision and explanation.</p></div></section>` : `<section class="ledger-section" aria-labelledby="required"><div class="section-number">06 / STILL TO CHECK</div><div><h2 id="required">What is needed before a final decision</h2><ul class="checklist">${gates.map((gate) => `<li>${escapeHtml(gate)}</li>`).join("")}</ul><div class="claim-actions"><a class="button-link button-primary" href="/api/people/${encodeURIComponent(slug)}/report">Download evidence report</a></div></div></section>`}
   </article>`;
 }
 
 function renderMethodology() {
   main.innerHTML = html`<article class="section-wrap prose-page methodology-page"><p class="eyebrow">How it works · July 20, 2026</p><h1>Check the claim,<span class="mobile-line"> step by step</span></h1>
     <p class="lede">We keep the public method simple enough for anyone to follow and strict enough to prevent cherry-picking.</p>
-    <nav class="on-page" aria-label="How this works"><a href="#rateable">What can be rated</a><a href="#checking">How claims are checked</a><a href="#decision">Final ratings</a><a href="#track-record">Track record</a><a href="#limits">What a score cannot prove</a></nav>
-    <section class="method-step" id="rateable"><h2>1. Which claims can be rated?</h2><p>Only clear statements about facts or future events can receive a true, false, or partly true rating. Encouragement, symbolism, theology, and personal interpretation may be described, but they are not treated as failed predictions.</p></section>
-    <section class="method-step" id="checking"><h2>2. How is a claim checked?</h2><p>We save the exact words, date, original source, and surrounding context. Each source stays a distinct statement so a later retelling cannot replace earlier details. We decide what would count before judging the result, compare the claim with reliable sources independent from the speaker, and show what was already public when the claim was made.</p></section>
-    <section class="method-step" id="decision"><h2>3. When does a rating<span class="mobile-line"> become final?</span></h2><p>Not until two independent, verified reviewers agree on the claim, the result, and the sources. Pending or unclear claims are not counted as misses. If the evidence changes, the public record keeps the correction history.</p></section>
-    <section class="method-step" id="track-record"><h2>4. When will there be<span class="mobile-line"> a track-record score?</span></h2><p>Only after a broad, clearly defined group of videos has been reviewed. Every recorded version stays in the ledger. Related claims may share one scoring cluster so repetition does not inflate the score, but each version and every stated detail are tested on their own. Reviewers may not stitch selected fragments from separate videos into a new prophecy or ignore details that did not happen.</p></section>
+    <nav class="on-page" aria-label="How this works"><a href="#rateable">What can be decided</a><a href="#checking">How claims are checked</a><a href="#decision">Final decisions</a><a href="#track-record">Track record</a><a href="#limits">What a score cannot prove</a></nav>
+    <section class="method-step" id="rateable"><h2>1. Which claims can receive a decision?</h2><p>Only clear statements about facts or future events can receive a Happened, Did not happen, or Partly happened decision. Encouragement, symbolism, theology, and personal interpretation may be described, but they are not treated as failed predictions.</p></section>
+    <section class="method-step" id="checking"><h2>2. How is a claim checked?</h2><p>We save the exact words, date, original source, and surrounding context. A later retelling cannot replace what was said earlier. Before judging the result, we state what would count, compare the claim with reliable sources independent from the speaker, and show what was already public when the claim was made.</p></section>
+    <section class="method-step" id="decision"><h2>3. When does a decision<span class="mobile-line"> become final?</span></h2><p>Several AI checks research the claim, challenge the evidence, and identify disagreements. One human reviewer then checks the complete record, publishes the final decision under a public name, and owns the explanation. Pending or unclear claims are not counted as misses. If evidence changes, the public record keeps the correction history.</p></section>
+    <section class="method-step" id="track-record"><h2>4. When will there be<span class="mobile-line"> a track-record score?</span></h2><p>Only after a broad, clearly defined group of videos has been reviewed. Every recorded version stays in the ledger. Repeated versions of the same prediction count once, while every stated detail is still checked. Reviewers cannot combine selected fragments from separate videos or ignore details that did not happen.</p></section>
     <section class="method-step" id="limits"><h2>5. What can a score<span class="mobile-line"> never prove?</span></h2><p>A score can describe how public, testable claims performed. It cannot prove or disprove anyone's faith, motives, character, prophetic status, or divine causation. If an original source disappears, its claim record, archived words, date, and review history remain in the ledger; only the original link is marked unavailable. We record the disappearance without guessing why.</p></section>
+  </article>`;
+}
+
+function renderTroyArchiveMethod() {
+  main.innerHTML = html`<article class="section-wrap prose-page essay-page">
+    <a class="back" href="/people/troy-black">← Back to Troy Black public record</a>
+    <p class="eyebrow">Troy Black · fulfilled archive</p>
+    <h1>The pattern in the fulfilled archive</h1>
+    <p class="lede">Troy Black keeps a public list of words he says came to pass. Watch the original videos, then look at the titles he later gave them, and the same habit appears.</p>
+    <p>A typical entry starts with loose language and a strong image. He may talk about a rumbling, a shaking, giants, walls, a bomb, or a vessel. He often leaves the timing loose too: a year and a half, four weeks, around August, a rumbling of sorts. He may leave himself room as well. The thing might be natural or man-made. It might be symbolic. It might happen only if someone acts rash. Then months can pass, or years.</p>
+    <p>Later a news story that shares a word or a feeling is paired with the original phrase. The new title makes it sound as if the original details had come true. Sometimes the later event is written into the title, even a date he never named. If the original video later disappears from public view, the later story can still remain on the list.</p>
+    <p>The <a href="/people/troy-black/claims/claim_38ddbf12d108c8d398106b76">Anchorage word</a> shows the swap clearly. He said the city would have a severe storm in May of 2021 that would destroy many things. He later listed an earthquake as the fulfillment. A storm is not an earthquake. The list still marks the word as fulfilled.</p>
+    <p>This is the heart of the pattern. The original image is exchanged for a nearby later story. He spoke of a missile with a red banner and a swastika, and later listed a <a href="/people/troy-black/claims/claim_afe16d4cc10c1850ff7dd818">New York police shooting</a> as the match. He described <a href="/people/troy-black/claims/claim_bd5841fc9a6515e3e290aafe">chemical warfare and a toxic release</a>, and the later story was a plastics-plant fire. He described a barricade and another wall of Jericho moment, due in three weeks, and later listed <a href="/people/troy-black/claims/claim_5c90be2a1db9aa27b1587be7">an earthquake in Venezuela</a>. He described a crash landing in earth orbit, with one person slightly injured, and later listed <a href="/people/troy-black/claims/claim_095c02fba42f1c0a531cbb00">an unmanned moon lander</a>.</p>
+    <p>The same swap appears in stranger images and in markets. Swells of giants with marks on their foreheads became <a href="/people/troy-black/claims/claim_64e664821e935cb33faaedf4">a Miami mall fight and an alien rumor</a>. A UFO crash-landing in Nevada became <a href="/people/troy-black/claims/claim_7ee48d463209d25532d0fc75">a meteor and a closed 911 call</a>. A rumbling and a public failure in the next two weeks became <a href="/people/troy-black/claims/claim_88641c8d84b0ed1a461d63c1">a 2016 document release</a>. Vessels sinking in trade from August into October 2025 became <a href="/people/troy-black/claims/claim_7c1ef80e8eda701b28d91a74">a tariff pause</a>. A stock-market crash about a year and a half later became <a href="/people/troy-black/claims/claim_e271f2f8558cf06591775089">a slump in China</a>, not another 2020-style crash in the United States.</p>
+    <p>In November 2023 he pointed toward Christmas, the Speaker of the House, and vandalism. The Speaker had already been removed on October 3, and he still listed later <a href="/people/troy-black/claims/claim_0856e661b985c5117e4c08ca">Speaker drama</a> as the sign. Sometimes the archive itself says the event had already begun before he posted the public video. A wide window makes it easier to find a later story that can be stretched over the original phrase.</p>
+    <p>He also names a person or a brand, and later whatever happens to them can be listed as the word. Kathryn Krick runs through years of this. In 2022 he posted a <a href="/people/troy-black/claims/claim_264dceaa916ec3d8bed60ca3">praise video</a> that later disappeared from public view. In 2024 he returned to her in a <a href="/people/troy-black/claims/claim_2993be2c3e8b2bf701ba0ab1">dream he treated as personal</a>. In 2025 he posted a video <a href="/people/troy-black/claims/claim_f30c39c88c71a92a28f52432">coming out against her</a>. In 2026 the whole sequence was listed as a <a href="/people/troy-black/claims/claim_7d1fe49069f130190fb289b5">warning that came to pass</a>. The first video was praise. Later retellings do not rewrite that. He also hears a short phrase, searches it while the camera is rolling, and treats whatever the search turns up as part of the word.</p>
+    <p>Sometimes the original details do match. <a href="/people/troy-black/claims/claim_67c34b137503e6bd91d17891">Gun restrictions by the new year</a> landed on calendars that were already public in 2023. A word about a <a href="/people/troy-black/claims/claim_d555ccffd7de344bbc9510b7">crisis in Holland</a> was followed three days later by the collapse of the Dutch cabinet. Queen Elizabeth died, and Charles took the throne, which was already the public line of succession. Matches like these are scarce beside the swaps above. That is how the list is built. It is not a judgment of anyone's faith, motives, or character.</p>
+    <p>The fulfilled page is his later account of his own words. It is not independent proof of what he said on camera. The original video is still the source. Each published claim on this profile keeps those original words beside what happened afterward.</p>
   </article>`;
 }
 
@@ -392,7 +469,7 @@ function renderPrivacy() {
   main.innerHTML = html`<article class="section-wrap prose-page"><p class="eyebrow">Privacy · July 20, 2026</p><h1>Privacy, in plain language</h1>
     <p class="lede">The Prophecy Ledger collects only what it needs to document public claims, accept source suggestions, and support careful human review.</p>
     <section><h2>Public-source records</h2><p>We store public source links and related public metadata so readers can inspect the evidence trail. Suggested video links are saved for identity confirmation; submitting one does not start an automatic scan.</p></section>
-    <section><h2>Private review material</h2><p>Generated transcripts, model output, reviewer assignments, and draft decisions stay on private services and are not served by the public site. Reviewers sign in through Cloudflare Access. The ledger stores a pseudonymous reviewer identifier and append-only review actions, not the reviewer's sign-in credentials.</p></section>
+    <section><h2>Private review material</h2><p>Generated transcripts, model output, reviewer assignments, and draft decisions stay on private services and are not served by the public site. Reviewers sign in through Cloudflare Access. Final decisions show the reviewer's chosen public name; sign-in credentials and the private stable identifier are never published.</p></section>
     <section><h2>Service providers</h2><p>Cloudflare hosts the site, database, private storage, access control, and in-house claim-analysis tools. Google Gemini may process a public video to generate transcript text for private human checking. We do not sell personal information.</p></section>
     <section><h2>Contact</h2><p>Questions about this policy can be sent to <a href="mailto:hi@saneapps.com">hi@saneapps.com</a>.</p></section>
   </article>`;
@@ -428,6 +505,12 @@ async function boot() {
     main.innerHTML = html`<section class="paper loading-state" role="status"><span class="signal-dot"></span><p>Loading the people directory…</p></section>`;
     try { return renderDirectory(await loadPeopleDirectory()); }
     catch (error) { return renderDirectory([], error instanceof Error ? error.message : "The people directory could not be loaded."); }
+  }
+  const nestedMethod = path.match(/^\/people\/([^/]+)\/method$/);
+  if (nestedMethod) {
+    const slug = decodeURIComponent(nestedMethod[1]);
+    if (slug !== "troy-black") return renderNotFound();
+    return renderTroyArchiveMethod();
   }
   const nestedClaim = path.match(/^\/people\/([^/]+)\/claims\/(.+)$/);
   const personMatch = path.match(/^\/people\/([^/]+)$/);

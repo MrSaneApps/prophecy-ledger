@@ -15,6 +15,7 @@ export {
 const html = String.raw;
 
 let activeFeedbackRef = null;
+let activeReviewerPrincipal = null;
 
 const EVIDENCE_LANES = [
   ["original", "Original source", "The exact statement and its surrounding context."],
@@ -61,6 +62,7 @@ function assignmentType(assignment) {
 }
 
 function principalLabel(principal) {
+  if (principal?.publicReviewerName) return principal.publicReviewerName;
   if (principal?.demo || principal?.mode === "local_non_deployable_demo") {
     return "Signed in (local demo reviewer)";
   }
@@ -104,11 +106,11 @@ async function responseJson(response) {
 
 export function renderReview(main) {
   main.innerHTML = html`<article class="section-wrap review-page">
-    <header class="workspace-header"><div><p class="eyebrow"><span class="signal-dot"></span>Private review boundary</p><h1>Reviewer workspace</h1><p>Review one source-bound atomic claim at a time. General statements and archive source leads stay outside this queue. Publication still requires two matching independent reviewers.</p></div></header>
+    <header class="workspace-header"><div><p class="eyebrow"><span class="signal-dot"></span>Private review boundary</p><h1>Reviewer workspace</h1><p>Multiple AI passes research and challenge each claim. One authenticated human reviewer makes and owns the final decision.</p></div></header>
     <section class="review-session" aria-label="Reviewer session"><span>Signed-in reviewer</span><strong id="reviewer-principal">Checking session…</strong><a id="reviewer-logout" hidden>Sign out</a></section>
     <div class="review-layout">
       <aside class="queue" aria-labelledby="queue-title"><h2 id="queue-title">Your atomic claims</h2><p class="queue-guidance">Every tracked claim appears below with its pipeline state. Open any claim marked ready.</p><label class="queue-search" for="claim-search">Search claims<input id="claim-search" type="search" autocomplete="off" placeholder="Filter by words, person, or state"></label><p id="queue-status" class="form-status" role="status" aria-live="polite">Loading your queue…</p><div id="review-queue"></div></aside>
-      <section id="review-private" class="review-work" aria-live="polite"><div class="workspace-empty" data-dashboard-slot><span>01</span><h2>Loading your workspace…</h2><p>Up next, items waiting on your reviewing partner, and your recent decisions.</p></div></section>
+      <section id="review-private" class="review-work" aria-live="polite"><div class="workspace-empty" data-dashboard-slot><span>01</span><h2>Loading your workspace…</h2><p>Up next, saved decisions, and recent work.</p></div></section>
     </div>
     ${researchPanelMarkup()}
     <details class="tool-panel" id="feedback-panel" open><summary>General notes and feedback history</summary><div class="tool-panel-body"><p>Notes about a specific prophecy belong in that claim's visible note thread above. Use this general form for the review screen, feature requests, or anything that is not tied to one claim. All saved notes remain visible in the history below.</p><form id="feedback-form"><label>Category<select name="category"><option value="ai_extraction_quality">The AI picked a wrong or weak candidate</option><option value="ui_friction">A screen or step is confusing</option><option value="evidence_gap">Evidence is wrong or missing</option><option value="feature_request">Feature request</option><option value="other">Something else</option></select></label><label>What happened, and what did you expect?<textarea name="message" rows="4" minlength="5" maxlength="4000" required placeholder="Plain words are perfect. Paste the exact wording that looks wrong if you have it."></textarea></label><button type="submit">Send general note</button><p id="feedback-status" class="form-status" role="status" aria-live="polite"></p></form><div id="feedback-receipt" class="feedback-receipt" hidden></div><section id="feedback-history" class="feedback-history" aria-live="polite"><h3>Your recent feedback</h3><p class="form-status">Loading what you already sent…</p></section></div></details>
@@ -330,6 +332,12 @@ function bindClaimSearch() {
   });
 }
 
+if (typeof document !== "undefined") {
+  document.addEventListener("prophecy-ledger:review-saved", () => {
+    loadQueue().catch(() => {});
+  });
+}
+
 async function loadQueue() {
   const status = document.querySelector("#queue-status");
   const queue = document.querySelector("#review-queue");
@@ -348,6 +356,7 @@ async function loadQueue() {
     const received = Array.isArray(data.assignments) ? data.assignments
       : Array.isArray(data.items) ? data.items : [];
     const assignments = received.filter((assignment) => assignmentType(assignment) !== "archive_lead_verification");
+    activeReviewerPrincipal = data.principal || null;
     document.querySelector("#reviewer-principal").textContent = data.principal
       ? principalLabel(data.principal) : "Verified Access reviewer";
     const logoutTarget = data.logoutTarget || data.logout_target
@@ -363,19 +372,22 @@ async function loadQueue() {
     status.textContent = `${assignments.length} active · ${allClaims.length} tracked ${allClaims.length === 1 ? "claim" : "claims"}.`;
     const STATE_LABELS = {
       ready: "Ready for review", in_preparation: "Being prepared",
-      awaiting_second_review: "Awaiting second review",
       awaiting_reconciliation: "Reconciling", decided: "Decided",
+      duplicate: "Already decided (same claim)",
     };
     const claimRows = allClaims.map((item) => {
-      const openable = ["ready", "awaiting_second_review"].includes(item.state)
+      const openable = item.state === "ready"
         && !activeWorkItems.has(item.workItemId);
+      const extra = item.state === "duplicate" && item.duplicateOf
+        ? ` · same as published ${item.duplicateOf}`
+        : item.hasDraft ? " · AI draft ready" : "";
       return html`<button class="queue-item claim-row" type="button"
         ${openable ? `data-lease-work-item="${escapeHtml(item.workItemId)}"` : "disabled"}
         data-state="${escapeHtml(item.state)}"
         data-search="${escapeHtml(`${item.title} ${item.person} ${STATE_LABELS[item.state] || item.state}`.toLowerCase())}">
         <span>${escapeHtml(STATE_LABELS[item.state] || item.state)}</span>
         <strong>${escapeHtml(item.title)}</strong>
-        <small>${escapeHtml(item.person)}${item.deadline ? ` · due ${escapeHtml(item.deadline)}` : ""}${item.hasDraft ? " · AI draft ready" : ""}</small>
+        <small>${escapeHtml(item.person)}${item.deadline ? ` · due ${escapeHtml(item.deadline)}` : ""}${escapeHtml(extra)}</small>
       </button>`;
     }).join("");
     const assignmentRows = assignments.filter((assignment) => assignmentId(assignment)).map((assignment, index) => {
@@ -405,8 +417,11 @@ async function loadQueue() {
     const archiveRows = assignedArchiveRows + availableArchiveRows;
     queue.innerHTML = html`<div class="queue-chips" role="group" aria-label="Filter work"><button type="button" data-queue-chip="pending" aria-pressed="true">Pending</button><button type="button" data-queue-chip="recent">Recent</button><button type="button" data-queue-chip="all">All</button></div>${assignmentRows ? `<p class="queue-group">Your active work</p>${assignmentRows}` : ""}
       <p class="queue-group">All claims</p>${claimRows || `<p class="queue-empty">No claims are tracked yet.</p>`}
-      <p class="queue-group">Source checks — ${escapeHtml(String(archiveCounts.ready ?? 0))} ready, ${escapeHtml(String(archiveCounts.matched ?? 0))} with the quote already located</p>
-      <p class="queue-hint">The machine takes quote-located items automatically as videos transcribe. Rows here are waiting on transcription or need human eyes; open one only if you want to verify against the video yourself.</p>${archiveRows}`;
+      <details class="queue-archive"${Number(archiveCounts.matched || 0) ? " open" : ""}>
+        <summary>Source checks — ${escapeHtml(String(archiveCounts.ready ?? 0))} waiting, ${escapeHtml(String(archiveCounts.matched ?? 0))} with the quote already located</summary>
+        <p class="queue-hint">Your main job is Accept or send back on finished packets above. Source checks stay optional. The machine should take items once the quote is located in a transcript; open one only if you want to check a video yourself.</p>
+        ${archiveRows || `<p class="queue-empty">No source checks are listed right now.</p>`}
+      </details>`;
     queue.querySelectorAll("[data-assignment-id]").forEach((button) => {
       button.addEventListener("click", () => loadAssignedItem(button.dataset.assignmentId, button));
     });
@@ -469,7 +484,7 @@ async function loadQueue() {
     } else {
       // One-shot auto-resume so reviewers are not left staring at a dashboard card.
       const resume = document.querySelector("#review-private [data-dashboard-open]");
-      if (resume && !deepLinkConsumed) {
+      if (resume && resume.dataset.dashboardAuto === "true" && !deepLinkConsumed) {
         deepLinkConsumed = true;
         queue.querySelector(resume.dataset.dashboardOpen)?.click();
       }
@@ -513,23 +528,19 @@ let deepLinkConsumed = false;
 function renderDashboard({ assignments, allClaims, archiveData, availableArchive }) {
   const container = document.querySelector("#review-private");
   if (!container || !container.querySelector("[data-dashboard-slot]")) return;
-  const openClaim = assignments.find((assignment) => (assignment.status || "") !== "submitted");
-  const archiveMine = (archiveData.assignments || []).filter((assignment) => (assignment.status || assignment.assignment_status || "leased") === "leased");
+  const openClaim = assignments.find((assignment) => (assignment.status || "") !== "submitted"
+    && assignmentType(assignment) !== "archive_lead_verification");
+  const readyClaim = (allClaims || []).find((item) => item.state === "ready");
+  const matchedArchive = (availableArchive || []).find((item) => item.matched && !item.taken);
   const upNext = openClaim
-    ? { label: "Resume your claim review", title: openClaim.prophecy || openClaim.title || "Assigned claim", selector: `[data-assignment-id="${openClaim.assignmentId || openClaim.assignment_id}"]` }
-    : archiveMine.length
-      ? { label: "Resume your source check", title: archiveMine[0].description || "Archive source check", selector: `[data-archive-assignment-id="${archiveMine[0].archiveAssignmentId || archiveMine[0].assignmentId}"]` }
-      : (availableArchive || []).filter((item) => !item.taken).slice(0, 1).map((item) => ({
-          label: item.matched ? "Start the next source check — quote already located" : "Start the next source check",
-          title: item.title, selector: `[data-archive-work-item="${item.workItemId}"]` }))[0] || null;
-  const waiting = [
-    ...assignments.filter((assignment) => (assignment.status || "") === "submitted")
-      .map((assignment) => assignment.prophecy || assignment.title || "Claim review"),
-    ...allClaims.filter((claim) => (claim.state || "") === "awaiting_second_review"
-        && !assignments.some((assignment) => (assignment.status || "") !== "submitted"
-          && (assignment.claimId || assignment.claim_id) === (claim.claimId || claim.claim_id)))
-      .map((claim) => claim.title || claim.prophecy || "Claim"),
-  ];
+    ? { label: "Resume your claim review", title: openClaim.prophecy || openClaim.title || "Assigned claim", selector: `[data-assignment-id="${openClaim.assignmentId || openClaim.assignment_id}"]`, auto: true }
+    : readyClaim
+      ? { label: "Open the next finished packet", title: readyClaim.title, selector: `[data-lease-work-item="${readyClaim.workItemId}"]`, auto: true }
+    : matchedArchive
+      ? { label: "Start the next source check — quote already located", title: matchedArchive.title, selector: `[data-archive-work-item="${matchedArchive.workItemId}"]`, auto: false }
+      : null;
+  const waiting = assignments.filter((assignment) => (assignment.status || "") === "submitted")
+    .map((assignment) => assignment.prophecy || assignment.title || "Claim review");
   const recent = (archiveData.assignments || [])
     .filter((assignment) => (assignment.status || assignment.assignment_status) === "submitted")
     .slice(0, 5).map((assignment) => assignment.description || "Source check");
@@ -537,9 +548,9 @@ function renderDashboard({ assignments, allClaims, archiveData, availableArchive
   container.innerHTML = html`<div class="workspace-dashboard">
     <span class="lane-eyebrow">Your reviewer workspace</span>
     <h2>${upNext ? "Ready when you are" : "All caught up"}</h2>
-    <p class="queue-hint">${escapeHtml(String(counts.ready ?? 0))} source checks open (${escapeHtml(String(counts.matched ?? 0))} with the quote located) · ${escapeHtml(String(assignments.filter((a) => (a.status || "") !== "submitted").length))} claim${assignments.filter((a) => (a.status || "") !== "submitted").length === 1 ? "" : "s"} open for you · ${escapeHtml(String([...new Set(waiting)].length))} waiting on your reviewing partner.</p>
-    ${upNext ? html`<section class="method-step"><h3>Up next</h3><p><strong>${escapeHtml(String(upNext.title).slice(0, 110))}</strong></p><button class="button-link" type="button" data-dashboard-open="${escapeHtml(upNext.selector)}">${escapeHtml(upNext.label)}</button></section>` : ""}
-    ${waiting.length ? html`<section class="method-step"><h3>Waiting on your reviewing partner — you are not blocked</h3><p>Your review is already in on ${waiting.length === 1 ? "this item" : "these items"}. Each publishes only if the second, blind review matches; there is nothing more for you to do here.</p><ul>${[...new Set(waiting)].map((title) => `<li>${escapeHtml(String(title).slice(0, 100))}</li>`).join("")}</ul></section>` : ""}
+    <p class="queue-hint">${escapeHtml(String((allClaims || []).filter((item) => item.state === "ready").length))} finished packet${(allClaims || []).filter((item) => item.state === "ready").length === 1 ? "" : "s"} ready to accept or send back · ${escapeHtml(String(counts.matched ?? 0))} source check${Number(counts.matched || 0) === 1 ? "" : "s"} with the quote located · ${escapeHtml(String(counts.ready ?? 0))} optional source checks waiting.</p>
+    ${upNext ? html`<section class="method-step"><h3>Up next</h3><p><strong>${escapeHtml(String(upNext.title).slice(0, 110))}</strong></p><button class="button-link" type="button" data-dashboard-open="${escapeHtml(upNext.selector)}" data-dashboard-auto="${upNext.auto ? "true" : "false"}">${escapeHtml(upNext.label)}</button></section>` : ""}
+    ${waiting.length ? html`<section class="method-step"><h3>Your saved decisions</h3><p>These append-only decisions are already recorded under your reviewer identity.</p><ul>${[...new Set(waiting)].map((title) => `<li>${escapeHtml(String(title).slice(0, 100))}</li>`).join("")}</ul></section>` : ""}
     ${recent.length ? html`<section class="method-step"><h3>Your recent decisions</h3><ul>${recent.map((title) => `<li>${escapeHtml(String(title).slice(0, 100))}</li>`).join("")}</ul></section>` : ""}
     <p class="queue-hint">Pick anything else from the list on the left — Pending shows what is open right now.</p>
   </div>`;
@@ -615,14 +626,14 @@ function renderCandidateVerification(bundle, assignmentId) {
       </fieldset>
       <section id="reject-panel" class="reject-panel" hidden>
         <h3>Why should it be discarded?</h3>
-        <label>Clear reason<select name="reasonCode" disabled required><option value="">Choose a reason</option><option value="generic_advice_or_commentary">Generic advice, encouragement, or commentary</option><option value="non_falsifiable">No observable way to prove it true or false</option><option value="missing_essential_context">Who, what, why, where, or when is not stated</option><option value="invented_causality_or_mechanism">A stated reason or mechanism was replaced with an invented one</option><option value="non_observable_mental_state">Depends on an unobservable thought, feeling, or motive</option><option value="invalid_quote">Quotation does not match the source</option><option value="context_changes_meaning">Surrounding context changes the meaning</option><option value="duplicate">Duplicates an existing claim</option><option value="insufficient_source_verification">Original source could not be verified</option></select></label>
+        <label>Clear reason<select name="reasonCode" disabled required><option value="">Choose a reason</option><option value="generic_advice_or_commentary">Generic advice, encouragement, or commentary</option><option value="non_falsifiable">No observable way to prove it true or false</option><option value="missing_essential_context">Who, what, where, or when is not stated</option><option value="current_events_dressed_as_prophecy">Current events dressed as prophecy, or already public news</option><option value="invented_causality_or_mechanism">A stated reason or mechanism was replaced with an invented one</option><option value="non_observable_mental_state">Depends on an unobservable thought, feeling, or motive</option><option value="invalid_quote">Quotation does not match the source</option><option value="context_changes_meaning">Surrounding context changes the meaning</option><option value="duplicate">Duplicates an existing claim</option><option value="insufficient_source_verification">Original source could not be verified</option></select></label>
       </section>
       <section id="promotion-panel" class="promotion-panel" hidden>
         <header><span>Promotion lock</span><h3>Build the claim only from the source</h3><p>Fill every required field with what the speaker or surrounding source explicitly states. “Not stated” blocks essential fields. How may remain open, but never infer it.</p></header>
         <fieldset><legend>Source checks</legend><label class="checkbox"><input type="checkbox" name="originalSourceVerified" data-promotion-control><span>The quotation matches the original source exactly.</span></label><label class="checkbox"><input type="checkbox" name="contextVerified" data-promotion-control><span>The surrounding context supports this reading without changing its meaning.</span></label><div class="review-field-grid"><label>Human-confirmed exact timestamp<input name="verifiedTimestampSeconds" type="number" min="0" step="1" data-promotion-control><small>Enter whole seconds after opening the original source. The AI locator is approximate.</small></label><label>Surrounding-context note<textarea name="contextNote" rows="3" data-promotion-control placeholder="State what you watched before and after the quote and whether it changes the meaning."></textarea></label></div></fieldset>
         <div class="review-field-grid"><label>Short claim title<input name="title" data-promotion-control placeholder="Plain-language title; do not copy an AI draft"></label><label>Statement type<select name="statementType" data-promotion-control><option value="">Choose only after checking</option><option value="testable_prediction">Testable prediction</option><option value="present_or_past_factual_claim">Present or past factual claim</option><option value="conditional_prediction">Conditional prediction</option></select></label></div>
         <label>Single testable statement<textarea name="atomicProposition" data-promotion-control rows="3" placeholder="One concrete statement that can be proven true or false."></textarea></label>
-        <fieldset class="claim-elements"><legend>Who, what, why, where, when, and optional how</legend><p class="field-guidance">Who, what, why, where, and when need exact source support. How may be left blank and recorded as “not stated / mechanism remains open.” If a mechanism is stated, copy its exact support so it can be tested separately.</p>${claimElementFields()}</fieldset>
+        <fieldset class="claim-elements"><legend>Who, what, where, when, and optional why / how</legend><p class="field-guidance">Who, what, where, and when need exact source support. Why and How may be left blank when the speaker does not state them.</p>${claimElementFields()}</fieldset>
         <label>Bounded deadline<input name="deadline" data-promotion-control type="date"><small>Required for predictions. The source must ground the time window.</small></label>
         <fieldset class="evidence-test"><legend>Concrete public evidence test</legend><p class="field-guidance">Name public, observable evidence that can resolve the statement in either direction.</p>
           <label>Public evidence to check<textarea name="publicEvidence" data-promotion-control rows="3" placeholder="Name the public record, event, result, or measurement."></textarea></label><label>Source words supporting that test<textarea name="publicEvidenceSourceBasis" data-promotion-control rows="2" placeholder="Copy the exact quote or context that makes this the right evidence."></textarea></label>
@@ -681,9 +692,12 @@ function renderCandidateVerification(bundle, assignmentId) {
       && groundedText(values.rationale) && String(values.rationale).trim().length >= 10;
     const promoteReady = decision === "promote" && readiness.ok;
     submit.disabled = !rejectReady && !promoteReady;
+    const missingHint = promotionMode && !readiness.ok && readiness.missing.length
+      ? `Still needed: ${readiness.missing[0]}${readiness.missing.length > 1 ? ` (+${readiness.missing.length - 1} more)` : ""}`
+      : "";
     submit.textContent = rejectReady ? "Append discard decision"
-      : promoteReady ? "Append promotion decision" : promotionMode
-        ? "Complete every required field, then choose Promote" : "Choose discard or check promotion";
+      : promoteReady ? "Append promotion decision" : missingHint || (promotionMode
+        ? "Complete every required field, then choose Promote" : "Choose discard or check promotion");
   };
   startPromotion.addEventListener("click", () => {
     promotionMode = true;
@@ -701,6 +715,31 @@ const OUTCOME_LABELS = {
   pending: "Still pending", undetermined: "Undetermined", not_falsifiable: "Cannot be tested",
 };
 
+function displayDate(value) {
+  const date = new Date(value);
+  return Number.isNaN(date.getTime()) ? String(value || "Date not recorded") : date.toLocaleString();
+}
+
+function savedDecisionMarkup(decision, claim, reviewerName) {
+  const published = claim.visibility === "published";
+  const heading = decision.sendbackRecorded ? "Sent back for research"
+    : published ? "Published" : "Decision saved";
+  return html`<section class="workspace-receipt saved-decision" aria-labelledby="saved-decision-title">
+    <span>SAVED HUMAN DECISION</span>
+    <h3 id="saved-decision-title">${heading}</h3>
+    <p><strong>Decision owner:</strong> ${escapeHtml(reviewerName || "Verified reviewer")}</p>
+    <p><strong>Outcome:</strong> ${escapeHtml(OUTCOME_LABELS[decision.outcomeStatus] || decision.outcomeStatus)}</p>
+    <p><strong>Your rationale:</strong> ${escapeHtml(decision.rationale || "No rationale was stored.")}</p>
+    <p><strong>Saved:</strong> ${escapeHtml(displayDate(decision.decidedAt))}</p>
+    <p><strong>Receipt:</strong> <code>${escapeHtml(decision.reviewId)}</code></p>
+    <p>${decision.sendbackRecorded
+      ? "Your decision is preserved and the claim is waiting for a new adversarial research pass."
+      : published
+        ? "Your decision is public under your reviewer name. No second reviewer is required."
+        : "Your decision is preserved and publication reconciliation is finishing."}</p>
+  </section>`;
+}
+
 function renderClaimAdjudication(bundle, assignmentId) {
   const container = document.querySelector("#review-private");
   const claim = bundle.subject || bundle.claim || {};
@@ -709,6 +748,8 @@ function renderClaimAdjudication(bundle, assignmentId) {
   const evidence = Array.isArray(bundle.evidence) ? bundle.evidence : [];
   const receipts = Array.isArray(bundle.priorInformationReceipts) ? bundle.priorInformationReceipts
     : Array.isArray(bundle.receipts) ? bundle.receipts : [];
+  const ownDecision = bundle.reviewState?.ownDecision || null;
+  const reviewerName = bundle.principal?.publicReviewerName || activeReviewerPrincipal?.publicReviewerName;
   const verifiedSeconds = claim.source_timestamp_seconds ?? claim.sourceTimestampSeconds ?? null;
   const verifiedOriginal = evidence.some((item) => (item.evidence_role || item.evidenceRole) === "original_statement"
     && ((item.verification_method || item.verificationMethod) === "authorized_transcript"
@@ -727,9 +768,9 @@ function renderClaimAdjudication(bundle, assignmentId) {
     ${sourceGrounding(candidateDecisionFields)}
     <p class="warning">${escapeHtml(sourceVerificationNote)}</p>
     <section class="ai-research" aria-labelledby="ai-research-title"><span class="lane-eyebrow">What the AI found</span><h3 id="ai-research-title">Research collected for this claim</h3><p>Every item links to its source. The lanes stay separate: prior information, independent outcome, and the speaker's own account, which is never proof.</p>${evidenceLanes(evidence)}</section>
-    ${draft ? `<section class="ai-draft-card" aria-labelledby="ai-draft-title"><span class="lane-eyebrow">Pending AI decision · needs human review</span><h3 id="ai-draft-title">${escapeHtml(OUTCOME_LABELS[draft.outcomeStatus] || draft.outcomeStatus)}</h3><p>${escapeHtml(draft.reasoning)}</p><p class="draft-provenance">AI-drafted from the research above. It carries no weight until two independent humans decide.</p></section>` : `<aside class="load-warning" role="status"><strong>No pending AI decision.</strong><p>This claim has no AI draft yet, so it cannot be decided in the simple flow.</p></aside>`}
+    ${draft ? `<section class="ai-draft-card" aria-labelledby="ai-draft-title"><span class="lane-eyebrow">Adversarial AI consensus · ${ownDecision ? "reviewed" : "needs a human decision"}</span><h3 id="ai-draft-title">${escapeHtml(OUTCOME_LABELS[draft.outcomeStatus] || draft.outcomeStatus)}</h3><p>${escapeHtml(draft.reasoning)}</p><p class="draft-provenance">${ownDecision ? "This is the AI draft that informed your saved decision below." : "AI models researched, challenged, and reconciled this draft. It carries no public weight until you decide."}</p></section>` : `<aside class="load-warning" role="status"><strong>No pending AI decision.</strong><p>This claim has no AI draft yet, so it cannot be decided in the simple flow.</p></aside>`}
     ${claimFeedbackMarkup(claim.claim_id || claim.claimId || "")}
-    <form id="review-form" class="review-form">
+    ${ownDecision ? savedDecisionMarkup(ownDecision, claim, reviewerName) : `<form id="review-form" class="review-form">
       ${draft ? `<fieldset class="verdict-choice"><legend>Your decision</legend>
       <label class="decision-option"><input type="radio" name="verdict" value="agree" required><span><strong>Accept the verdict</strong><small>The AI-verified evidence supports the pending decision: ${escapeHtml(OUTCOME_LABELS[draft.outcomeStatus] || draft.outcomeStatus)}.</small></span></label>
       <label class="decision-option"><input type="radio" name="verdict" value="disagree"><span><strong>Send it back</strong><small>The evidence is wrong, incomplete, or supports a different outcome — record why. That rejection becomes a research lesson and the claim returns for another pass.</small></span></label>
@@ -739,22 +780,25 @@ function renderClaimAdjudication(bundle, assignmentId) {
         ["pending", "Still pending"], ["undetermined", "Undetermined"], ["not_falsifiable", "Cannot be tested"],
       ])}</select></label>` : ""}
       <label>Why, in your words<textarea name="rationale" required minlength="10" rows="4" placeholder="One or two sentences. What in the evidence decides it?"></textarea></label>
-      <p class="blind-note">Publishes only when a second reviewer, working blind, also accepts. Sending it back publishes nothing and records your reasons for the next research pass.</p>
-      <button type="submit" ${draft ? "" : "disabled"}>Submit my decision</button><p id="review-status" class="form-status" role="status" aria-live="polite"></p>
-    </form></section>`;
+      ${(bundle.principal?.needsPublicName ?? activeReviewerPrincipal?.needsPublicName) ? `<label>Public reviewer name<input name="publicReviewerName" required minlength="2" maxlength="80" autocomplete="name" placeholder="Joshua"><small>This name appears with every decision you own. Your sign-in credentials stay private.</small></label>` : `<p class="blind-note"><strong>Decision owner:</strong> ${escapeHtml(bundle.principal?.publicReviewerName || activeReviewerPrincipal?.publicReviewerName || "Verified reviewer")}</p>`}
+      <p class="blind-note">Accepting publishes your decision immediately. Sending it back publishes nothing, saves your reasons, and starts another adversarial research pass.</p>
+      <button type="submit" ${draft ? "" : "disabled"}>Save my decision</button><p id="review-status" class="form-status" role="status" aria-live="polite"></p>
+    </form>`}</section>`;
   const form = document.querySelector("#review-form");
-  form.addEventListener("submit", (event) => submitReview(event, assignmentId));
-  const disagreePanel = form.querySelector("#disagree-outcome");
-  const updateVerdict = () => {
-    const disagreeing = form.querySelector('input[name="verdict"][value="disagree"]')?.checked;
-    if (disagreePanel) {
-      disagreePanel.hidden = !disagreeing;
-      form.disagreeOutcome.disabled = !disagreeing;
-      form.disagreeOutcome.required = Boolean(disagreeing);
-    }
-  };
-  form.addEventListener("change", updateVerdict);
-  updateVerdict();
+  if (form) {
+    form.addEventListener("submit", (event) => submitReview(event, assignmentId));
+    const disagreePanel = form.querySelector("#disagree-outcome");
+    const updateVerdict = () => {
+      const disagreeing = form.querySelector('input[name="verdict"][value="disagree"]')?.checked;
+      if (disagreePanel) {
+        disagreePanel.hidden = !disagreeing;
+        form.disagreeOutcome.disabled = !disagreeing;
+        form.disagreeOutcome.required = Boolean(disagreeing);
+      }
+    };
+    form.addEventListener("change", updateVerdict);
+    updateVerdict();
+  }
   bindClaimFeedbackThread(claim.claim_id || claim.claimId || "", assignmentId);
 }
 
@@ -798,8 +842,8 @@ function decisionReceiptHtml({ sendingBack, result, rationale, hasNext = false }
   const reviewId = result.reviewId || "(missing)";
   const sendback = result.sendbackRecorded ? "yes — research will re-run with your lesson" : "no";
   const acceptMsg = published
-    ? "Your acceptance matched an independent second review. This claim is now published. You will not see the other reviewer’s rationale (blinded)."
-    : "Your acceptance is stored. Publication still needs a matching independent second review. You will not see another reviewer’s rationale (blinded).";
+    ? "Your authenticated human decision is now published under your public reviewer name."
+    : "Your authenticated human decision is stored and the publication reconciler is finishing.";
   return html`<div class="workspace-receipt" role="status">
     <span>OK</span>
     <h2>${sendingBack ? "Sent back for research" : (published ? "Published" : "Decision recorded")}</h2>
@@ -808,12 +852,12 @@ function decisionReceiptHtml({ sendingBack, result, rationale, hasNext = false }
     <p><strong>Research send-back recorded:</strong> ${escapeHtml(sendback)}</p>
     <p><strong>Your rationale:</strong> ${escapeHtml(String(rationale || "").slice(0, 400))}</p>
     <p>${sendingBack
-      ? "Your rejection is stored as an append-only research lesson. A new AI draft will return to the queue after research. You will not see another reviewer’s rationale (blinded)."
+      ? "Your rejection is stored as an append-only research lesson owned by you. A new adversarial AI draft will return after re-research."
       : acceptMsg}</p>
     <p class="form-status" id="receipt-advance-status">${hasNext
-      ? "A next case is ready. Stay here until you have copied the review id if you need it."
+      ? "The next case opens automatically in a moment."
       : "No other open case is waiting right now. Fresh drafts return after the research pass."}</p>
-    ${hasNext ? `<p><button type="button" class="button-link" id="receipt-open-next">Open next case</button></p>` : ""}
+    ${hasNext ? `<p><button type="button" class="button-link" id="receipt-open-next">Open next now</button> <button type="button" id="receipt-stay">Stay on this receipt</button></p>` : ""}
   </div>`;
 }
 
@@ -824,6 +868,7 @@ async function submitReview(event, claimId) {
   const button = form.querySelector("button[type='submit']");
   const data = new FormData(form);
   const body = { workType: "claim_adjudication", verdict: data.get("verdict"), rationale: data.get("rationale") };
+  if (data.get("publicReviewerName")) body.publicReviewerName = data.get("publicReviewerName");
   if (body.verdict === "disagree") body.disagreeOutcome = data.get("disagreeOutcome");
   const sendingBack = body.verdict === "disagree";
   status.textContent = sendingBack ? "Sending it back for research…" : "Recording your acceptance…";
@@ -864,6 +909,14 @@ async function submitReview(event, claimId) {
           if (statusEl) statusEl.textContent = "That next case is no longer open. Pick one from Your active work.";
         }
       });
+      if (next) {
+        const advance = setTimeout(() => panel.querySelector("#receipt-open-next")?.click(), 2500);
+        panel.querySelector("#receipt-stay")?.addEventListener("click", () => {
+          clearTimeout(advance);
+          const statusEl = panel.querySelector("#receipt-advance-status");
+          if (statusEl) statusEl.textContent = "Receipt held. Use Open next now when you are ready.";
+        });
+      }
     }
   } catch (error) {
     status.classList.remove("success");

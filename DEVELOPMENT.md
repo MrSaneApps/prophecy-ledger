@@ -349,3 +349,22 @@ quotations or source material, private transcripts, raw model output, reviewer
 records, database dumps, or Prophecy Ledger/SaneApps branding. Keep those private
 materials and all maintainer-only `.codex/`, handoff, and generated-output state
 out of Git. See `README.md` and `LICENSE` for the public distribution boundary.
+
+## One-human decision and adversarial AI gate
+
+One authenticated reviewer owns each final claim decision. An accepted review
+publishes immediately after the ordinary source, evidence, novelty, and frozen-
+draft gates pass. A send-back is append-only, cannot publish, and requires a
+newer AI draft before another human decision can become eligible. The reviewer
+chooses a public display name once; public projections show that name and the
+review rationale without exposing the credential-derived reviewer identifier.
+
+Research remains machine-only until that human decision. The canonical worker
+can ask Cloudflare-hosted Nemotron to challenge the primary draft and use
+Cloudflare-hosted Qwen as the deciding AI check. This lane is disabled before
+network access unless `RESEARCH_CLOUDFLARE_ADVERSARIAL_ENABLED=1` is deliberately
+configured after an account-wide billing review. A D1 reservation is made before
+each enabled inference. The trigger caps reservations at 7,800 neurons per UTC
+day, below Cloudflare's 10,000-neuron free daily allocation; failed calls and
+retries retain their reservations. Disabled, exhausted, or incomplete work fails
+closed to manual research and never authorizes paid overflow.

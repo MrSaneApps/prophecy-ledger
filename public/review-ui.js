@@ -13,7 +13,7 @@ export function options(items) {
 const CLAIM_ELEMENTS = [
   ["who", "Who", "Name the person, group, institution, or place affected.", true],
   ["what", "What", "State the observable event or condition being claimed.", true],
-  ["why", "Why", "Use only the reason the speaker explicitly gave.", true],
+  ["why", "Why (if stated)", "Use only the reason the speaker explicitly gave, or leave blank.", false],
   ["where", "Where", "State the location or scope named in the source.", true],
   ["when", "When", "State the time window or source-grounded timing.", true],
   ["how", "How (if stated)", "Enter the speaker-stated mechanism, or leave blank when it remains open.", false],
@@ -51,6 +51,10 @@ export function promotionReadiness(values) {
   if (groundedText(how) && !groundedText(values.howSourceBasis)) {
     missing.push("how source words");
   }
+  const why = String(values.why ?? "").trim();
+  if (groundedText(why) && !groundedText(values.whySourceBasis)) {
+    missing.push("why source words");
+  }
   if (values.statementType && values.statementType !== "present_or_past_factual_claim"
       && !groundedText(values.deadline)) missing.push("bounded deadline");
   return { ok: missing.length === 0, missing };
@@ -64,6 +68,10 @@ export function candidateDecisionPayload(values) {
   if (!groundedText(body.how)) {
     body.how = "not stated";
     body.howSourceBasis = "";
+  }
+  if (!groundedText(body.why)) {
+    body.why = "not stated";
+    body.whySourceBasis = "";
   }
   body.claimElements = Object.fromEntries(CLAIM_ELEMENTS.map(([key]) => [key, {
     value: String(body[key] || "").trim(),

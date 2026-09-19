@@ -1,2 +1,5 @@
 User-agent: *
-Disallow: /
+Allow: /
+Disallow: /review
+Disallow: /api/
+Sitemap: https://prophecy-ledger.pages.dev/sitemap.xml

@@ -3,7 +3,7 @@ const html = String.raw;
 const CLAIM_ELEMENTS = [
   ["who", "Who", "Name the person, group, institution, or place affected.", true],
   ["what", "What", "State the observable event or condition being claimed.", true],
-  ["why", "Why", "Use only the reason the speaker explicitly gave.", true],
+  ["why", "Why (if stated)", "Use only the reason the speaker explicitly gave, or leave blank.", false],
   ["where", "Where", "State the location or scope named in the source.", true],
   ["when", "When", "State the time window or source-grounded timing.", true],
   ["how", "How (if stated)", "Enter the speaker-stated mechanism, or leave blank when it remains open.", false],
@@ -78,6 +78,9 @@ export function archiveDecisionReadiness(values) {
   if (groundedText(values.how) && !groundedText(values.howSourceBasis)) {
     missing.push("how exact source support");
   }
+  if (groundedText(values.why) && !groundedText(values.whySourceBasis)) {
+    missing.push("why exact source support");
+  }
   if (groundedText(values.passConditionNote)
       && values.passConditionNote === values.failConditionNote) {
     missing.push("distinct pass and fail conditions");
@@ -95,6 +98,10 @@ export function archiveDecisionPayload(values) {
   if (!groundedText(body.how)) {
     body.how = "";
     body.howSourceBasis = "";
+  }
+  if (!groundedText(body.why)) {
+    body.why = "";
+    body.whySourceBasis = "";
   }
   return body;
 }
@@ -137,7 +144,20 @@ async function submitArchiveReview(event, assignmentId) {
     }
     status.classList.add("success");
     status.textContent = `Source check saved${id ? ` (${id})` : ""}: ${String(result.decision || result.state || "recorded").replaceAll("_", " ")}. No claim or rating was created.`;
-    // Keep the reviewer on this receipt; do not auto-advance archive work.
+    document.dispatchEvent(new CustomEvent("prophecy-ledger:review-saved"));
+    const next = document.querySelector("#review-queue [data-archive-work-item], #review-queue [data-archive-assignment-id]");
+    if (next) {
+      const openNext = document.createElement("button");
+      openNext.type = "button";
+      openNext.id = "archive-open-next";
+      openNext.textContent = "Open next source check";
+      openNext.addEventListener("click", () => {
+        const again = document.querySelector("#review-queue [data-archive-work-item], #review-queue [data-archive-assignment-id]");
+        if (again) again.click();
+        else status.textContent = "No other source check is waiting. Pick one from Your active work.";
+      });
+      status.insertAdjacentElement("afterend", openNext);
+    }
   } catch (error) {
     status.classList.remove("success");
     status.textContent = error instanceof Error ? error.message : "The source check could not be saved.";
@@ -167,15 +187,17 @@ export function renderArchiveVerification(bundle, assignmentId) {
       <fieldset class="decision-gate"><legend>Decision for this source version</legend><p>This appends a human source-check lead only. It cannot create a claim, promotion, fulfillment rating, or publication.</p>
         <label class="decision-option"><input type="radio" name="decision" value="source_supported"><span><strong>Source supports a testable statement</strong><small>The selected source and context explicitly support Who, What, Why, Where, When, and any stated How.</small></span></label>
         <label class="decision-option"><input type="radio" name="decision" value="archive_mismatch"><span><strong>Archive does not match this source</strong><small>The selected source is available, but its wording or context does not support the retrospective archive entry.</small></span></label>
-        <label class="decision-option"><input type="radio" name="decision" value="not_testable"><span><strong>Source is not testable</strong><small>The source wording is confirmed, but it is generic, non-observable, or lacks an essential Who, What, Why, Where, or When.</small></span></label>
+        <label class="decision-option"><input type="radio" name="decision" value="not_testable"><span><strong>Not testable, or already public news</strong><small>Generic, non-observable, missing Who / What / Where / When, or current events dressed as prophecy. Use this when the “prediction” was already in the news or otherwise predictable.</small></span></label>
         <label class="decision-option"><input type="radio" name="decision" value="source_unavailable"><span><strong>Source is unavailable</strong><small>The assigned original source cannot be checked. Preserve the archive lead without guessing why.</small></span></label>
       </fieldset>
       <fieldset id="archive-source-checks"><legend>Original-source checks</legend><label class="checkbox"><input type="checkbox" name="sourceAvailable"><span>The assigned original source is available.</span></label><label class="checkbox"><input type="checkbox" name="contextVerified"><span>I checked enough surrounding context to preserve the source’s meaning.</span></label><label class="checkbox"><input type="checkbox" name="exactSourceVerified"><span>The archive reading matches the exact words in this source version.</span></label><label class="checkbox"><input type="checkbox" name="testable"><span>This source version states an observable proposition with distinct pass and fail conditions.</span></label></fieldset>
       <section id="archive-source-detail" class="archive-review-panel" hidden><div class="review-field-grid"><label>Exact source quotation<textarea name="exactSourceQuote" rows="4" placeholder="Copy the exact words from this one source version."></textarea></label><label>Timestamp in seconds, if found<input name="sourceTimestampSeconds" type="number" min="0" step="1" placeholder="Optional"></label></div></section>
-      <section id="archive-supported-panel" class="promotion-panel" hidden><header><span>Exact-source grounding</span><h3>Record the testable statement</h3><p>Who, What, Why, Where, and When must have exact support in this source version. How stays open unless the speaker states it.</p></header><fieldset class="claim-elements"><legend>Who, what, why, where, when, and optional how</legend>${archiveClaimElementFields()}</fieldset><fieldset class="evidence-test"><legend>Future independent evidence test</legend><p class="field-guidance">These are reviewer notes about what independent public evidence would later resolve the statement. The speaker’s claimed result and evidence above do not count as independent.</p><label>Public evidence to check<textarea name="publicEvidenceNote" data-archive-supported rows="3"></textarea></label><div class="evidence-test-grid"><label>What would pass<textarea name="passConditionNote" data-archive-supported rows="3"></textarea></label><label>What would fail<textarea name="failConditionNote" data-archive-supported rows="3"></textarea></label></div></fieldset></section>
+      <section id="archive-supported-panel" class="promotion-panel" hidden><header><span>Exact-source grounding</span><h3>Record the testable statement</h3><p>Who, What, Where, and When must have exact support in this source version. Why and How stay open unless the speaker states them.</p></header><fieldset class="claim-elements"><legend>Who, what, where, when, and optional why / how</legend>${archiveClaimElementFields()}</fieldset><fieldset class="evidence-test"><legend>Future independent evidence test</legend><p class="field-guidance">These are reviewer notes about what independent public evidence would later resolve the statement. The speaker’s claimed result and evidence above do not count as independent.</p><label>Public evidence to check<textarea name="publicEvidenceNote" data-archive-supported rows="3"></textarea></label><div class="evidence-test-grid"><label>What would pass<textarea name="passConditionNote" data-archive-supported rows="3"></textarea></label><label>What would fail<textarea name="failConditionNote" data-archive-supported rows="3"></textarea></label></div></fieldset></section>
       <label>Reviewer rationale<textarea name="rationale" required minlength="10" rows="4" placeholder="Explain this decision from the selected source and context only."></textarea></label>
       <div id="archive-decision-lock" class="promotion-lock"><div><strong>Submission is locked.</strong><p>Choose a decision and complete its required source checks.</p></div></div>
-      <button id="archive-submit" type="submit" disabled>Complete the source check</button><p id="review-status" class="form-status" role="status" aria-live="polite"></p>
+      <button id="archive-submit" type="submit" disabled>Complete the source check</button>
+      <p id="archive-missing-hint" class="form-status">Choose a decision first. The button names whatever is still missing.</p>
+      <p id="review-status" class="form-status" role="status" aria-live="polite"></p>
     </form></section>`;
   const form = document.querySelector("#archive-form");
   const sourceDetail = form.querySelector("#archive-source-detail");
@@ -221,9 +243,21 @@ export function renderArchiveVerification(bundle, assignmentId) {
     submit.disabled = !readiness.ok;
     lock.classList.toggle("ready", readiness.ok);
     lock.querySelector("strong").textContent = readiness.ok ? "Ready to append." : "Submission is locked.";
+    const missingText = readiness.missing.join(", ");
     lock.querySelector("p").textContent = readiness.ok
-      ? "Review the selected source once more, then append this source-check decision."
-      : `Still needed: ${readiness.missing.join(", ")}.`;
+      ? "Review the selected source once more, then save this source check."
+      : `Still needed: ${missingText}.`;
+    const hint = form.querySelector("#archive-missing-hint");
+    if (hint) {
+      hint.textContent = readiness.ok
+        ? "All required checks are complete. Save this source check, then open the next one."
+        : (missingText ? `Still needed: ${missingText}.` : "Choose a decision first.");
+    }
+    submit.textContent = readiness.ok
+      ? "Save this source check"
+      : readiness.missing.length
+        ? `Still needed: ${readiness.missing[0]}${readiness.missing.length > 1 ? ` (+${readiness.missing.length - 1} more)` : ""}`
+        : "Complete the source check";
   };
   form.addEventListener("input", update);
   form.addEventListener("change", update);
