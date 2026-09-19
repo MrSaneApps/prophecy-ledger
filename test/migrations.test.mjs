@@ -136,7 +136,7 @@ test("migration chain is contiguous and fresh replay exposes the recovered schem
   const files = readdirSync(join(ROOT, "migrations"))
     .filter((name) => /^\d{4}_.*\.sql$/.test(name)).sort();
   assert.deepEqual(files.map((name) => Number(name.slice(0, 4))),
-    Array.from({ length: 57 }, (_, index) => index + 1));
+    Array.from({ length: 61 }, (_, index) => index + 1));
 
   const env = makeEnv();
   const db = env.DB.db;
@@ -144,13 +144,24 @@ test("migration chain is contiguous and fresh replay exposes the recovered schem
     .all().map((row) => row.name);
   for (const name of ["candidate_atomic_readiness", "archive_transcript_match_checks",
     "archive_post_match_checks", "archive_falsifiability_findings",
-    "reviewer_feedback_claim_links"]) {
+    "reviewer_feedback_claim_links", "reviewer_public_attributions",
+    "workers_ai_neuron_reservations"]) {
     assert.ok(tableNames.includes(name), name);
   }
   assert.equal(db.prepare(
     "SELECT count(*) count FROM sqlite_master WHERE type='view' AND name='reviewer_feedback_effective'"
   ).get().count, 1);
   assert.equal(db.prepare("SELECT count(*) count FROM sqlite_master WHERE name='transcript_search'").get().count, 0);
+
+  db.prepare(`INSERT INTO workers_ai_neuron_reservations
+    (reservation_id,usage_day,claim_id,role,model_name,reserved_neurons,limit_neurons,created_at)
+    VALUES (?,?,?,?,?,?,?,?)`).run("cf_budget_full", "2026-08-16", "southeast-asia-oil-2021",
+    "critic", "@cf/nvidia/nemotron-3-120b-a12b", 7800, 7800, "2026-08-16T01:00:00Z");
+  assert.throws(() => db.prepare(`INSERT INTO workers_ai_neuron_reservations
+    (reservation_id,usage_day,claim_id,role,model_name,reserved_neurons,limit_neurons,created_at)
+    VALUES (?,?,?,?,?,?,?,?)`).run("cf_budget_over", "2026-08-16", "russia-spring-2022",
+    "judge", "@cf/qwen/qwen3-30b-a3b-fp8", 1, 7800, "2026-08-16T01:01:00Z"),
+  /free neuron budget exhausted/);
 
   const reservationSql = db.prepare(
     "SELECT sql FROM sqlite_master WHERE type='table' AND name='gemini_media_reservations'"
