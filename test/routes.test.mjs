@@ -39,7 +39,8 @@ function seedPublicationEvidence(env) {
 const reviewBody = (overrides = {}) => ({
   claimType: "testable_prediction", outcomeStatus: "false", noveltyStatus: "not_assessed",
   baselineProbability: "", priorReceiptId: "", evidenceIds: ["original_verified", "outcome_independent"],
-  rationale: "Literal deadline with verified original and independent outcome evidence.", ...overrides,
+  rationale: "Literal deadline with verified original and independent outcome evidence.",
+  publicReviewerName: "Joshua", ...overrides,
 });
 
 function reviewContext(env, token, assignmentId, { method = "GET", body } = {}) {
@@ -212,6 +213,10 @@ test("public profile exposes neutral catalogue records but no draft verdict fiel
   const russia = body.researchRecords.find((record) => record.id === "russia-spring-2022");
   assert.match(oil.currentEvidenceSummary, /5\.06 million.*4\.86 million/i);
   assert.match(oil.currentEvidenceSummary, /timing wrong/i);
+  assert.equal(oil.headline,
+    "The speaker's own record says the prediction did not happen in 2021");
+  assert.doesNotMatch(JSON.stringify(body.researchRecords),
+    /automated passes|private transcript|atomic claim|Who, What, Why, Where, and When gate|novelty score|resubmitted for a rating|source-supported definition|two independent, verified reviewers/i);
   assert.match(russia.currentEvidenceSummary, /no legal change/i);
   assert.match(russia.priorPublicInformationSummary, /public sources and satellite images/i);
   assert.match(russia.corpusWarning, /selects claims described as fulfilled/i);
@@ -281,7 +286,9 @@ test("draft public API is 404 and reviewer API requires an authenticated princip
   const body = await jsonBody(authenticated);
   assert.equal(body.principal.mode, "local_non_deployable_demo");
   assert.equal("reviewerId" in body.principal, false);
-  assert.deepEqual(body.reviewState, { ownSubmissionRecorded: false, previousDecisionsBlinded: true });
+  assert.deepEqual(body.reviewState, {
+    ownSubmissionRecorded: false, previousDecisionsBlinded: true, ownDecision: null,
+  });
 });
 
 test("archive review routes preserve Access identity, assignment ownership, and work-type binding", async () => {
@@ -365,23 +372,21 @@ test("body-supplied identity is rejected and one credential cannot become two re
   assert.equal(env.DB.db.prepare("SELECT count(*) count FROM moderator_reviews").get().count, 1);
 });
 
-test("two credential-derived matching principals publish one immutable revision", async () => {
+test("one credential-derived named principal publishes one immutable revision", async () => {
   const env = makeEnv({ demo: true });
   seedPublicationEvidence(env);
   const alpha = await assign(env, "alpha-token");
   const first = await reviewPost(reviewContext(env, "alpha-token", alpha.assignmentId, {
     method: "POST", body: { workType: "claim_adjudication", ...reviewBody() },
   }));
-  assert.equal((await jsonBody(first)).publication.state, "awaiting_second_review");
-  const beta = await assign(env, "beta-token");
-  const second = await reviewPost(reviewContext(env, "beta-token", beta.assignmentId, {
-    method: "POST", body: { workType: "claim_adjudication", ...reviewBody() },
-  }));
-  assert.equal((await jsonBody(second)).publication.state, "published");
+  assert.equal((await jsonBody(first)).publication.state, "published");
   const stored = env.DB.db.prepare("SELECT visibility,outcome_status FROM claims WHERE claim_id=?").get(CLAIM_ID);
   assert.equal(stored.visibility, "published");
   assert.equal(stored.outcome_status, "false");
   assert.equal(env.DB.db.prepare("SELECT count(*) count FROM claim_revisions").get().count, 1);
+  assert.equal(env.DB.db.prepare(
+    "SELECT display_name FROM reviewer_public_attributions WHERE reviewer_id='reviewer_alpha'"
+  ).get().display_name, "Joshua");
   env.DB.db.prepare(`INSERT INTO source_items
     (source_item_id,person_id,platform,platform_item_id,canonical_url,first_discovered_at,last_seen_at,availability)
     VALUES (?,?,?,?,?,?,?,?)`).run("source_published_unavailable", "person_troy_black", "youtube", VIDEO_ID,
@@ -398,6 +403,14 @@ test("two credential-derived matching principals publish one immutable revision"
     url: "https://example.test/api/people/troy-black", params: { slug: "troy-black" },
   })));
   assert.ok(publicProfile.claims.some((claim) => claim.claim_id === CLAIM_ID));
+  const decidedRecord = publicProfile.researchRecords.find((record) => record.id === CLAIM_ID);
+  assert.equal(decidedRecord.humanDecision.reviewerName, "Joshua");
+  assert.equal(decidedRecord.humanDecision.outcomeStatus, "false");
+  assert.equal(decidedRecord.humanDecision.rationale,
+    "Literal deadline with verified original and independent outcome evidence.");
+  assert.ok(decidedRecord.humanDecision.decidedAt);
+  assert.deepEqual(decidedRecord.missingGates, []);
+  assert.equal(decidedRecord.exactTimestampSeconds, null);
   assert.doesNotMatch(JSON.stringify(publishedSource), /reviewer|rationale|transcript|model/i);
   assert.throws(() => env.DB.db.prepare("UPDATE claims SET title='changed' WHERE claim_id=?").run(CLAIM_ID), /immutable revision/);
   assert.throws(() => env.DB.db.prepare("DELETE FROM claims WHERE claim_id=?").run(CLAIM_ID), /cannot be deleted/);

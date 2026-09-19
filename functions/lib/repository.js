@@ -5,6 +5,24 @@ async function all(statement) {
   return result.results || [];
 }
 
+function publicLanguage(value) {
+  if (value == null) return value;
+  return String(value)
+    .replace("Source found; the archive says the timing was wrong",
+      "The speaker's own record says the prediction did not happen in 2021")
+    .replace(/two independent automated passes/gi, "two independent checks")
+    .replace(/two automated passes/gi, "two independent checks")
+    .replace(/saved private transcript/gi, "saved transcript")
+    .replace(/fully testable atomic claim/gi, "clear claim that can be fairly tested")
+    .replace(/current Who, What, Why, Where, and When gate/gi,
+      "basic details needed for a fair test")
+    .replace(/novelty score/gi, "judgment about whether it was already public")
+    .replace(/resubmitted for a rating/gi, "reviewed again")
+    .replace(/source-supported definition/gi, "clear definition supported by the original words")
+    .replace(/Get matching decisions from two independent, verified reviewers(?: before any final public rating)?/gi,
+      "Get one named human reviewer to make and publish the final decision");
+}
+
 export async function getPersonProfile(db, slug, asOf = new Date().toISOString().slice(0, 10)) {
   const person = await db.prepare(
     `SELECT person_id,slug,display_name,corpus_label,corpus_start,corpus_end,
@@ -22,13 +40,35 @@ export async function getPersonProfile(db, slug, asOf = new Date().toISOString()
       baseline_probability,publication_summary,visibility
      FROM claims WHERE person_id=?1 AND visibility='published' ORDER BY source_date,claim_id`
   ).bind(person.person_id));
+  const decisionRows = await all(db.prepare(
+    `SELECT revision.claim_id,attribution.display_name reviewer_name,
+      review.outcome_status,review.rationale,review.created_at
+     FROM claim_revisions revision
+     JOIN moderator_reviews review ON review.claim_id=revision.claim_id
+       AND EXISTS (SELECT 1 FROM json_each(revision.actor_ids_json) actor
+         WHERE actor.value=review.reviewer_id)
+     JOIN reviewer_public_attributions attribution
+       ON attribution.reviewer_id=review.reviewer_id
+      AND NOT EXISTS (SELECT 1 FROM reviewer_public_attributions newer
+        WHERE newer.reviewer_id=attribution.reviewer_id
+          AND (newer.created_at>attribution.created_at OR
+            (newer.created_at=attribution.created_at AND newer.attribution_id>attribution.attribution_id)))
+     WHERE revision.revision_type='publication'
+       AND revision.claim_id IN (SELECT claim_id FROM claims WHERE person_id=?1)
+     ORDER BY review.created_at,review.review_id`
+  ).bind(person.person_id));
+  const decisionByClaim = new Map(decisionRows.map((row) => [row.claim_id, {
+    reviewerName: row.reviewer_name, outcomeStatus: row.outcome_status,
+    rationale: row.rationale, decidedAt: row.created_at,
+  }]));
+  for (const claim of claims) claim.humanDecision = decisionByClaim.get(claim.claim_id) || null;
   const catalogueRecords = await all(db.prepare(
     `SELECT claim_id,title,source_url,source_date,statement_type,lifecycle_status,
       CASE WHEN visibility='published' THEN 'published' ELSE 'provisional_not_adjudicated' END AS record_status
      FROM claims WHERE person_id=?1 ORDER BY source_date,claim_id`
   ).bind(person.person_id));
   const researchRows = await all(db.prepare(
-    `SELECT c.claim_id,c.title,c.exact_quote,c.source_url,c.source_date,c.statement_type,
+    `SELECT c.claim_id,c.title,c.exact_quote,c.source_url,c.source_date,c.source_timestamp_seconds,c.statement_type,
       b.quotation_source_url,b.headline,b.evidence_strength,b.test_framing,
       b.evidence_summary,b.prior_information_summary,b.corpus_warning,
       b.missing_gates_json,b.research_status,b.as_of_date,b.revision_number
@@ -62,7 +102,7 @@ export async function getPersonProfile(db, slug, asOf = new Date().toISOString()
       title: reference.title,
       url: reference.url,
       publishedAt: reference.published_at,
-      note: reference.note,
+      note: publicLanguage(reference.note),
     });
     referencesByClaim.set(reference.claim_id, claimReferences);
   }
@@ -71,23 +111,38 @@ export async function getPersonProfile(db, slug, asOf = new Date().toISOString()
     title: record.title,
     exactArchivedQuote: record.exact_quote,
     sourceDate: record.source_date,
+    exactTimestampSeconds: record.source_timestamp_seconds,
     originalSourceUrl: record.source_url,
     quotationSourceUrl: record.quotation_source_url,
     statementType: record.statement_type,
-    headline: record.headline,
+    headline: publicLanguage(record.headline),
     evidenceStrength: record.evidence_strength,
-    testFraming: record.test_framing,
-    currentEvidenceSummary: record.evidence_summary,
-    priorPublicInformationSummary: record.prior_information_summary,
-    corpusWarning: record.corpus_warning,
-    missingGates: JSON.parse(record.missing_gates_json),
+    testFraming: publicLanguage(record.test_framing),
+    currentEvidenceSummary: publicLanguage(record.evidence_summary),
+    priorPublicInformationSummary: publicLanguage(record.prior_information_summary),
+    corpusWarning: publicLanguage(record.corpus_warning),
+    missingGates: decisionByClaim.has(record.claim_id) ? []
+      : JSON.parse(record.missing_gates_json).map(publicLanguage),
     researchStatus: record.research_status,
-    finalAdjudicationStatus: "not_adjudicated",
+    finalAdjudicationStatus: decisionByClaim.has(record.claim_id) ? "published" : "not_adjudicated",
+    humanDecision: decisionByClaim.get(record.claim_id) || null,
     asOf: record.as_of_date,
     revision: record.revision_number,
     supportingReferences: referencesByClaim.get(record.claim_id) || [],
   }));
   const corpusCoverage = await getCorpusCoverage(db, person.person_id);
+  let archiveCatalog = [];
+  try {
+    archiveCatalog = await all(db.prepare(
+      `SELECT revision.description_text AS title, revision.date_shared_text AS dateShared
+       FROM first_party_archive_lead_revisions revision
+       JOIN first_party_archive_leads lead ON lead.archive_lead_id=revision.archive_lead_id
+       WHERE lead.person_id=?1
+       ORDER BY revision.date_shared_text, revision.description_text, revision.archive_revision_id`
+    ).bind(person.person_id));
+  } catch (error) {
+    if (!ingestionTablesMissing(error)) throw error;
+  }
   return {
     asOf,
     person: {
@@ -98,6 +153,7 @@ export async function getPersonProfile(db, slug, asOf = new Date().toISOString()
     completeness: person.corpus_label,
     sources,
     catalogueRecords,
+    archiveCatalog,
     researchRecords,
     corpusCoverage,
     claims,
@@ -132,6 +188,22 @@ export async function getPublicClaim(db, claimId) {
      WHERE claim_id=?1 AND event_type IN ('published','source_unavailable')
      ORDER BY created_at,event_id`
   ).bind(claimId));
+  const humanDecision = await db.prepare(
+    `SELECT attribution.display_name reviewer_name,review.outcome_status,
+      review.rationale,review.created_at
+     FROM claim_revisions revision
+     JOIN moderator_reviews review ON review.claim_id=revision.claim_id
+       AND EXISTS (SELECT 1 FROM json_each(revision.actor_ids_json) actor
+         WHERE actor.value=review.reviewer_id)
+     JOIN reviewer_public_attributions attribution
+       ON attribution.reviewer_id=review.reviewer_id
+      AND NOT EXISTS (SELECT 1 FROM reviewer_public_attributions newer
+        WHERE newer.reviewer_id=attribution.reviewer_id
+          AND (newer.created_at>attribution.created_at OR
+            (newer.created_at=attribution.created_at AND newer.attribution_id>attribution.attribution_id)))
+     WHERE revision.claim_id=?1 AND revision.revision_type='publication'
+     ORDER BY review.created_at DESC,review.review_id DESC LIMIT 1`
+  ).bind(claimId).first();
   return {
     asOf: claim.as_of_date,
     claim,
@@ -142,7 +214,11 @@ export async function getPublicClaim(db, claimId) {
       priorInformation: evidence.filter((item) => item.evidence_role === "contemporaneous_public_information"),
     },
     timeline: events,
-    publication: { requiresTwoMatchingHumanReviews: true, summary: claim.publication_summary },
+    publication: { requiresOneNamedHumanDecision: true, summary: claim.publication_summary,
+      humanDecision: humanDecision ? {
+        reviewerName: humanDecision.reviewer_name, outcomeStatus: humanDecision.outcome_status,
+        rationale: humanDecision.rationale, decidedAt: humanDecision.created_at,
+      } : null },
   };
 }
 

@@ -45,7 +45,7 @@ function reportProfile(overrides = {}) {
       currentEvidenceSummary: "Independent evidence supports a factual research summary.",
       priorPublicInformationSummary: "Contemporaneous reporting existed before the claim.",
       corpusWarning: "The archive is outcome-selected and incomplete.",
-      missingGates: ["Verify original context.", "Obtain two matching human reviews."],
+      missingGates: ["Verify original context.", "Obtain one named human decision."],
       researchStatus: "provisional_research", finalAdjudicationStatus: "not_adjudicated",
       asOf: "2026-07-19",
       supportingReferences: [{
@@ -102,6 +102,22 @@ test("report model makes working evidence useful without converting it to a verd
   assert.equal(model.research[0].supportingReferences[0].role, "independent_outcome");
   assert.equal(model.metrics.provisionalBriefs, 1);
   assert.equal(model.metrics.publishedFindings, 0);
+  assert.equal(model.metrics.publishedDecisions, 0);
+  assert.equal(model.corpusLabel, "Early review: only selected claims have been checked.");
+});
+
+test("report model shows a named final decision without stale pending gates", () => {
+  const profile = reportProfile();
+  profile.researchRecords[0].humanDecision = {
+    reviewerName: "Joshua", outcomeStatus: "false",
+    rationale: "The documented deadline passed without the stated outcome.",
+    decidedAt: "2026-08-15T18:22:10.000Z",
+  };
+  profile.researchRecords[0].finalAdjudicationStatus = "published";
+  const model = buildProfileReportModel(profile);
+  assert.deepEqual(model.research[0].humanDecision, profile.researchRecords[0].humanDecision);
+  assert.deepEqual(model.research[0].missingGates, []);
+  assert.equal(model.metrics.publishedDecisions, 1);
 });
 
 test("report model keeps the six public coverage counts separate from scoring", () => {
@@ -148,7 +164,7 @@ test("published report findings survive a later unavailable-source fact without 
     claims: [{ claim_id: "preserved", title: "Preserved finding", exact_quote: "Archived exact words",
       source_url: "https://example.test/original", source_date: "2020-01-01",
       statement_type: "testable_prediction", novelty_status: "not_assessed", visibility: "published",
-      outcome_status: "false", publication_summary: "Two matching human reviews published this finding." }],
+      outcome_status: "false", publication_summary: "One named human reviewer published this finding." }],
     transcript_body: "private transcript", reviewer_notes: "private rationale",
   }));
   assert.deepEqual(model.findings.map((finding) => finding.id), ["preserved"]);

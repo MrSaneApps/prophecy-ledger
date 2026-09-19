@@ -1,6 +1,6 @@
 import { resolveReviewerPrincipal } from "../../../lib/reviewer-auth.js";
 import {
-  leaseArchiveReviewWork, listArchiveReviewerAssignments, switchArchiveLease,
+  listArchiveReviewerAssignments, switchArchiveLease,
 } from "../../../lib/archive-review-workflow.js";
 import { ReviewWorkflowError } from "../../../lib/review-workflow.js";
 import { apiError, json, readJson } from "../../../lib/response.js";
@@ -87,7 +87,6 @@ export async function onRequestGet({ request, env }) {
   const principal = await resolveReviewerPrincipal(request, env);
   if (!principal) return apiError("Not found.", "not_found", 404);
   try {
-    await leaseArchiveReviewWork(env.DB, principal.reviewerId, env);
     const assignments = await listArchiveReviewerAssignments(env.DB, principal.reviewerId);
     const available = await listAvailableArchiveWork(env.DB, principal.reviewerId);
     const counts = await archiveCounts(env.DB);

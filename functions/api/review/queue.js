@@ -1,11 +1,11 @@
 import { resolveReviewerPrincipal } from "../../lib/reviewer-auth.js";
 import {
-  leaseReviewWork, listReviewerAssignments, reconcileNeededPublications, recordReviewAudit,
+  getReviewerPublicName, leaseReviewWork, listReviewerAssignments, reconcileNeededPublications, recordReviewAudit,
   ReviewWorkflowError, switchLease,
 } from "../../lib/review-workflow.js";
 import { readJson } from "../../lib/response.js";
 import {
-  leaseArchiveReviewWork, listArchiveReviewerAssignments,
+  listArchiveReviewerAssignments,
 } from "../../lib/archive-review-workflow.js";
 import { apiError, json } from "../../lib/response.js";
 
@@ -62,23 +62,24 @@ export async function onRequestGet({ request, env }) {
     // Prefer claim/candidate review work. Archive must never take down the queue.
     try { await leaseReviewWork(env.DB, principal.reviewerId, env); }
     catch (error) { console.error("review_queue_lease_failed", error); }
-    try { await leaseArchiveReviewWork(env.DB, principal.reviewerId, env); }
-    catch (error) { console.error("review_queue_archive_lease_failed", error); }
     let archiveAssignments = [];
     let standardAssignments = [];
     try { standardAssignments = await listReviewerAssignments(env.DB, principal.reviewerId); }
     catch (error) { console.error("review_queue_list_failed", error); throw error; }
     try { archiveAssignments = await listArchiveReviewerAssignments(env.DB, principal.reviewerId); }
     catch (error) { console.error("review_queue_archive_list_failed", error); }
-    const assignments = [...archiveAssignments, ...standardAssignments].sort((left, right) => {
+    const workOrder = { claim_adjudication: 0, candidate_verification: 1, archive_lead_verification: 2 };
+    const assignments = [...standardAssignments, ...archiveAssignments].sort((left, right) => {
       if (left.status !== right.status) return left.status === "leased" ? -1 : 1;
-      if (left.workType !== right.workType) {
-        return left.workType === "archive_lead_verification" ? -1 : 1;
-      }
+      const leftOrder = workOrder[left.workType] ?? 9;
+      const rightOrder = workOrder[right.workType] ?? 9;
+      if (leftOrder !== rightOrder) return leftOrder - rightOrder;
       return String(left.assignmentId).localeCompare(String(right.assignmentId));
     });
+    const publicReviewerName = await getReviewerPublicName(env.DB, principal.reviewerId);
     return json({
-      principal: { mode: principal.mode, demo: principal.mode === "local_non_deployable_demo" },
+      principal: { mode: principal.mode, demo: principal.mode === "local_non_deployable_demo",
+        publicReviewerName, needsPublicName: !publicReviewerName },
       assignments,
     });
   } catch (error) {

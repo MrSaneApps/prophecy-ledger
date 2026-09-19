@@ -181,7 +181,7 @@ export class Composer {
   }
 
   quote(value) {
-    this.panel("Exact words in the archive", `"${ascii(value)}"`, {
+    this.panel("The speaker's exact words", `"${ascii(value)}"`, {
       bodyFont: this.fonts.serifBold, bodySize: 15, lineHeight: 20,
       color: COLORS.panelBright, borderColor: COLORS.cyan, after: 17,
     });
@@ -213,7 +213,7 @@ export class Composer {
   keepBulletSection(title, items) {
     const titleHeight = 34;
     const required = titleHeight + items.reduce((sum, item) => sum + this.bulletHeight(item), 0) + 14;
-    this.ensure(required, "HOW A RATING BECOMES FINAL");
+    this.ensure(required, "HOW A DECISION BECOMES FINAL");
     const startPage = this.pages.length;
     this.heading(title, 2);
     items.forEach((item) => this.bullet(item, { color: COLORS.amber }));

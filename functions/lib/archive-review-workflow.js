@@ -3,7 +3,7 @@ import { ReviewWorkflowError } from "./review-workflow.js";
 const ARCHIVE_DECISIONS = new Set([
   "source_supported", "archive_mismatch", "not_testable", "source_unavailable",
 ]);
-const REQUIRED_ELEMENTS = ["who", "what", "why", "where", "when"];
+const REQUIRED_ELEMENTS = ["who", "what", "where", "when"];
 
 async function all(statement) {
   const result = await statement.all();
@@ -15,8 +15,8 @@ function changes(result) {
 }
 
 function leaseSeconds(env) {
-  const configured = Number(env.REVIEW_LEASE_SECONDS || 900);
-  return Number.isInteger(configured) && configured >= 60 && configured <= 3600 ? configured : 900;
+  const configured = Number(env.REVIEW_LEASE_SECONDS || 3600);
+  return Number.isInteger(configured) && configured >= 60 && configured <= 14400 ? configured : 3600;
 }
 
 function plusSeconds(now, seconds) {
@@ -407,7 +407,7 @@ export function normalizeArchiveDecision(input) {
   for (const name of REQUIRED_ELEMENTS) {
     const value = cleanText(input?.[name], `archive_${name}_required`, { max: 1_000 });
     if (value.toLowerCase() === "not stated") {
-      throw new ReviewWorkflowError(`archive_${name}_required`, "Who, what, why, where, and when must be stated.", 400);
+      throw new ReviewWorkflowError(`archive_${name}_required`, "Who, what, where, and when must be stated.", 400);
     }
     elements[name] = {
       value,
@@ -420,6 +420,16 @@ export function normalizeArchiveDecision(input) {
   });
   if (how && !howSourceBasis) {
     throw new ReviewWorkflowError("archive_how_source_basis_required", "A stated How needs exact source support.", 400);
+  }
+  const why = cleanText(input?.why, "archive_why_invalid", { max: 1_000, optional: true });
+  const whySourceBasis = cleanText(input?.whySourceBasis, "archive_why_source_basis_required", {
+    max: 2_000, optional: !why,
+  });
+  if (why && why.toLowerCase() !== "not stated" && !whySourceBasis) {
+    throw new ReviewWorkflowError("archive_why_source_basis_required", "A stated Why needs exact source support.", 400);
+  }
+  if (why && why.toLowerCase() !== "not stated") {
+    elements.why = { value: why, sourceBasis: whySourceBasis };
   }
   const publicEvidenceNote = cleanText(input?.publicEvidenceNote, "archive_public_evidence_note_required", { max: 2_000 });
   const passConditionNote = cleanText(input?.passConditionNote, "archive_pass_condition_required", { max: 2_000 });

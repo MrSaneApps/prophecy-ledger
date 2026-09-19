@@ -4,8 +4,21 @@ import { COLORS, Composer, titleCase } from "./profile-report-layout.js";
 const REPORTABLE_OUTCOMES = new Set(["true", "false", "partial"]);
 
 function reportDate(value) {
-  const date = new Date(`${value}T12:00:00.000Z`);
+  const text = String(value || "");
+  const date = new Date(/^\d{4}-\d{2}-\d{2}$/.test(text) ? `${text}T12:00:00.000Z` : text);
   return Number.isNaN(date.valueOf()) ? new Date("2026-07-19T12:00:00.000Z") : date;
+}
+
+function outcomeLabel(outcome) {
+  return ({ true: "Happened", false: "Did not happen", partial: "Partly happened",
+    pending: "Still pending", undetermined: "Undetermined",
+    not_falsifiable: "Cannot be tested" })[outcome] || "Not decided";
+}
+
+function plainCorpusLabel(value) {
+  return /provisional pilot|selected records/i.test(String(value || ""))
+    ? "Early review: only selected claims have been checked."
+    : value || "Only selected claims have been checked.";
 }
 
 function reportFilename(slug) {
@@ -78,7 +91,13 @@ export function buildProfileReportModel(profile) {
     currentEvidenceSummary: record.currentEvidenceSummary,
     priorPublicInformationSummary: record.priorPublicInformationSummary,
     corpusWarning: record.corpusWarning,
-    missingGates: Array.isArray(record.missingGates) ? [...record.missingGates] : [],
+    missingGates: record.humanDecision ? [] : Array.isArray(record.missingGates) ? [...record.missingGates] : [],
+    humanDecision: record.humanDecision ? {
+      reviewerName: record.humanDecision.reviewerName,
+      outcomeStatus: record.humanDecision.outcomeStatus,
+      rationale: record.humanDecision.rationale,
+      decidedAt: record.humanDecision.decidedAt,
+    } : null,
     researchStatus: record.researchStatus,
     finalAdjudicationStatus: record.finalAdjudicationStatus,
     asOf: record.asOf,
@@ -105,8 +124,8 @@ export function buildProfileReportModel(profile) {
     title: "Evidence report",
     subject: profile?.person?.displayName || "Profile",
     asOf: profile?.asOf || "2026-07-19",
-    corpusLabel: profile?.completeness || "Selected claims, not a complete channel review",
-    publicationScope: "This is a working report. A rating becomes final only when two independent reviewers agree.",
+    corpusLabel: plainCorpusLabel(profile?.completeness),
+    publicationScope: "This is a working report. A rating becomes final only after adversarial AI research and one named human decision.",
     findings,
     research,
     catalogue,
@@ -116,6 +135,7 @@ export function buildProfileReportModel(profile) {
       catalogueRecords: catalogue.length,
       provisionalBriefs: research.length,
       publishedFindings: findings.length,
+      publishedDecisions: research.filter((record) => record.humanDecision).length,
       scoreStatus: profile?.score?.significanceStatus || "insufficient_sample",
       strictAccuracy: profile?.score?.strictAccuracy ?? null,
     },
@@ -123,13 +143,13 @@ export function buildProfileReportModel(profile) {
       "Check each original statement's exact timestamp and full context.",
       "Define what would count before judging what happened.",
       "Preserve reliable sources about the result and what was public beforehand.",
-      "Get matching decisions from two independent, verified reviewers.",
+      "Get one accountable decision from an authenticated, publicly named human reviewer.",
     ],
     limitations: [
       "This report covers selected claims, not the speaker's complete channel or track record.",
       "The page titled All Fulfilled Prophecies selects claims described as fulfilled.",
       "A page written by the speaker can help locate claims, but it is not independent proof.",
-      "The findings in this working report are not final true, false, or partly true ratings.",
+      "A published claim decision is final, but this report is not a complete review of the channel.",
       "The report reviews public statements, not anyone's faith, motives, character, or divine causation.",
     ],
   };
@@ -142,13 +162,16 @@ function renderCover(doc, model) {
   doc.text("What was said. What was already public. What happened next.", {
     size: 17, font: doc.fonts.sansBold, color: COLORS.cyan, lineHeight: 21, after: 9,
   });
-  doc.text(`Working report as of ${model.asOf}. No claim in this report has a final rating yet.`, {
+  const decisionSummary = model.metrics.publishedDecisions
+    ? `${model.metrics.publishedDecisions} final ${model.metrics.publishedDecisions === 1 ? "decision" : "decisions"} published.`
+    : "No final decisions published yet.";
+  doc.text(`Profile updated ${model.asOf}. ${decisionSummary} The channel review is still incomplete.`, {
     size: 10.5, color: COLORS.muted, after: 18,
   });
   doc.metricRow([
     { value: String(model.metrics.provisionalBriefs), label: "Claims examined" },
     { value: String(model.research.reduce((total, item) => total + item.supportingReferences.length, 0)), label: "Sources linked" },
-    { value: String(model.metrics.publishedFindings), label: "Final ratings", color: COLORS.amber },
+    { value: String(model.metrics.publishedDecisions), label: "Published decisions", color: COLORS.amber },
   ]);
   doc.label("Strongest evidence found so far", 9);
   if (model.research.length) {
@@ -203,7 +226,7 @@ function renderMethodOverview(doc, model) {
   doc.addPage("HOW TO READ THIS REPORT");
   doc.label("Working report", 21, COLORS.amber);
   doc.heading("What this report shows", 1);
-  doc.text("This report shows what was said, what happened, what was already publicly known, and what still needs checking. It does not give a final rating yet.", {
+  doc.text("This report shows what was said, what happened, what was already publicly known, and who owns each final decision. Claims without a decision show what still needs checking.", {
     size: 12, color: COLORS.muted, lineHeight: 17, after: 17,
   });
   doc.panel("What you can check",
@@ -211,7 +234,7 @@ function renderMethodOverview(doc, model) {
       borderColor: COLORS.cyan, bodySize: 11.5, lineHeight: 16,
     });
   doc.panel("What this report does not decide",
-    "It does not judge faith, motives, character, prophetic status, fraud, or divine causation. These claims also do not count toward an accuracy score unless two independent reviewers agree on a final rating.", {
+    "It does not judge faith, motives, character, prophetic status, fraud, or divine causation. There is no overall accuracy score until a broad group of claims has been reviewed.", {
       borderColor: COLORS.rust, titleColor: COLORS.amber, bodySize: 11.5, lineHeight: 16,
     });
   doc.panel("Why this is not a complete track record",
@@ -221,14 +244,15 @@ function renderMethodOverview(doc, model) {
 }
 
 function renderResearchBrief(doc, record, index) {
-  doc.addPage(`CLAIM ${String(index + 1).padStart(2, "0")} / WORKING REPORT`);
-  doc.label(`Claim ${String(index + 1).padStart(2, "0")} / still being checked`, 20, COLORS.amber);
+  const decision = record.humanDecision;
+  doc.addPage(`CLAIM ${String(index + 1).padStart(2, "0")} / ${decision ? "FINAL DECISION" : "STILL BEING CHECKED"}`);
+  doc.label(`Claim ${String(index + 1).padStart(2, "0")} / ${decision ? "final decision" : "still being checked"}`, 20, decision ? COLORS.cyan : COLORS.amber);
   doc.heading(record.title, 1);
-  doc.text(`Claim date: ${record.sourceDate} | Final rating: None yet`, {
+  doc.text(`Claim date: ${record.sourceDate} | Decision: ${decision ? `${outcomeLabel(decision.outcomeStatus)} by ${decision.reviewerName}` : "Not decided yet"}`, {
     size: 8.5, font: doc.fonts.sansBold, color: COLORS.cyan, after: 14,
   });
   doc.quote(record.exactArchivedQuote);
-  doc.panel("Strongest evidence found so far", record.headline, {
+  doc.panel(decision ? "Evidence summary" : "Strongest evidence found so far", record.headline, {
     borderColor: COLORS.amber, titleColor: COLORS.amber,
     bodyFont: doc.fonts.sansBold, bodySize: 13, lineHeight: 18, after: 23,
   });
@@ -249,13 +273,21 @@ function renderResearchBrief(doc, record, index) {
     size: 10.5, color: COLORS.muted, lineHeight: 15, after: 14,
     sectionName: `CLAIM ${String(index + 1).padStart(2, "0")} / WHAT WOULD COUNT`,
   });
-  doc.panel("No final rating yet",
-    "WORKING REPORT. The information above has not received a final true, false, or partly true rating. It does not count toward a track-record score.", {
-      borderColor: COLORS.rust, titleColor: COLORS.amber, bodySize: 10.5, lineHeight: 15,
-      sectionName: `CLAIM ${String(index + 1).padStart(2, "0")} / STATUS`, after: 23,
-    });
-  doc.heading("What still needs checking", 2);
-  record.missingGates.forEach((gate) => doc.bullet(gate, { color: COLORS.amber }));
+  if (decision) {
+    doc.panel(`Final decision: ${outcomeLabel(decision.outcomeStatus)}`,
+      `${decision.rationale} Decided by ${decision.reviewerName} on ${decision.decidedAt}.`, {
+        borderColor: COLORS.cyan, titleColor: COLORS.cyan, bodySize: 10.5, lineHeight: 15,
+        sectionName: `CLAIM ${String(index + 1).padStart(2, "0")} / FINAL DECISION`, after: 23,
+      });
+  } else {
+    doc.panel("Not decided yet",
+      "This claim is still being checked and does not count toward a track-record score.", {
+        borderColor: COLORS.rust, titleColor: COLORS.amber, bodySize: 10.5, lineHeight: 15,
+        sectionName: `CLAIM ${String(index + 1).padStart(2, "0")} / STATUS`, after: 23,
+      });
+    doc.heading("What still needs checking", 2);
+    record.missingGates.forEach((gate) => doc.bullet(gate, { color: COLORS.amber }));
+  }
 
   doc.addPage(`CLAIM ${String(index + 1).padStart(2, "0")} / SOURCES`);
   doc.label("Sources", 19);
@@ -271,12 +303,12 @@ function renderResearchBrief(doc, record, index) {
 }
 
 function renderFinalSections(doc, model) {
-  doc.addPage("HOW A RATING BECOMES FINAL");
-  doc.label("No final rating yet", 20, COLORS.amber);
-  const publicationGates = doc.keepBulletSection("What still needs to happen", model.missingGates);
+  doc.addPage("HOW A DECISION BECOMES FINAL");
+  doc.label("How decisions become final", 20, COLORS.amber);
+  const publicationGates = doc.keepBulletSection("What every claim must include", model.missingGates);
   doc.rule(24);
   doc.heading("How this works", 2);
-  doc.text("We save the original statement, decide what would count before judging it, check reliable sources, and show what was already public. A rating becomes final only when two independent, verified reviewers agree on the claim, result, and sources.", {
+  doc.text("We save the original statement, decide what would count before judging it, check reliable sources, and show what was already public. AI models challenge the packet, then one authenticated, publicly named human reviewer owns the final decision.", {
     size: 10.5, color: COLORS.cream, lineHeight: 15, after: 13,
   });
   doc.text("We will not publish an overall track-record score until a broad, clearly defined group of videos has been reviewed. Repeated versions of the same prediction count once. This helps prevent cherry-picking.", {

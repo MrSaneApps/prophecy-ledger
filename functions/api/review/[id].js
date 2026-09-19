@@ -2,7 +2,8 @@ import { normalizeReview, validateReviewPrerequisites } from "../../lib/claims.j
 import { resolveReviewerPrincipal } from "../../lib/reviewer-auth.js";
 import {
   getAssignedReviewBundle, hasReviewerSubmission, normalizeCandidateDecision,
-  reconcilePublication, recordReviewAudit, ReviewWorkflowError, submitAssignedClaimReview,
+  getReviewerPublicName, normalizeReviewerPublicName, reconcilePublication, recordReviewAudit,
+  ReviewWorkflowError, submitAssignedClaimReview,
   submitCandidateDecision,
 } from "../../lib/review-workflow.js";
 import {
@@ -74,8 +75,10 @@ export async function onRequestGet({ request, env, params }) {
           archiveWorkItemId: bundle.assignment.workItemId }
         : { workType: bundle.assignment.workType },
     });
+    const publicReviewerName = await getReviewerPublicName(env.DB, principal.reviewerId);
     return json({
-      principal: { mode: principal.mode, demo: principal.mode === "local_non_deployable_demo" },
+      principal: { mode: principal.mode, demo: principal.mode === "local_non_deployable_demo",
+        publicReviewerName, needsPublicName: !publicReviewerName },
       warning: "Assigned private work. Previous reviewer decisions and rationales are blinded.",
       ...bundle,
     });
@@ -168,6 +171,8 @@ export async function onRequestPost({ request, env, params }) {
     if (bundle.subject.visibility === "published") {
       throw new ReviewWorkflowError("already_published", "This adjudication is immutable after publication.", 409);
     }
+    const existingPublicName = await getReviewerPublicName(env.DB, principal.reviewerId);
+    const publicReviewerName = existingPublicName || normalizeReviewerPublicName(input?.publicReviewerName);
     // Send-back (disagree) returns the claim to research; it must NOT be blocked
     // by publication evidence prerequisites. Only Accept (agree / publish path)
     // continues to require the full cited record.
@@ -181,7 +186,7 @@ export async function onRequestPost({ request, env, params }) {
       }
     }
     const accepted = await submitAssignedClaimReview(
-      env.DB, assignmentId, principal.reviewerId, review, undefined, sendback,
+      env.DB, assignmentId, principal.reviewerId, review, undefined, sendback, publicReviewerName,
     );
     const evaluation = sendback
       ? { state: "research_requested" }

@@ -357,6 +357,7 @@ test("4. Accept persists moderator_reviews and returns reviewId", async () => {
     body: {
       workType: "claim_adjudication",
       verdict: "agree",
+      publicReviewerName: "Joshua",
       rationale: "E2E accept: AI draft matches verified original and independent outcome evidence.",
     },
   }));
@@ -378,6 +379,16 @@ test("4. Accept persists moderator_reviews and returns reviewId", async () => {
   ).get(leased.assignmentId);
   assert.equal(asg.status, "submitted");
   assert.ok(asg.submitted_at);
+
+  const reopened = await reviewGet(reviewContext(env, "alpha-token", leased.assignmentId));
+  assert.equal(reopened.status, 200);
+  const reopenedBody = await jsonBody(reopened);
+  assert.equal(reopenedBody.reviewState.ownSubmissionRecorded, true);
+  assert.equal(reopenedBody.reviewState.ownDecision.reviewId, body.reviewId);
+  assert.equal(reopenedBody.reviewState.ownDecision.outcomeStatus, "false");
+  assert.match(reopenedBody.reviewState.ownDecision.rationale, /E2E accept/);
+  assert.equal(reopenedBody.reviewState.ownDecision.sendbackRecorded, false);
+  assert.doesNotMatch(JSON.stringify(reopenedBody.reviewState), /reviewer_alpha/);
 });
 
 test("5. Send-back persists review + research_sendbacks without full evidence packet", async () => {
@@ -388,6 +399,7 @@ test("5. Send-back persists review + research_sendbacks without full evidence pa
     body: {
       workType: "claim_adjudication",
       verdict: "disagree",
+      publicReviewerName: "Joshua",
       disagreeOutcome: "true",
       rationale: "E2E send-back: Queen deathbed / chosen heir was widely expected — research must learn.",
     },

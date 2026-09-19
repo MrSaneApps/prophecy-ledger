@@ -303,11 +303,12 @@ test("explicit archive switching returns the requested item and revives released
   seedArchiveWork(env, "one");
   seedArchiveWork(env, "two");
   const initialQueue = await archiveQueue(env, "alpha-token");
-  const initial = initialQueue.assignments.find((item) =>
-    item.workType === "archive_lead_verification" && item.status === "leased");
-  assert.ok(initial?.workItemId);
-  const requested = initialQueue.available.find((item) => item.workItemId !== initial.workItemId);
+  assert.equal((initialQueue.assignments || []).filter((item) => item.status === "leased").length, 0);
+  const first = initialQueue.available.find((item) => !item.taken);
+  const requested = initialQueue.available.find((item) => !item.taken && item.workItemId !== first?.workItemId);
+  assert.ok(first?.workItemId);
   assert.ok(requested?.workItemId);
+  const initial = await openArchiveWork(env, "alpha-token", first.workItemId);
   const before = env.DB.db.prepare(
     `SELECT archive_assignment_id,assigned_at,lease_version
      FROM archive_review_assignments WHERE archive_work_item_id=? AND reviewer_id='reviewer_alpha'`,
@@ -360,10 +361,10 @@ test("supported archive decisions require exact 5W1H grounding and append an obs
   const incomplete = await archiveReviewPost(context({
     env, url: `http://localhost/api/review/archive/${assignment.assignmentId}`, method: "POST",
     params: { id: assignment.assignmentId }, headers: headers("alpha-token"),
-    body: supportedArchiveBody({ why: "Not stated", whySourceBasis: "" }),
+    body: supportedArchiveBody({ who: "Not stated", whoSourceBasis: "" }),
   }));
   assert.equal(incomplete.status, 400);
-  assert.equal((await jsonBody(incomplete)).code, "archive_why_required");
+  assert.equal((await jsonBody(incomplete)).code, "archive_who_required");
   assert.equal(env.DB.db.prepare("SELECT count(*) count FROM archive_review_decisions").get().count, 0);
 
   const accepted = await archiveReviewPost(context({
@@ -641,11 +642,11 @@ test("promotion fails closed when an essential 5W1H field or its source basis is
     title: "Measurable event by Friday", statementType: "testable_prediction",
     atomicProposition: "The stated measurable event would happen by the identified Friday.",
     criteria: "Independent records must show the event by the bounded deadline.",
-    deadline: "2020-09-18", ...groundedPromotion(), why: "Not stated" };
+    deadline: "2020-09-18", ...groundedPromotion(), who: "Not stated" };
   const response = await reviewPost(context({ env, url: `http://localhost/api/review/${assignment.assignmentId}`,
     method: "POST", params: { id: assignment.assignmentId }, headers: headers("alpha-token"), body: payload }));
   assert.equal(response.status, 400);
-  assert.equal((await jsonBody(response)).code, "candidate_why_required");
+  assert.equal((await jsonBody(response)).code, "candidate_who_required");
   assert.equal(env.DB.db.prepare("SELECT count(*) count FROM candidate_review_decisions").get().count, 0);
 });
 
@@ -675,30 +676,15 @@ test("candidate rejection records a reasoned append-only decision without creati
   ).get().status, "complete");
 });
 
-test("second reviewer remains blind and publication reconciles idempotently after interruption", async () => {
+test("one named human review publishes idempotently after append-only submission", async () => {
   const env = makeEnv({ demo: true });
   seedPublicationEvidence(env);
   const now = new Date().toISOString();
   const alpha = await leaseReviewWork(env.DB, "reviewer_alpha", env, now);
-  const beta = await leaseReviewWork(env.DB, "reviewer_beta", env, now);
   assert.equal(alpha.claim_id, CLAIM_ID);
-  assert.equal(beta.claim_id, CLAIM_ID);
   const normalized = normalizeReview(claimReview());
-  await submitAssignedClaimReview(env.DB, alpha.assignment_id, "reviewer_alpha", normalized, now);
-
-  const betaDetail = await reviewGet(context({
-    env, url: `http://localhost/api/review/${beta.assignment_id}`, params: { id: beta.assignment_id },
-    headers: headers("beta-token"),
-  }));
-  const betaBundle = await jsonBody(betaDetail);
-  assert.equal(betaBundle.aiDraftDecision?.outcomeStatus, "false");
-  assert.equal(betaBundle.aiDraftDecision?.provenance, "ai_generated_needs_human_check");
-  assert.equal(betaBundle.reviewState?.previousDecisionsBlinded, true);
-  const serialized = JSON.stringify(betaBundle);
-  assert.doesNotMatch(serialized, /reviewer_alpha|The verified source and independent outcome satisfy the frozen criteria/);
-
-  assert.equal((await reconcilePublication(env.DB, CLAIM_ID, now)).state, "awaiting_second_review");
-  await submitAssignedClaimReview(env.DB, beta.assignment_id, "reviewer_beta", normalized, now);
+  await submitAssignedClaimReview(env.DB, alpha.assignment_id, "reviewer_alpha", normalized,
+    now, null, "Joshua");
   assert.equal(env.DB.db.prepare("SELECT state FROM publication_evaluations WHERE claim_id=?").get(CLAIM_ID).state, "needed");
   assert.equal(env.DB.db.prepare("SELECT visibility FROM claims WHERE claim_id=?").get(CLAIM_ID).visibility, "draft");
 
@@ -708,4 +694,7 @@ test("second reviewer remains blind and publication reconciles idempotently afte
   await reconcilePublication(env.DB, CLAIM_ID);
   assert.equal(env.DB.db.prepare("SELECT count(*) count FROM claim_revisions WHERE claim_id=?").get(CLAIM_ID).count, 1);
   assert.equal(env.DB.db.prepare("SELECT count(*) count FROM claim_events WHERE claim_id=? AND event_type='published'").get(CLAIM_ID).count, 1);
+  assert.equal(JSON.parse(env.DB.db.prepare(
+    "SELECT decision_json FROM claim_revisions WHERE claim_id=?"
+  ).get(CLAIM_ID).decision_json).reviewerNames[0], "Joshua");
 });

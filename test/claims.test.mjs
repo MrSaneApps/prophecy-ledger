@@ -87,16 +87,16 @@ test("reviewer identity is forbidden in the decision body", () => {
   }), /baseline_too_low_or_invalid/);
 });
 
-test("consensus searches every pair and matches the frozen evidence decision", () => {
+test("the latest accepted authenticated human review owns publication", () => {
   const first = decision({ outcomeStatus: "undetermined", evidenceIds: ["original"] });
   const matching = decision();
   const result = evaluatePublication(claim, [original, outcome], [], [
     row("one", first), row("two", matching), row("three", matching),
   ]);
   assert.equal(result.state, "published");
-  assert.deepEqual(result.reviewerIds, ["two", "three"]);
+  assert.deepEqual(result.reviewerIds, ["three"]);
   const differentEvidence = decision({ evidenceIds: ["original", "outcome", "extra"] });
   assert.equal(evaluatePublication(claim, [original, outcome], [], [
     row("one", matching), row("two", differentEvidence),
-  ]).state, "disagreement");
+  ]).state, "blocked");
 });

@@ -8,10 +8,10 @@ const REJECTION_REASONS = new Set([
   "invalid_quote", "non_falsifiable", "context_changes_meaning", "duplicate",
   "insufficient_source_verification", "missing_essential_context",
   "generic_advice_or_commentary", "non_observable_mental_state",
-  "invented_causality_or_mechanism",
+  "invented_causality_or_mechanism", "current_events_dressed_as_prophecy",
 ]);
 const CLAIM_ELEMENTS = ["who", "what", "why", "where", "when", "how"];
-const REQUIRED_CLAIM_ELEMENTS = new Set(["who", "what", "why", "where", "when"]);
+const REQUIRED_CLAIM_ELEMENTS = new Set(["who", "what", "where", "when"]);
 
 export class ReviewWorkflowError extends Error {
   constructor(code, message, status = 409) { super(message); this.code = code; this.status = status; }
@@ -34,8 +34,8 @@ function changes(result) {
 }
 
 function leaseSeconds(env) {
-  const configured = Number(env.REVIEW_LEASE_SECONDS || 900);
-  return Number.isInteger(configured) && configured >= 60 && configured <= 3600 ? configured : 900;
+  const configured = Number(env.REVIEW_LEASE_SECONDS || 3600);
+  return Number.isInteger(configured) && configured >= 60 && configured <= 14400 ? configured : 3600;
 }
 
 function plusSeconds(now, seconds) {
@@ -51,6 +51,28 @@ export async function recordReviewAudit(db, event, now = new Date().toISOString(
   ).bind(`audit_${crypto.randomUUID()}`, event.reviewerId || null, event.eventType,
     event.workItemId || null, event.claimId || null, event.candidateId || null,
     event.assignmentId || null, JSON.stringify(event.detail || {}), now).run();
+}
+
+export async function getReviewerPublicName(db, reviewerId) {
+  const row = await db.prepare(
+    `SELECT display_name FROM reviewer_public_attributions attribution
+     WHERE reviewer_id=?1 AND NOT EXISTS (
+       SELECT 1 FROM reviewer_public_attributions newer
+       WHERE newer.reviewer_id=attribution.reviewer_id
+         AND (newer.created_at>attribution.created_at OR
+           (newer.created_at=attribution.created_at AND newer.attribution_id>attribution.attribution_id)))
+     LIMIT 1`
+  ).bind(reviewerId).first();
+  return row?.display_name || null;
+}
+
+export function normalizeReviewerPublicName(value) {
+  const name = String(value || "").trim().replace(/\s+/g, " ");
+  if (name.length < 2 || name.length > 80 || !/^[\p{L}\p{N} .'-]+$/u.test(name)) {
+    throw new ReviewWorkflowError("reviewer_public_name_required",
+      "Enter the name that should appear publicly with your decisions.", 400);
+  }
+  return name;
 }
 
 async function currentAssignment(db, reviewerId, now) {
@@ -114,15 +136,19 @@ async function candidateWorkItems(db, reviewerId, now) {
            AND decision.reviewer_id=?1)
        AND ((work.work_type='candidate_verification' AND NOT EXISTS (
               SELECT 1 FROM candidate_review_decisions decision WHERE decision.candidate_id=work.candidate_id))
-         OR (work.work_type='claim_adjudication' AND (
-           (SELECT COUNT(*) FROM moderator_reviews review WHERE review.claim_id=work.claim_id)<2
-           OR COALESCE(evaluation.state,'needed') IN ('disagreement','blocked','needed'))))
+         OR (work.work_type='claim_adjudication' AND NOT EXISTS (
+           SELECT 1 FROM moderator_reviews review
+           LEFT JOIN research_sendbacks sendback ON sendback.review_id=review.review_id
+           WHERE review.claim_id=work.claim_id AND sendback.review_id IS NULL
+             AND review.created_at>=COALESCE((
+               SELECT MAX(draft.created_at) FROM ai_draft_decisions draft
+               WHERE draft.claim_id=work.claim_id
+             ),'')
+         )))
        AND ((SELECT COUNT(*) FROM review_assignments active
               WHERE active.work_item_id=work.work_item_id
                 AND (active.status='submitted' OR (active.status='leased' AND active.lease_expires_at>?2)))
-            < CASE WHEN work.work_type='candidate_verification' THEN 1
-              WHEN (SELECT COUNT(*) FROM moderator_reviews review WHERE review.claim_id=work.claim_id)<2 THEN 2
-              ELSE work.max_reviews END)
+            < 1)
      ORDER BY CASE work.work_type WHEN 'candidate_verification' THEN 0 ELSE 1 END,
        COALESCE(claim_sort.source_date,work.created_at),work.work_item_id LIMIT 20`
   ).bind(reviewerId, now));
@@ -274,10 +300,14 @@ export async function switchLease(db, reviewerId, workItemId, env, now = new Dat
   ).bind(assignmentId).first();
 }
 
+function normalizeClaimTitle(title) {
+  return String(title || "").toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
+}
+
 export async function listAllClaimWork(db, now = new Date().toISOString()) {
   const rows = await all(db.prepare(
     `SELECT work.work_item_id,claim.claim_id,claim.title,person.display_name person,
-      claim.source_date,claim.deadline,claim.visibility,claim.lifecycle_status,
+      claim.source_url,claim.source_date,claim.deadline,claim.visibility,claim.lifecycle_status,
       (SELECT COUNT(*) FROM moderator_reviews review WHERE review.claim_id=claim.claim_id) reviews,
       EXISTS (SELECT 1 FROM ai_draft_decisions draft WHERE draft.claim_id=claim.claim_id) has_draft,
       (work.status='ready' AND EXISTS (
@@ -289,20 +319,30 @@ export async function listAllClaimWork(db, now = new Date().toISOString()) {
      WHERE work.work_type='claim_adjudication' AND work.status<>'withdrawn'
      ORDER BY claim.source_date, claim.claim_id`
   ));
-  return rows.map((row) => ({
-    workItemId: row.work_item_id,
-    claimId: row.claim_id,
-    title: row.title,
-    person: row.person,
-    sourceDate: row.source_date,
-    deadline: row.deadline,
-    reviews: Number(row.reviews || 0),
-    hasDraft: Boolean(row.has_draft),
-    state: row.visibility === "published" ? "decided"
-      : Number(row.reviews || 0) >= 2 ? "awaiting_reconciliation"
-      : !row.is_ready ? "in_preparation"
-      : Number(row.reviews || 0) === 1 ? "awaiting_second_review" : "ready",
-  }));
+  const publishedKeys = new Set(rows.filter((row) => row.visibility === "published")
+    .map((row) => `${row.source_url}|${normalizeClaimTitle(row.title)}`));
+  const publishedByUrl = new Map(rows.filter((row) => row.visibility === "published")
+    .map((row) => [row.source_url, row.claim_id]));
+  return rows.map((row) => {
+    const duplicateOf = row.visibility !== "published"
+      && publishedKeys.has(`${row.source_url}|${normalizeClaimTitle(row.title)}`)
+      ? publishedByUrl.get(row.source_url) : null;
+    return {
+      workItemId: row.work_item_id,
+      claimId: row.claim_id,
+      title: row.title,
+      person: row.person,
+      sourceDate: row.source_date,
+      deadline: row.deadline,
+      reviews: Number(row.reviews || 0),
+      hasDraft: Boolean(row.has_draft),
+      duplicateOf,
+      state: row.visibility === "published" ? "decided"
+        : duplicateOf ? "duplicate"
+        : Number(row.reviews || 0) >= 1 ? "awaiting_reconciliation"
+        : !row.is_ready ? "in_preparation" : "ready",
+    };
+  });
 }
 
 export async function listReviewerAssignments(db, reviewerId, now = new Date().toISOString()) {
@@ -460,8 +500,13 @@ export async function getAssignedReviewBundle(db, assignmentId, reviewerId, now 
       sources_checked_json,method_note,completed_at,created_at
      FROM prior_information_receipts WHERE claim_id=?1 ORDER BY created_at,receipt_id`
   ).bind(assignment.claim_id));
-  const ownSubmitted = await db.prepare(
-    `SELECT 1 submitted FROM moderator_reviews WHERE claim_id=?1 AND reviewer_id=?2`
+  const ownReview = await db.prepare(
+    `SELECT review.review_id,review.claim_type,review.outcome_status,
+      review.novelty_status,review.rationale,review.created_at,
+      CASE WHEN sendback.review_id IS NULL THEN 0 ELSE 1 END sendback_recorded
+     FROM moderator_reviews review
+     LEFT JOIN research_sendbacks sendback ON sendback.review_id=review.review_id
+     WHERE review.claim_id=?1 AND review.reviewer_id=?2`
   ).bind(assignment.claim_id, reviewerId).first();
   let candidateDecisionFields = null;
   if (assignment.promotion_id) {
@@ -481,17 +526,35 @@ export async function getAssignedReviewBundle(db, assignmentId, reviewerId, now 
     priorInformationReceipts: receipts,
     aiDraftDecision,
     candidateDecisionFields,
-    reviewState: { ownSubmissionRecorded: Boolean(ownSubmitted), previousDecisionsBlinded: true },
+    reviewState: {
+      ownSubmissionRecorded: Boolean(ownReview),
+      previousDecisionsBlinded: true,
+      ownDecision: ownReview ? {
+        reviewId: ownReview.review_id,
+        claimType: ownReview.claim_type,
+        outcomeStatus: ownReview.outcome_status,
+        noveltyStatus: ownReview.novelty_status,
+        rationale: ownReview.rationale,
+        decidedAt: ownReview.created_at,
+        sendbackRecorded: Boolean(ownReview.sendback_recorded),
+      } : null,
+    },
   };
 }
 
-export async function submitAssignedClaimReview(db, assignmentId, reviewerId, review, now = new Date().toISOString(), sendback = null) {
+export async function submitAssignedClaimReview(db, assignmentId, reviewerId, review, now = new Date().toISOString(), sendback = null, publicReviewerName = null) {
   const assignment = await assignmentForAccess(db, assignmentId, reviewerId, now, false);
   if (!assignment || assignment.work_type !== "claim_adjudication") {
     throw new ReviewWorkflowError("assignment_required", "A live claim assignment is required.", 404);
   }
   const reviewId = `review_${crypto.randomUUID()}`;
   const statements = [
+    db.prepare(
+      `INSERT OR IGNORE INTO reviewer_public_attributions
+       (attribution_id,reviewer_id,display_name,created_at)
+       VALUES (?1,?2,?3,?4)`
+    ).bind(`reviewer_attribution_${crypto.randomUUID()}`, reviewerId,
+      publicReviewerName || "Verified reviewer", now),
     db.prepare(
       `INSERT INTO moderator_reviews
        (review_id,claim_id,reviewer_id,claim_type,outcome_status,novelty_status,
@@ -571,14 +634,25 @@ export function normalizeCandidateDecision(input) {
     throw new ReviewWorkflowError("candidate_deadline_required", "Predictions require a bounded YYYY-MM-DD deadline.", 400);
   }
   const elements = {};
+  const optionalElements = new Set(["how", "why"]);
   for (const name of CLAIM_ELEMENTS) {
-    const value = cleanText(input?.[name], `candidate_${name}_required`, { max: 1_000 });
+    const raw = String(input?.[name] ?? "").trim();
+    const value = optionalElements.has(name) && (!raw || raw.toLowerCase() === "not stated")
+      ? "not stated"
+      : cleanText(input?.[name], `candidate_${name}_required`, { max: 1_000 });
     if (value.toLowerCase() === "not stated" && REQUIRED_CLAIM_ELEMENTS.has(name)) throw new ReviewWorkflowError(`candidate_${name}_required`, "Every essential claim element must be explicitly stated.", 400);
     const element = input?.claimElements?.[name];
-    const sourceBasis = name === "how" && value.toLowerCase() === "not stated"
+    const sourceBasis = optionalElements.has(name) && value.toLowerCase() === "not stated"
       ? String(element?.sourceBasis || "").trim()
       : cleanText(element?.sourceBasis, `candidate_${name}_source_basis_required`, { max: 2_000 });
-    if (String(element?.value || "").trim() !== value) throw new ReviewWorkflowError(`candidate_${name}_source_basis_mismatch`, "Claim element source basis must match the reviewed value.", 400);
+    if (optionalElements.has(name) && value === "not stated") {
+      const incoming = String(element?.value || "").trim();
+      if (incoming && incoming.toLowerCase() !== "not stated") {
+        throw new ReviewWorkflowError(`candidate_${name}_source_basis_mismatch`, "Claim element source basis must match the reviewed value.", 400);
+      }
+    } else if (String(element?.value || "").trim() !== value) {
+      throw new ReviewWorkflowError(`candidate_${name}_source_basis_mismatch`, "Claim element source basis must match the reviewed value.", 400);
+    }
     elements[name] = { value, sourceBasis };
   }
   const publicEvidence = cleanText(input?.publicEvidence, "candidate_public_evidence_required", { max: 2_000 });

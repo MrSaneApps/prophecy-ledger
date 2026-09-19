@@ -108,6 +108,7 @@ function normalizedReviewRow(row) {
   return {
     ...review,
     reviewerId: row.reviewer_id,
+    reviewerName: row.public_reviewer_name || "Verified reviewer",
     decisionFingerprint: row.decision_fingerprint || reviewDecisionFingerprint(review),
   };
 }
@@ -153,20 +154,11 @@ export function validateReviewPrerequisites(claim, evidence, receipts, review) {
 }
 
 export function evaluatePublication(claim, evidence, receipts, reviews) {
-  if (reviews.length < 2) return { state: "awaiting_second_review" };
+  if (reviews.length < 1) return { state: "needed" };
   const normalized = reviews.map(normalizedReviewRow);
-  let pair = null;
-  for (let left = 0; left < normalized.length && !pair; left += 1) {
-    for (let right = left + 1; right < normalized.length; right += 1) {
-      if (normalized[left].reviewerId !== normalized[right].reviewerId &&
-          normalized[left].decisionFingerprint === normalized[right].decisionFingerprint) {
-        pair = [normalized[left], normalized[right]];
-        break;
-      }
-    }
-  }
-  if (!pair) return { state: "disagreement", outcomeStatus: "undetermined" };
-  const [decision] = pair;
+  // A single authenticated human owns the final decision. Legacy claims can
+  // contain several accepted reviews, so the newest accepted review wins.
+  const decision = normalized.at(-1);
   const claimGate = validateClaimForPublication(claim, decision);
   const evidenceGate = validateReviewPrerequisites(claim, evidence, receipts, decision);
   const missing = [...claimGate.missing, ...evidenceGate.missing];
@@ -179,7 +171,8 @@ export function evaluatePublication(claim, evidence, receipts, reviews) {
     baselineProbability: decision.baselineProbability,
     evidenceIds: decision.evidenceIds,
     priorReceiptId: decision.priorReceiptId,
-    reviewerIds: pair.map((review) => review.reviewerId),
+    reviewerIds: [decision.reviewerId],
+    reviewerNames: [decision.reviewerName],
     decisionFingerprint: decision.decisionFingerprint,
   };
 }
