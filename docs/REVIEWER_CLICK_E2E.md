@@ -4,13 +4,14 @@ Minimal-friction way to **click-test Prophecy Ledger as a reviewer** again later
 
 ## Canonical tool (preferred)
 
-You do not need to remember npm paths. From Air or Mini:
+Run the wrapper on the Mini (from the Air: `ssh mini` first):
 
 ```bash
-ruby ~/SaneApps/infra/SaneProcess/scripts/SaneMaster.rb prophecy_reviewer_click
-ruby ~/SaneApps/infra/SaneProcess/scripts/SaneMaster.rb prophecy_reviewer_click --mode live
-ruby ~/SaneApps/infra/SaneProcess/scripts/SaneMaster.rb prophecy_reviewer_click --live --allow-live-submit
+~/SaneApps/websites/prophecy-ledger/scripts/run-reviewer-click-e2e.sh --mode local   # fresh demo D1
+~/SaneApps/websites/prophecy-ledger/scripts/run-reviewer-click-e2e.sh --mode live    # reuses the Mini Brave Access session
 ```
+
+The wrapper has no live-submit flag. Accept or Send back on production only with the owner present.
 
 Ad-hoc `/tmp` Brave OTP scripts are **blocked** by `sane_bash_guards.rb`.
 
