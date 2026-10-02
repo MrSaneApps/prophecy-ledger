@@ -122,7 +122,7 @@ function researchBrief(record, index, slug = DEFAULT_PERSON_SLUG) {
       <p class="brief-source">${sourceLink(record.originalSourceUrl, "Watch original video ↗")} · ${escapeHtml(displayDate(record.sourceDate))}</p>
     </div>
     ${decision
-      ? `<aside class="missing-gates"><span>Final decision</span><strong>${escapeHtml(outcomeLabel(decision.outcomeStatus))}</strong><p>${escapeHtml(decision.rationale)}</p><small>Decided by ${escapeHtml(decision.reviewerName)} on ${escapeHtml(displayDate(decision.decidedAt))}</small><a href="/people/${encodeURIComponent(slug)}/claims/${encodeURIComponent(record.id)}">Read the evidence and decision <span aria-hidden="true">→</span></a></aside>`
+      ? `<aside class="missing-gates"><span>Final decision</span><strong>${escapeHtml(outcomeLabel(decision.outcomeStatus))}</strong><p>${escapeHtml(decision.rationale)}</p><small>Decided by ${escapeHtml(decision.reviewerName)} on ${escapeHtml(displayDate(decision.decidedAt))}</small>${decision.correction ? `<small class="correction">Corrected ${escapeHtml(displayDate(decision.correction.correctedAt))}: ${escapeHtml(outcomeLabel(decision.correction.previousOutcomeStatus))} → ${escapeHtml(outcomeLabel(decision.outcomeStatus))}. ${escapeHtml(decision.correction.rationale)}</small>` : ""}<a href="/people/${encodeURIComponent(slug)}/claims/${encodeURIComponent(record.id)}">Read the evidence and decision <span aria-hidden="true">→</span></a></aside>`
       : `<aside class="missing-gates"><span>What still needs checking</span><ul>${gates.slice(0, 2).map((gate) => `<li>${escapeHtml(gate)}</li>`).join("")}</ul><a href="/people/${encodeURIComponent(slug)}/claims/${encodeURIComponent(record.id)}">Read the full claim review <span aria-hidden="true">→</span></a></aside>`}
   </article>`;
 }
@@ -142,6 +142,7 @@ function coverageModel(profile) {
     possibleClaims: firstDefined(counts, ["possibleClaimPosts", "possible_claim_posts", "possibleClaimsFound", "possible_claims_found"], 0),
     specificClaims: firstDefined(counts, ["specificClaimCandidates", "specific_claim_candidates"], 0),
     archiveClaims: firstDefined(counts, ["archiveClaimsCatalogued", "archive_claims_catalogued"], 0),
+    claimsFound: firstDefined(counts, ["ledgerClaimsTotal", "ledger_claims_total"], 0),
     archiveVideos: firstDefined(counts, ["archiveOriginalVideos", "archive_original_videos"], 0),
     archiveChecks: firstDefined(counts, ["archiveSourceChecksCompleted", "archive_source_checks_completed"], 0),
     humanChecked: firstDefined(counts, ["claimsCheckedByPeople", "claims_checked_by_people", "humanReviewed", "human_reviewed"], 0),
@@ -368,16 +369,14 @@ function renderPerson(profile, slug, loadError = "") {
   main.innerHTML = html`
     <section class="profile-hero paper" aria-labelledby="dossier-title">
       <div class="profile-intro"><p class="eyebrow"><span class="signal-dot"></span>Public claim record</p><div class="profile-title"><h1 id="dossier-title">${escapeHtml(displayName)}</h1><span class="status status-warning">Profile in progress</span></div>
-      <p class="lede"><strong>${escapeHtml(finalRatingSummary)}</strong> Read the claims below to see the original words, the evidence, and who made each decision.</p>
-      <p>${escapeHtml(countLabel(coverage.archiveClaims))} possible claims have been found so far, but only ${escapeHtml(countLabel(researchRecords.length))} are shown here with detailed evidence. This does not establish an overall track record.</p>${slug === "troy-black" ? `<p>There is also an essay on <a href="/people/troy-black/method">the pattern in the fulfilled archive</a>.</p>` : ""}
+      <p class="lede"><strong>${escapeHtml(finalRatingSummary)}</strong> ${escapeHtml(countLabel(coverage.claimsFound))} claims found, ${escapeHtml(countLabel(researchRecords.length))} shown with detailed evidence. Read the claims below to see the original words, the evidence, and who made each decision.</p>
+      <p class="scope-note">Still growing: not yet a complete review of the channel. A profile count is not an accuracy score \u2014 each published decision is final and names the human reviewer who made it.</p>
       <div class="hero-actions"><a class="button-link button-primary" href="#claim-briefs">See claims and decisions <span aria-hidden="true">↓</span></a>${slug === "troy-black" ? `<a class="text-link" href="/people/troy-black/method">The pattern in the fulfilled archive</a>` : ""}<a class="text-link" href="/api/people/${encodeURIComponent(slug)}/report">Download evidence report <span aria-hidden="true">↗</span></a></div></div>
-      <dl class="profile-summary" aria-label="Review at a glance"><div><dt>Claims found</dt><dd>${escapeHtml(countLabel(coverage.archiveClaims))}</dd></div><div><dt>Claims shown</dt><dd>${escapeHtml(countLabel(researchRecords.length))}</dd></div><div><dt>Checked by people</dt><dd>${escapeHtml(countLabel(coverage.humanChecked))}</dd></div><div><dt>Published decisions</dt><dd>${escapeHtml(countLabel(coverage.finalRatings))}</dd></div></dl>
-      <p class="score-boundary"><strong>A profile count is not an accuracy score.</strong> Each published claim decision belongs to the named human reviewer who made it.</p>
     </section>
-    <section class="section-wrap dossier" aria-labelledby="research-state-title">${notice()}
+    <section class="section-wrap dossier" aria-labelledby="research-state-title">
       ${loadError ? `<aside class="load-warning" role="status"><strong>Claim details unavailable</strong><p>${escapeHtml(loadError)} Showing the basic source information instead.</p></aside>` : ""}
-      <header class="section-heading selected-heading"><div><p class="eyebrow">Claims and decisions</p><h2 id="research-state-title">What was said, and what the evidence shows.</h2></div><p>Open any claim for its sources, decision, reviewer, and explanation.</p></header>
-      <div id="claim-briefs" class="claim-briefs">${researchRecords.map((record, index) => researchBrief(record, index, slug)).join("")}</div>
+      <header class="section-heading selected-heading"><div><p class="eyebrow">Claims and decisions</p><h2 id="research-state-title">Every claim, with its evidence and decision.</h2></div><p>Search, filter by decision, and open any claim for its sources, decision, reviewer, and explanation.</p></header>
+      ${claimsExplorer(researchRecords, slug)}
       ${(() => {
         const pending = undecidedCatalogue(profile, researchRecords);
         if (!pending.length) return "";
@@ -398,6 +397,93 @@ function renderPerson(profile, slug, loadError = "") {
     </section>`;
   document.querySelector("#intake-form").addEventListener("submit", submitIntake);
   bindSourceBrowser(slug);
+  bindClaimsExplorer();
+}
+
+const OUTCOME_GROUPS = [
+  { key: "true", label: "Happened" },
+  { key: "partial", label: "Partly happened" },
+  { key: "false", label: "Did not happen" },
+  { key: "not_falsifiable", label: "Cannot be tested" },
+  { key: "undetermined", label: "Undetermined" },
+  { key: "pending", label: "Still pending" },
+  { key: "undecided", label: "Not decided yet" },
+];
+
+function outcomeGroupKey(record) {
+  const status = record && record.humanDecision ? record.humanDecision.outcomeStatus : null;
+  if (status === true || status === "true") return "true";
+  if (status === false || status === "false") return "false";
+  if (typeof status === "string" && ["partial", "not_falsifiable", "undetermined", "pending"].includes(status)) return status;
+  return "undecided";
+}
+
+function claimRow(record, index, slug) {
+  const group = outcomeGroupKey(record);
+  const decision = record.humanDecision;
+  const meta = decision
+    ? `${outcomeLabel(decision.outcomeStatus)} · ${decision.reviewerName} · ${displayDate(record.sourceDate)}`
+    : `Not decided yet · ${displayDate(record.sourceDate)}`;
+  const searchText = [record.title, record.exactArchivedQuote, record.headline].filter(Boolean).join(" ").toLowerCase();
+  return `<details class="claim-row" id="claim-${escapeHtml(record.id)}" data-outcome="${group}" data-search="${escapeHtml(searchText)}">
+    <summary class="claim-row-summary"><span class="outcome-dot outcome-${group}" aria-hidden="true"></span><span class="claim-row-title">${escapeHtml(record.title)}</span><span class="claim-row-meta">${escapeHtml(meta)}</span><a class="claim-row-link" href="/people/${encodeURIComponent(slug)}/claims/${encodeURIComponent(record.id)}">Full page <span aria-hidden="true">↗</span></a></summary>
+    <div class="claim-row-body">${researchBrief(record, index, slug)}</div>
+  </details>`;
+}
+
+function claimsExplorer(researchRecords, slug) {
+  const counts = new Map();
+  for (const record of researchRecords) {
+    const key = outcomeGroupKey(record);
+    counts.set(key, (counts.get(key) || 0) + 1);
+  }
+  const chips = [{ key: "all", label: "All", count: researchRecords.length },
+    ...OUTCOME_GROUPS.filter((group) => counts.get(group.key))
+      .map((group) => ({ key: group.key, label: group.label, count: counts.get(group.key) }))];
+  return `<div class="claims-explorer">
+    <div class="outcome-totals" role="group" aria-label="Filter claims by decision">
+      ${chips.map((chip) => `<button type="button" class="chip" data-filter="${chip.key}" aria-pressed="${chip.key === "all"}">${chip.key === "all" ? "" : `<span class="outcome-dot outcome-${chip.key}" aria-hidden="true"></span>`}${escapeHtml(chip.label)} <b>${countLabel(chip.count)}</b></button>`).join("")}
+    </div>
+    <div class="claims-search"><label for="claim-search">Search these claims</label><input id="claim-search" type="search" placeholder="Try: election, Russia, earthquake…" autocomplete="off"><p id="claim-count" role="status" aria-live="polite"></p></div>
+    <div id="claim-briefs" class="claim-briefs">${researchRecords.map((record, index) => claimRow(record, index, slug)).join("")}</div>
+  </div>`;
+}
+
+function bindClaimsExplorer() {
+  const container = document.querySelector("#claim-briefs");
+  if (!container) return;
+  const chips = [...document.querySelectorAll(".outcome-totals .chip")];
+  const search = document.querySelector("#claim-search");
+  const count = document.querySelector("#claim-count");
+  let filter = "all";
+  const apply = () => {
+    const query = (search && search.value ? search.value : "").trim().toLowerCase();
+    const rows = [...container.querySelectorAll(".claim-row")];
+    let shown = 0;
+    for (const row of rows) {
+      const matchFilter = filter === "all" || row.dataset.outcome === filter;
+      const matchQuery = !query || (row.dataset.search || "").includes(query);
+      const visible = matchFilter && matchQuery;
+      row.hidden = !visible;
+      if (visible) shown += 1;
+    }
+    if (count) count.textContent = `Showing ${shown} of ${rows.length} claims`;
+  };
+  for (const chip of chips) chip.addEventListener("click", () => {
+    filter = chip.dataset.filter;
+    for (const other of chips) other.setAttribute("aria-pressed", String(other === chip));
+    apply();
+  });
+  if (search) search.addEventListener("input", apply);
+  container.addEventListener("toggle", (event) => {
+    const row = event.target && event.target.closest ? event.target.closest(".claim-row") : null;
+    if (row && row.open && row.id) history.replaceState(null, "", `#${row.id}`);
+  }, true);
+  apply();
+  if (location.hash.indexOf("#claim-") === 0) {
+    const target = document.getElementById(location.hash.slice(1));
+    if (target && target.classList.contains("claim-row")) target.open = true;
+  }
 }
 
 async function submitIntake(event) {
@@ -431,7 +517,7 @@ function renderClaim(id, publicRecord, { slug = DEFAULT_PERSON_SLUG, displayName
     <section class="ledger-section evidence-finding" aria-labelledby="current-evidence"><div class="section-number">03 / WHAT HAPPENED</div><div><p class="eyebrow">Evidence after the claim</p><h2 id="current-evidence">What happened afterward</h2><p class="ledger-lede">${escapeHtml(record.currentEvidenceSummary)}</p></div></section>
     <section class="ledger-section prior-finding" aria-labelledby="prior-information"><div class="section-number">04 / WHAT WAS KNOWN</div><div><h2 id="prior-information">What was already public</h2><p class="ledger-lede">${escapeHtml(record.priorPublicInformationSummary)}</p>${decision ? "" : `<p class="warning"><strong>Still being checked:</strong> We are preserving the searches and sources used to show what was publicly known at the time.</p>`}</div></section>
     <section class="ledger-section" aria-labelledby="sources"><div class="section-number">05 / SOURCES</div><div><h2 id="sources">Sources</h2><div class="evidence-register">${sourceCards}</div></div></section>
-    ${decision ? `<section class="ledger-section" aria-labelledby="human-decision"><div class="section-number">06 / FINAL DECISION</div><div><h2 id="human-decision">${escapeHtml(outcomeLabel(decision.outcomeStatus))}</h2><p class="ledger-lede">${escapeHtml(decision.rationale)}</p><p><strong>Decided by ${escapeHtml(decision.reviewerName)}</strong> on ${escapeHtml(displayDate(decision.decidedAt))}. This reviewer owns this decision and explanation.</p></div></section>` : `<section class="ledger-section" aria-labelledby="required"><div class="section-number">06 / STILL TO CHECK</div><div><h2 id="required">What is needed before a final decision</h2><ul class="checklist">${gates.map((gate) => `<li>${escapeHtml(gate)}</li>`).join("")}</ul><div class="claim-actions"><a class="button-link button-primary" href="/api/people/${encodeURIComponent(slug)}/report">Download evidence report</a></div></div></section>`}
+    ${decision ? `<section class="ledger-section" aria-labelledby="human-decision"><div class="section-number">06 / FINAL DECISION</div><div><h2 id="human-decision">${escapeHtml(outcomeLabel(decision.outcomeStatus))}</h2><p class="ledger-lede">${escapeHtml(decision.rationale)}</p><p><strong>Decided by ${escapeHtml(decision.reviewerName)}</strong> on ${escapeHtml(displayDate(decision.decidedAt))}. This reviewer owns this decision and explanation.</p>${decision.correction ? `<p class="correction"><strong>Correction ${escapeHtml(displayDate(decision.correction.correctedAt))}:</strong> ${escapeHtml(outcomeLabel(decision.correction.previousOutcomeStatus))} → ${escapeHtml(outcomeLabel(decision.outcomeStatus))}. ${escapeHtml(decision.correction.rationale)}</p>` : ""}</div></section>` : `<section class="ledger-section" aria-labelledby="required"><div class="section-number">06 / STILL TO CHECK</div><div><h2 id="required">What is needed before a final decision</h2><ul class="checklist">${gates.map((gate) => `<li>${escapeHtml(gate)}</li>`).join("")}</ul><div class="claim-actions"><a class="button-link button-primary" href="/api/people/${encodeURIComponent(slug)}/report">Download evidence report</a></div></div></section>`}
   </article>`;
 }
 

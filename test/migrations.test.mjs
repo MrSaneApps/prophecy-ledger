@@ -11,7 +11,7 @@ test("ordered migrations seed a neutral incomplete Troy catalogue", () => {
   assert.equal(person.display_name, data.person.displayName);
   assert.match(person.corpus_label, /not a complete catalogue/i);
   const claims = env.DB.db.prepare("SELECT claim_id,visibility,proposed_outcome FROM claims ORDER BY claim_id").all();
-  assert.equal(claims.length, 2);
+  assert.equal(claims.length, 152);
   assert.ok(claims.every((claim) => claim.visibility === "draft"));
   assert.ok(claims.every((claim) => claim.proposed_outcome == null));
 });
@@ -33,23 +33,26 @@ test("public research supports append-only corrections by numbered revision", ()
   const existing = env.DB.db.prepare(
     "SELECT brief_id,revision_number,supersedes_brief_id,headline FROM public_research_briefs WHERE claim_id='southeast-asia-oil-2021' ORDER BY revision_number"
   ).all();
-  assert.deepEqual(existing.map((row) => row.revision_number), [1, 2, 3]);
+  assert.deepEqual(existing.map((row) => row.revision_number), [1, 2, 3, 4]);
   assert.equal(existing[2].supersedes_brief_id, "brief_oil_r2");
   assert.match(existing[2].headline, /timing was wrong/i);
+  assert.equal(existing[3].brief_id, "brief_tb_oil_2026_r4");
+  assert.equal(existing[3].supersedes_brief_id, "brief_oil_r3");
+  assert.match(existing[3].headline, /delayed hit/i);
   env.DB.db.prepare(
     `INSERT INTO public_research_briefs
      (brief_id,claim_id,revision_number,supersedes_brief_id,quotation_source_url,
       headline,evidence_strength,test_framing,evidence_summary,prior_information_summary,
       corpus_warning,missing_gates_json,research_status,as_of_date,created_at)
-     SELECT 'brief_oil_r4',claim_id,4,'brief_oil_r3',quotation_source_url,
+     SELECT 'brief_oil_r5_test',claim_id,5,'brief_tb_oil_2026_r4',quotation_source_url,
       'Corrected public brief',evidence_strength,test_framing,evidence_summary,
       prior_information_summary,corpus_warning,missing_gates_json,research_status,
       '2026-07-20','2026-07-20T00:00:00.000Z'
-     FROM public_research_briefs WHERE brief_id='brief_oil_r3'`
+     FROM public_research_briefs WHERE brief_id='brief_tb_oil_2026_r4'`
   ).run();
   assert.equal(env.DB.db.prepare(
     "SELECT count(*) count FROM public_research_briefs WHERE claim_id='southeast-asia-oil-2021'"
-  ).get().count, 4);
+  ).get().count, 5);
   assert.throws(() => env.DB.db.exec(
     "UPDATE public_research_briefs SET headline='changed' WHERE brief_id='brief_oil_r1'"
   ), /append-only/);
@@ -86,7 +89,7 @@ test("private extraction candidates require explicit human promotion before adju
   assert.equal(env.DB.db.prepare("SELECT count(*) count FROM candidate_claim_promotions").get().count, 0);
   assert.equal(env.DB.db.prepare(
     "SELECT count(*) count FROM review_work_items WHERE work_type='claim_adjudication'"
-  ).get().count, 2);
+  ).get().count, 152);
   assert.equal(env.DB.db.prepare(
     "SELECT count(*) count FROM review_work_items WHERE work_type='candidate_verification'"
   ).get().count, 0, "the base fixture has no extracted candidates to promote or queue");
@@ -136,7 +139,7 @@ test("migration chain is contiguous and fresh replay exposes the recovered schem
   const files = readdirSync(join(ROOT, "migrations"))
     .filter((name) => /^\d{4}_.*\.sql$/.test(name)).sort();
   assert.deepEqual(files.map((name) => Number(name.slice(0, 4))),
-    Array.from({ length: 61 }, (_, index) => index + 1));
+    Array.from({ length: 69 }, (_, index) => index + 1));
 
   const env = makeEnv();
   const db = env.DB.db;

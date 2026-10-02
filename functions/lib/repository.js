@@ -61,7 +61,39 @@ export async function getPersonProfile(db, slug, asOf = new Date().toISOString()
     reviewerName: row.reviewer_name, outcomeStatus: row.outcome_status,
     rationale: row.rationale, decidedAt: row.created_at,
   }]));
-  for (const claim of claims) claim.humanDecision = decisionByClaim.get(claim.claim_id) || null;
+  const amendmentRows = await all(db.prepare(
+    `SELECT a.claim_id,a.amendment_number,a.outcome_status,a.novelty_status,
+      a.baseline_probability,a.rationale,a.corrected_by,a.created_at,
+      attribution.display_name reviewer_name
+     FROM claim_decision_amendments a
+     JOIN reviewer_public_attributions attribution ON attribution.reviewer_id=a.reviewer_id
+      AND NOT EXISTS (SELECT 1 FROM reviewer_public_attributions newer
+        WHERE newer.reviewer_id=attribution.reviewer_id
+          AND (newer.created_at>attribution.created_at OR
+            (newer.created_at=attribution.created_at AND newer.attribution_id>attribution.attribution_id)))
+     WHERE a.claim_id IN (SELECT claim_id FROM claims WHERE person_id=?1)
+       AND NOT EXISTS (SELECT 1 FROM claim_decision_amendments newer
+         WHERE newer.claim_id=a.claim_id AND newer.amendment_number>a.amendment_number)`
+  ).bind(person.person_id));
+  const amendmentByClaim = new Map(amendmentRows.map((row) => [row.claim_id, row]));
+  for (const claim of claims) {
+    claim.humanDecision = decisionByClaim.get(claim.claim_id) || null;
+    const amendment = amendmentByClaim.get(claim.claim_id);
+    if (amendment && claim.humanDecision) {
+      claim.humanDecision.correction = {
+        previousOutcomeStatus: claim.humanDecision.outcomeStatus,
+        rationale: publicLanguage(amendment.rationale),
+        correctedBy: amendment.corrected_by,
+        correctedAt: amendment.created_at,
+        amendmentNumber: amendment.amendment_number,
+        reviewerName: amendment.reviewer_name,
+      };
+      claim.humanDecision.outcomeStatus = amendment.outcome_status;
+      claim.outcome_status = amendment.outcome_status;
+      claim.novelty_status = amendment.novelty_status;
+      claim.baseline_probability = amendment.baseline_probability;
+    }
+  }
   const catalogueRecords = await all(db.prepare(
     `SELECT claim_id,title,source_url,source_date,statement_type,lifecycle_status,
       CASE WHEN visibility='published' THEN 'published' ELSE 'provisional_not_adjudicated' END AS record_status
@@ -185,10 +217,10 @@ export async function getPublicClaim(db, claimId) {
   ).bind(claimId));
   const events = await all(db.prepare(
     `SELECT event_type,actor_id,detail_json,created_at FROM claim_events
-     WHERE claim_id=?1 AND event_type IN ('published','source_unavailable')
+     WHERE claim_id=?1 AND event_type IN ('published','source_unavailable','correction')
      ORDER BY created_at,event_id`
   ).bind(claimId));
-  const humanDecision = await db.prepare(
+  const humanDecisionRow = await db.prepare(
     `SELECT attribution.display_name reviewer_name,review.outcome_status,
       review.rationale,review.created_at
      FROM claim_revisions revision
@@ -204,9 +236,47 @@ export async function getPublicClaim(db, claimId) {
      WHERE revision.claim_id=?1 AND revision.revision_type='publication'
      ORDER BY review.created_at DESC,review.review_id DESC LIMIT 1`
   ).bind(claimId).first();
+  const amendments = await all(db.prepare(
+    `SELECT a.amendment_number,a.outcome_status,a.novelty_status,a.rationale,
+      a.corrected_by,a.created_at,attribution.display_name reviewer_name
+     FROM claim_decision_amendments a
+     JOIN reviewer_public_attributions attribution ON attribution.reviewer_id=a.reviewer_id
+      AND NOT EXISTS (SELECT 1 FROM reviewer_public_attributions newer
+        WHERE newer.reviewer_id=attribution.reviewer_id
+          AND (newer.created_at>attribution.created_at OR
+            (newer.created_at=attribution.created_at AND newer.attribution_id>attribution.attribution_id)))
+     WHERE a.claim_id=?1
+     ORDER BY a.amendment_number`
+  ).bind(claimId));
+  const latestAmendment = amendments.at(-1);
+  let humanDecision = humanDecisionRow ? {
+    reviewerName: humanDecisionRow.reviewer_name, outcomeStatus: humanDecisionRow.outcome_status,
+    rationale: humanDecisionRow.rationale, decidedAt: humanDecisionRow.created_at,
+  } : null;
+  if (latestAmendment && humanDecision) {
+    humanDecision = { ...humanDecision,
+      outcomeStatus: latestAmendment.outcome_status,
+      correction: {
+        previousOutcomeStatus: humanDecision.outcomeStatus,
+        rationale: publicLanguage(latestAmendment.rationale),
+        correctedBy: latestAmendment.corrected_by,
+        correctedAt: latestAmendment.created_at,
+        amendmentNumber: latestAmendment.amendment_number,
+        reviewerName: latestAmendment.reviewer_name,
+      } };
+    claim.outcome_status = latestAmendment.outcome_status;
+    claim.novelty_status = latestAmendment.novelty_status;
+    claim.baseline_probability = latestAmendment.baseline_probability;
+  }
   return {
     asOf: claim.as_of_date,
     claim,
+    corrections: amendments.map((item) => ({
+      amendmentNumber: item.amendment_number, outcomeStatus: item.outcome_status,
+      noveltyStatus: item.novelty_status, rationale: publicLanguage(item.rationale),
+      correctedBy: item.corrected_by, correctedAt: item.created_at,
+      reviewerName: item.reviewer_name,
+    })),
     evidence: {
       original: evidence.filter((item) => item.evidence_role === "original_statement"),
       retrospective: evidence.filter((item) => item.evidence_role === "retrospective_fulfillment"),
@@ -215,10 +285,7 @@ export async function getPublicClaim(db, claimId) {
     },
     timeline: events,
     publication: { requiresOneNamedHumanDecision: true, summary: claim.publication_summary,
-      humanDecision: humanDecision ? {
-        reviewerName: humanDecision.reviewer_name, outcomeStatus: humanDecision.outcome_status,
-        rationale: humanDecision.rationale, decidedAt: humanDecision.created_at,
-      } : null },
+      humanDecision },
   };
 }
 
@@ -323,6 +390,7 @@ export async function getCorpusCoverage(db, personId) {
            WHERE item.person_id=?1 AND candidate.candidate_kind='exact_transcript_claim') specific_claim_candidates,
          (SELECT COUNT(*) FROM first_party_archive_leads
            WHERE person_id=?1) archive_claims_catalogued,
+         (SELECT COUNT(*) FROM claims WHERE person_id=?1) ledger_claims_total,
          (SELECT COUNT(DISTINCT link.source_item_id) FROM first_party_archive_leads lead
            JOIN latest_archive_revisions revision ON revision.archive_lead_id=lead.archive_lead_id
            JOIN first_party_archive_revision_links link ON link.archive_revision_id=revision.archive_revision_id
@@ -360,6 +428,7 @@ export async function getCorpusCoverage(db, personId) {
       possibleClaimPosts: Number(counts?.possible_claim_posts || 0),
       specificClaimCandidates: Number(counts?.specific_claim_candidates || 0),
       archiveClaimsCatalogued: Number(counts?.archive_claims_catalogued || 0),
+      ledgerClaimsTotal: Number(counts?.ledger_claims_total || 0),
       archiveOriginalVideos: Number(counts?.archive_original_videos || 0),
       archiveSourceChecksCompleted: Number(counts?.archive_source_checks_completed || 0),
       claimsCheckedByPeople: Number(counts?.claims_checked || 0),

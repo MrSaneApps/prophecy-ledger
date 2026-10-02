@@ -88,6 +88,7 @@ test("reviewer smoke accepts a ready renewable lease without impersonating the r
 
 test("public static projection contains neutral catalogue metadata but no draft verdict", () => {
   assert.match(app, /Final decision/);
+  assert.match(app, /class="correction"/);
   assert.match(app, /decision \? `\$\{outcomeLabel\(decision\.outcomeStatus\)\} · \$\{decision\.reviewerName\}` : "Not decided yet"/);
   assert.match(app, /Claim record/i);
   assert.match(app, /Decided by \$\{escapeHtml\(decision\.reviewerName\)\}/);
@@ -366,7 +367,7 @@ test("home explains the claim review in ordinary language", () => {
   assert.match(app, /What was already public/);
   assert.match(app, /What still needs checking/);
   assert.match(app, /Useful facts, with honest limits/);
-  assert.match(app, /What was said, and what the evidence shows/);
+  assert.match(app, /Every claim, with its evidence and decision/);
   assert.match(app, /finalRatingSummary/);
   assert.match(app, /The reviewer signs and owns the final decision/);
   assert.doesNotMatch(app, /Two independent reviewers must agree/);
@@ -375,7 +376,8 @@ test("home explains the claim review in ordinary language", () => {
 
 test("Troy profile is summary-first with optional archive detail after the claims and process", () => {
   const summary = app.indexOf('class="profile-hero paper"');
-  const claims = app.indexOf('id="claim-briefs"');
+  // Claims render through the explorer helper; anchor on its call site inside renderPerson.
+  const claims = app.indexOf('claimsExplorer(researchRecords');
   const process = app.indexOf('class="evidence-timeline"');
   const archive = app.indexOf('id="coverage-archive"');
   const sources = app.indexOf('id="source-archive"');
@@ -709,4 +711,29 @@ test("HTML social tags follow the SaneBar card contract and rewrite by path", ()
   assert.match(html, /property="og:url" content="https:\/\/prophecy-ledger\.pages\.dev\/people\/troy-black\/method"/);
   assert.match(html, /name="twitter:url" content="https:\/\/prophecy-ledger\.pages\.dev\/people\/troy-black\/method"/);
   assert.equal(canonicalForPath("/"), "https://prophecy-ledger.pages.dev/");
+});
+
+test("claims list is scannable: totals, search, one-line expandable rows", () => {
+  assert.match(app, /function claimsExplorer\(/);
+  assert.match(app, /function outcomeGroupKey\(/);
+  assert.match(app, /function bindClaimsExplorer\(/);
+  assert.match(app, /outcome-totals/);
+  assert.match(app, /Filter claims by decision/);
+  assert.match(app, /id="claim-search"/);
+  assert.match(app, /class="claim-row"/);
+  assert.match(app, /claim-row-summary/);
+  assert.match(app, /claim-row-body/);
+  assert.match(app, /Showing .* of .* claims/);
+  assert.match(app, /claims found, .* shown with detailed evidence/);
+  assert.match(app, /coverage\.claimsFound/);
+  assert.match(css, /\.claims-explorer/);
+  assert.match(css, /\.outcome-totals/);
+  assert.match(css, /\.outcome-dot/);
+  assert.match(css, /\.claim-row-title/);
+  assert.match(css, /\.chip\[aria-pressed/);
+});
+
+test("claims explorer grid cannot stretch past the viewport", () => {
+  assert.match(css, /\.claim-briefs\s*\{[^}]*grid-template-columns:\s*minmax\(0,\s*1fr\)/s);
+  assert.match(css, /\.claims-explorer\s*\{[^}]*grid-template-columns:\s*minmax\(0,\s*1fr\)/s);
 });

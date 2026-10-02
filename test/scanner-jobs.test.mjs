@@ -253,7 +253,7 @@ test("manual first-party archive ingest is frozen, idempotent, and creates only 
   assert.equal(db.prepare("SELECT count(*) count FROM archive_verification_work_items").get().count, 2);
   assert.equal(db.prepare("SELECT count(*) count FROM archive_linked_video_selector WHERE status='ready'").get().count, 2);
   assert.equal(db.prepare("SELECT count(*) count FROM claim_candidates").get().count, 0);
-  assert.equal(db.prepare("SELECT count(*) count FROM claims").get().count, 2);
+  assert.equal(db.prepare("SELECT count(*) count FROM claims").get().count, 152);
   const receipt = db.prepare("SELECT response_sha256,row_count FROM first_party_archive_receipts").get();
   assert.equal(receipt.response_sha256.length, 64);
   assert.equal(receipt.row_count, 2);

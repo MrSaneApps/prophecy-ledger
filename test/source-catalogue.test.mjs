@@ -130,7 +130,7 @@ test("profile coverage keeps source, transcript, candidate, review, and rating c
     params: { slug: "troy-black" } }));
   const { corpusCoverage: coverage } = await jsonBody(response);
   assert.deepEqual(coverage, {
-    postsFound: 4, videosLinked: 1, transcriptsAvailable: 1, possibleClaimPosts: 1, specificClaimCandidates: 0,
+    postsFound: 4, videosLinked: 1, transcriptsAvailable: 1, possibleClaimPosts: 1, specificClaimCandidates: 0, ledgerClaimsTotal: 152,
     archiveClaimsCatalogued: 0, archiveOriginalVideos: 0, archiveSourceChecksCompleted: 0,
     claimsCheckedByPeople: 0, finalRatings: 0, lastScanAt: "2026-07-19T10:05:00Z",
     scanStatus: "complete", sources: [{ name: "Official website", status: "complete", itemsFound: 4,

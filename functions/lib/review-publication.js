@@ -20,9 +20,13 @@ async function unblindedClaimBundle(db, claimId) {
   ).bind(claimId).first();
   const reviews = latestDraft?.created_at
     ? await all(db.prepare(
-      `SELECT review.*,attribution.display_name public_reviewer_name
+      `SELECT review.*,attribution.display_name public_reviewer_name,
+        docatt.attestation_id doc_attestation_id,docatt.doc_ref doc_ref,
+        docatt.doc_title doc_title,docatt.verbatim_verdict doc_verbatim_verdict,
+        docatt.rubric_version doc_rubric_version
        FROM moderator_reviews review
        LEFT JOIN research_sendbacks sendback ON sendback.review_id=review.review_id
+       LEFT JOIN doc_review_attestations docatt ON docatt.review_id=review.review_id
        LEFT JOIN reviewer_public_attributions attribution
          ON attribution.reviewer_id=review.reviewer_id
         AND NOT EXISTS (SELECT 1 FROM reviewer_public_attributions newer
@@ -33,9 +37,13 @@ async function unblindedClaimBundle(db, claimId) {
        ORDER BY review.created_at,review.review_id`
     ).bind(claimId, latestDraft.created_at))
     : await all(db.prepare(
-      `SELECT review.*,attribution.display_name public_reviewer_name
+      `SELECT review.*,attribution.display_name public_reviewer_name,
+        docatt.attestation_id doc_attestation_id,docatt.doc_ref doc_ref,
+        docatt.doc_title doc_title,docatt.verbatim_verdict doc_verbatim_verdict,
+        docatt.rubric_version doc_rubric_version
        FROM moderator_reviews review
        LEFT JOIN research_sendbacks sendback ON sendback.review_id=review.review_id
+       LEFT JOIN doc_review_attestations docatt ON docatt.review_id=review.review_id
        LEFT JOIN reviewer_public_attributions attribution
          ON attribution.reviewer_id=review.reviewer_id
         AND NOT EXISTS (SELECT 1 FROM reviewer_public_attributions newer
@@ -73,12 +81,20 @@ export async function reconcilePublication(db, claimId, now = new Date().toISOSt
   ).bind(claimId).first();
   const revisionId = existing?.revision_id || `revision_publication_${await hashId(claimId)}`;
   const decision = {
+    lane: result.lane || "interactive",
     claimType: result.claimType, outcomeStatus: result.outcomeStatus,
     noveltyStatus: result.noveltyStatus, baselineProbability: result.baselineProbability,
     evidenceIds: result.evidenceIds, priorReceiptId: result.priorReceiptId,
     reviewerNames: result.reviewerNames,
     decisionFingerprint: result.decisionFingerprint,
+    ...(result.lane === "doc_review" ? {
+      docRef: result.docRef, docTitle: result.docTitle,
+      rubricVersion: result.rubricVersion, verbatimVerdict: result.verbatimVerdict,
+    } : {}),
   };
+  const publicationSummary = result.lane === "doc_review"
+    ? `Published by ${result.reviewerNames[0]} via independent review document (${result.docTitle}); verified by site owner. No interactive review session.`
+    : `Published by ${result.reviewerNames[0]} after adversarial AI research and an authenticated human review of the frozen claim and evidence set.`;
   await db.batch([
     db.prepare(
       `INSERT OR IGNORE INTO claim_revisions
@@ -92,7 +108,7 @@ export async function reconcilePublication(db, claimId, now = new Date().toISOSt
     ).bind(result.claimType, result.outcomeStatus, result.noveltyStatus,
       result.baselineProbability, SCORE_ELIGIBLE_TYPES.has(result.claimType) ? 1 : 0,
       ["pending", "not_falsifiable"].includes(result.outcomeStatus) ? "pending" : "resolved",
-      `Published by ${result.reviewerNames[0]} after adversarial AI research and an authenticated human review of the frozen claim and evidence set.`,
+      publicationSummary,
       now, claimId),
     db.prepare(
       `INSERT OR IGNORE INTO claim_events (event_id,claim_id,event_type,actor_id,detail_json,created_at)

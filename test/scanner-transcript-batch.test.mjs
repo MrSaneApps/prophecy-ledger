@@ -446,7 +446,7 @@ test("daily cap pauses and acknowledges current work with no same-day or disable
   assert.equal(env.DB.db.prepare("SELECT COUNT(*) count FROM transcript_batch_items WHERE status='active'").get().count, 1);
   assert.equal(env.sent.length, 0);
 
-  env.GEMINI_DAILY_MEDIA_SECONDS = "86400";
+  env.GEMINI_DAILY_MEDIA_SECONDS = "14400";
   let duplicateGeminiCalls = 0;
   const duplicate = queueMessage(message.body);
   await processQueueBatch({ messages: [duplicate] }, env, { at: "2026-07-20T12:00:00.000Z",
@@ -480,7 +480,7 @@ test("Gemini 429 records a redacted failed attempt, pauses, acks, and dispatches
   const message = queueMessage(env.sent.shift());
   await processQueueBatch({ messages: [message] }, env, { at: AT,
     geminiFetcher: async () => new Response(JSON.stringify({ error: { message: "secret provider body" } }),
-      { status: 429, headers: { "content-type": "application/json" } }) });
+      { status: 429, headers: { "content-type": "application/json", "retry-after": "90" } }) });
   assert.deepEqual(message.state, { acked: 1, retried: 0, delay: null });
   assert.equal(env.DB.db.prepare("SELECT status FROM transcript_batches WHERE batch_id=?").get(started.batchId).status, "paused");
   const attempt = env.DB.db.prepare("SELECT status,error_code,request_sha256 FROM transcript_chunk_attempts").get();
@@ -503,8 +503,13 @@ test("Gemini 429 records a redacted failed attempt, pauses, acks, and dispatches
   assert.equal(env.DB.db.prepare("SELECT COUNT(*) count FROM transcript_chunk_attempts").get().count, 1);
   assert.equal(env.sent.length, 0);
   env.TRANSCRIPT_BATCH_ENABLED = "1";
-  assert.equal((await resumeScheduledTranscriptBatch(env, { at: "2026-07-20T20:00:00.000Z" })).reason, "resume_not_ready");
+  const pausedRow = env.DB.db.prepare("SELECT pause_reason,resume_after FROM transcript_batches WHERE batch_id=?")
+    .get(started.batchId);
+  assert.equal(pausedRow.pause_reason, "gemini_429");
+  assert.equal(pausedRow.resume_after, "2026-07-20T10:01:30.000Z");
+  assert.equal((await resumeScheduledTranscriptBatch(env, { at: AT })).reason, "resume_not_ready");
   assert.equal(env.sent.length, 0);
+  assert.equal((await resumeScheduledTranscriptBatch(env, { at: "2026-07-20T10:01:30.000Z" })).resumed, true);
 });
 
 
@@ -723,10 +728,10 @@ test("concurrent admin skip preserves failed history and dispatches exactly one 
 test("enabled scheduler never creates a batch and never redispatches a running active item", async () => {
   const config = readFileSync(join(ROOT, "scanner", "wrangler.toml"), "utf8");
   assert.match(config, /^SCAN_ENABLED = "0"$/m);
-  // The owner-approved production conveyor is intentionally enabled. Safety is
-  // enforced by the scheduler's no-create/no-duplicate-dispatch behavior below,
-  // not by asserting a disabled deployment default.
-  assert.match(config, /^TRANSCRIPT_BATCH_ENABLED = "1"$/m);
+  // Owner-authorized production state is disabled (cost control plus the
+  // transcript/analysis coupling defect). The scheduler behavior below is
+  // still verified with an explicitly enabled env.
+  assert.match(config, /^TRANSCRIPT_BATCH_ENABLED = "0"$/m);
   const env = batchEnv(); env.TRANSCRIPT_BATCH_ENABLED = "1";
   assert.deepEqual(await resumeScheduledTranscriptBatch(env, { at: AT }), { resumed: false, reason: "no_open_batch" });
   assert.equal(env.DB.db.prepare("SELECT COUNT(*) count FROM transcript_batches").get().count, 0);
@@ -750,7 +755,7 @@ test("batch claim guard leaves legacy non-batch deferred transcript recovery unc
   const first = env.sent.shift();
   await assert.rejects(() => processEnvelope(env, first, { at: AT,
     geminiFetcher: async () => { throw new Error("budget_must_block_before_gemini"); } }), /transcript_budget_deferred/);
-  env.GEMINI_DAILY_MEDIA_SECONDS = "86400";
+  env.GEMINI_DAILY_MEDIA_SECONDS = "14400";
   let geminiCalls = 0;
   const recovered = await processEnvelope(env, first, { at: NEXT_DAY, geminiFetcher: async () => {
     geminiCalls += 1;

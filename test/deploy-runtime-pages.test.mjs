@@ -193,3 +193,66 @@ test("png bytes are hashed as binary, not UTF-8 text", () => {
   assert.equal(hashed.bodySha256, sha256(png));
   assert.notEqual(hashed.bodySha256, sha256(Buffer.from(String(png))));
 });
+
+test("fetch timeout retries within the attempt instead of failing the deploy", async () => {
+  const fake = fakeFetcher(); let calls = 0;
+  const flaky = async (url) => {
+    calls += 1;
+    if (calls <= CALLS_PER_ATTEMPT) {
+      const error = new Error("timeout"); error.name = "TimeoutError"; throw error;
+    }
+    return fake.fetcher(url);
+  };
+  const sleeps = [];
+  const result = await pollPagesPropagation({ previewBase: PREVIEW, stableBase: STABLE,
+    expectedAssets: ASSETS, fetcher: flaky, now: () => 0,
+    sleep: async (milliseconds) => sleeps.push(milliseconds) });
+  assert.equal(result.receipt.status, "completed");
+  assert.equal(result.receipt.attemptCount, 1);
+  assert.deepEqual(sleeps, [1000]);
+});
+
+test("persistent fetch failure keeps polling, then times out with safe fetch detail", async () => {
+  let calls = 0;
+  const down = async () => {
+    calls += 1;
+    const error = new Error("down"); error.name = "TimeoutError"; throw error;
+  };
+  const sleeps = [];
+  await assert.rejects(() => pollPagesPropagation({ previewBase: PREVIEW, stableBase: STABLE,
+    expectedAssets: ASSETS, fetcher: down, now: () => 0, maxAttempts: 3,
+    sleep: async (milliseconds) => sleeps.push(milliseconds) }), (error) => {
+    assert.equal(error.message, "pages_propagation_timeout");
+    assert.equal(error.safeDetail.attemptCount, 0);
+    assert.equal(error.safeDetail.fetchFailures, 3);
+    assert.deepEqual(error.safeDetail.lastFetchError,
+      { name: "TimeoutError", code: null, path: "/app.js" });
+    assert.equal(error.partialReceipts.pagesPropagation.attemptCount, 0);
+    assert.equal(error.partialReceipts.pagesPropagation.fetchFailures, 3);
+    assert.deepEqual(error.partialReceipts.pagesPropagation.attempts, []);
+    return true;
+  });
+  assert.equal(calls, CALLS_PER_ATTEMPT * 3 * 3);
+  assert.deepEqual(sleeps, [1000, 1000, 10_000, 1000, 1000, 10_000, 1000, 1000]);
+});
+
+test("fetch failure across one attempt still completes on the next poll", async () => {
+  const fake = fakeFetcher(); let calls = 0;
+  const flaky = async (url) => {
+    calls += 1;
+    if (calls <= CALLS_PER_ATTEMPT * 3) {
+      const error = new Error("blip"); error.name = "TimeoutError"; throw error;
+    }
+    return fake.fetcher(url);
+  };
+  const sleeps = [];
+  const result = await pollPagesPropagation({ previewBase: PREVIEW, stableBase: STABLE,
+    expectedAssets: ASSETS, fetcher: flaky, now: () => 0,
+    sleep: async (milliseconds) => sleeps.push(milliseconds) });
+  assert.equal(result.receipt.status, "completed");
+  assert.equal(result.receipt.attemptCount, 1);
+  assert.equal(result.receipt.fetchFailures, 1);
+  assert.equal(result.receipt.attempts.length, 1);
+  assert.equal(result.receipt.attempts[0].attempt, 1);
+  assert.deepEqual(sleeps, [1000, 1000, 10_000]);
+});

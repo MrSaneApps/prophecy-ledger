@@ -74,7 +74,7 @@ function reviewContext(env, token, assignmentId, { method = "GET", body } = {}) 
   });
 }
 
-async function assign(env, token) {
+async function assign(env, token, claimId) {
   const response = await queueGet(context({
     env, url: "http://127.0.0.1/api/review/queue", headers: demoHeaders(token),
   }));
@@ -83,7 +83,13 @@ async function assign(env, token) {
   const leased = (body.assignments || []).find((item) => item.status === "leased" && item.workType !== "archive_lead_verification")
     || (body.assignments || []).find((item) => item.status === "leased");
   assert.ok(leased?.assignmentId, `expected leased assignment, got ${JSON.stringify(body).slice(0, 400)}`);
-  return leased;
+  if (!claimId || leased.claimId === claimId) return leased;
+  const switched = await queuePost(context({
+    env, url: "http://127.0.0.1/api/review/queue", method: "POST",
+    headers: demoHeaders(token), body: { leaseWorkItemId: `work_${claimId}` },
+  }));
+  assert.equal(switched.status, 201, await switched.clone().text());
+  return (await jsonBody(switched)).assignment;
 }
 
 const PRESERVATION = {
@@ -338,7 +344,7 @@ test("2. Pending list returns tracked claims with states", async () => {
 
 test("3. Open assigned claim returns AI draft bundle", async () => {
   const env = makeEnv({ demo: true });
-  const leased = await assign(env, "alpha-token");
+  const leased = await assign(env, "alpha-token", CLAIM_ID);
   const response = await reviewGet(reviewContext(env, "alpha-token", leased.assignmentId));
   assert.equal(response.status, 200, await response.clone().text());
   const body = await jsonBody(response);
@@ -351,7 +357,7 @@ test("3. Open assigned claim returns AI draft bundle", async () => {
 test("4. Accept persists moderator_reviews and returns reviewId", async () => {
   const env = makeEnv({ demo: true });
   seedPublicationEvidence(env);
-  const leased = await assign(env, "alpha-token");
+  const leased = await assign(env, "alpha-token", CLAIM_ID);
   const response = await reviewPost(reviewContext(env, "alpha-token", leased.assignmentId, {
     method: "POST",
     body: {
@@ -393,7 +399,7 @@ test("4. Accept persists moderator_reviews and returns reviewId", async () => {
 
 test("5. Send-back persists review + research_sendbacks without full evidence packet", async () => {
   const env = makeEnv({ demo: true });
-  const leased = await assign(env, "alpha-token");
+  const leased = await assign(env, "alpha-token", CLAIM_ID);
   const response = await reviewPost(reviewContext(env, "alpha-token", leased.assignmentId, {
     method: "POST",
     body: {

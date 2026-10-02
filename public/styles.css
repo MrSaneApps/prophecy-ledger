@@ -106,7 +106,7 @@ small { font-size: var(--label-size); }
 .corpus-warning { margin: 0 0 1.5rem; display: grid; grid-template-columns: auto 1fr; gap: 1rem; border-color: var(--amber); }
 
 .selected-heading { margin-top: 0; }
-.claim-briefs { display: grid; gap: 1rem; }
+.claim-briefs { display: grid; grid-template-columns: minmax(0, 1fr); gap: 1rem; }
 .found-panel { margin: 1.5rem 0 0; }
 .found-list { margin: 0; padding: 0; list-style: none; display: grid; gap: 0.5rem; }
 .found-list li { padding: 0.85rem 1rem; border: 1px solid var(--line); background: var(--panel); display: grid; gap: 0.25rem; }
@@ -143,6 +143,7 @@ small { font-size: var(--label-size); }
 .missing-gates li, .checklist li { position: relative; padding: 0.55rem 0 0.55rem 1.4rem; border-bottom: 1px dotted var(--line); }
 .missing-gates li::before, .checklist li::before { content: "○"; position: absolute; left: 0; }
 .missing-gates a { display: inline-flex; min-height: 44px; align-items: center; font-size: var(--secondary-size); font-weight: 900; }
+.missing-gates small.correction { display: block; margin-top: 0.6rem; padding-top: 0.6rem; border-top: 1px dotted var(--line); }
 
 .evidence-timeline { margin-top: clamp(4rem, 9vw, 7rem); display: grid; grid-template-columns: minmax(250px, 0.7fr) minmax(0, 1.3fr); gap: clamp(2rem, 7vw, 6rem); }
 .evidence-timeline ol { margin: 0; padding: 0; list-style: none; }
@@ -575,3 +576,48 @@ footer { width: min(100% - 2rem, 1440px); margin: 3rem auto 0; padding: 2rem cla
 .claim-note small, .claim-response small, .claim-response-pending { color: var(--white); opacity: 0.9; }
 .claim-response { margin-left: 1rem; border-color: var(--cyan); }
 .claim-response-pending { margin: 0 0 0 1rem; padding-left: 0.85rem; border-left: 2px solid var(--line); }
+
+/* Claims explorer: outcome totals, search, one-line expandable rows. */
+.claims-explorer { display: grid; grid-template-columns: minmax(0, 1fr); gap: 1rem; }
+.outcome-totals { display: flex; flex-wrap: wrap; gap: 0.5rem; }
+.chip { display: inline-flex; align-items: center; gap: 0.45rem; padding: 0.5rem 0.85rem; border: 1px solid var(--line); border-radius: 999px; background: var(--panel); font: 700 var(--secondary-size)/1 var(--sans); cursor: pointer; min-height: 44px; }
+.chip b { font-family: var(--mono); font-weight: 800; }
+.chip[aria-pressed="true"] { border-color: var(--cyan); background: var(--panel-bright); }
+.outcome-dot { width: 0.65rem; height: 0.65rem; border-radius: 50%; flex: none; }
+.outcome-true { background: var(--cyan); }
+.outcome-partial { background: var(--amber); }
+.outcome-false { background: var(--rust); }
+.outcome-not_falsifiable, .outcome-undetermined, .outcome-pending, .outcome-undecided { background: #5a737c; }
+.claims-search { display: grid; gap: 0.4rem; }
+.claims-search label { font: 800 var(--label-size)/1.4 var(--mono); text-transform: uppercase; }
+.claims-search input { padding: 0.7rem 0.9rem; border: 1px solid var(--line); border-radius: 4px; background: var(--panel); font-size: var(--body-size); min-height: 44px; width: 100%; }
+#claim-count { margin: 0; font-size: var(--secondary-size); opacity: 0.85; }
+.claim-row { border: 1px solid var(--line); border-radius: 4px; background: var(--panel); }
+.claim-row-summary { display: flex; align-items: center; gap: 0.7rem; padding: 0.7rem 0.9rem; cursor: pointer; min-height: 44px; }
+.claim-row-summary::-webkit-details-marker { display: none; }
+.claim-row-summary { list-style: none; }
+.claim-row-title { font-weight: 700; flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.claim-row-meta { font-size: var(--secondary-size); opacity: 0.8; white-space: nowrap; }
+.claim-row-link { font-size: var(--secondary-size); white-space: nowrap; flex: none; }
+.claim-row-body { border-top: 1px solid var(--line); padding: 1rem; }
+.claim-row-body .claim-brief { border: none; }
+@media (max-width: 800px) {
+  .claim-row-meta { display: none; }
+}
+
+/* Slim profile header: the claims list starts above the fold. */
+.profile-hero { padding: clamp(1.5rem, 3vw, 2.5rem) 0 clamp(1.25rem, 2.5vw, 2rem); gap: clamp(1.25rem, 3vw, 2.5rem); align-items: start; }
+.profile-title h1 { font-size: clamp(2.4rem, 5vw, 3.6rem); }
+.profile-intro .lede { font-size: 1.05rem; }
+.profile-summary { grid-template-columns: repeat(4, 1fr); align-self: start; }
+.profile-summary div { min-height: 0; padding: 0.8rem 0.9rem; gap: 0.35rem; }
+.profile-summary dd { font-size: 30px; margin-top: 0.25rem; }
+.section-wrap.dossier { padding-block: clamp(1.25rem, 3vw, 2rem); }
+.notice { margin-bottom: 1.5rem; }
+@media (max-width: 800px) {
+  .profile-summary { grid-template-columns: 1fr 1fr; }
+}
+.profile-hero { display: block; }
+.profile-intro { max-width: 80ch; }
+.selected-heading h2 { font-size: clamp(1.3rem, 2.4vw, 1.75rem); }
+.selected-heading { margin-bottom: 1.25rem; }

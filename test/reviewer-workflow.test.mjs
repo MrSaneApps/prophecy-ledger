@@ -12,6 +12,7 @@ import { onRequestPost as archiveReviewPost } from "../functions/api/review/arch
 import { onRequestGet as reviewGet, onRequestPost as reviewPost } from "../functions/api/review/[id].js";
 import {
   leaseReviewWork, reconcileNeededPublications, reconcilePublication, submitAssignedClaimReview,
+  switchLease,
 } from "../functions/lib/review-workflow.js";
 import { context, jsonBody, makeEnv } from "./helpers/d1.mjs";
 
@@ -680,7 +681,8 @@ test("one named human review publishes idempotently after append-only submission
   const env = makeEnv({ demo: true });
   seedPublicationEvidence(env);
   const now = new Date().toISOString();
-  const alpha = await leaseReviewWork(env.DB, "reviewer_alpha", env, now);
+  await leaseReviewWork(env.DB, "reviewer_alpha", env, now);
+  const alpha = await switchLease(env.DB, "reviewer_alpha", `work_${CLAIM_ID}`, env, now);
   assert.equal(alpha.claim_id, CLAIM_ID);
   const normalized = normalizeReview(claimReview());
   await submitAssignedClaimReview(env.DB, alpha.assignment_id, "reviewer_alpha", normalized,

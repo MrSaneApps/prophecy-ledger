@@ -115,7 +115,7 @@ test("primary and independent verifier create an append-only AI-cross-verified r
   assert.equal(env.DB.db.prepare("SELECT outcome FROM video_agreement_results").get().outcome, "ai_cross_verified");
   assert.equal(env.DB.db.prepare("SELECT count(*) count FROM video_escalation_events").get().count, 0);
   assert.equal(env.DB.db.prepare("SELECT count(*) count FROM transcript_artifacts").get().count, 0);
-  assert.equal(env.DB.db.prepare("SELECT count(*) count FROM claims").get().count, 2);
+  assert.equal(env.DB.db.prepare("SELECT count(*) count FROM claims").get().count, 152);
 
   env.DB.db.prepare("UPDATE ingestion_jobs SET successor_enqueued=0 WHERE job_id=?").run(primaryJob.jobId);
   await processEnvelope(env, primaryJob);
@@ -153,7 +153,7 @@ test("a third independent pass resolves one dispute and escalates an unresolved 
   assert.deepEqual(final.map((row) => row.outcome), ["ai_cross_verified", "human_review_required"]);
   assert.equal(final.every((row) => Boolean(row.supersedes_agreement_id)), true);
   assert.equal(env.DB.db.prepare("SELECT state FROM video_escalation_events").get().state, "open");
-  assert.equal(env.DB.db.prepare("SELECT count(*) count FROM claims").get().count, 2);
+  assert.equal(env.DB.db.prepare("SELECT count(*) count FROM claims").get().count, 152);
 });
 
 test("retryable Gemini failures are recorded as separate immutable attempts before a successful retry", async () => {

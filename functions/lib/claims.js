@@ -110,6 +110,13 @@ function normalizedReviewRow(row) {
     reviewerId: row.reviewer_id,
     reviewerName: row.public_reviewer_name || "Verified reviewer",
     decisionFingerprint: row.decision_fingerprint || reviewDecisionFingerprint(review),
+    docAttestation: row.doc_attestation_id ? {
+      attestationId: row.doc_attestation_id,
+      docRef: row.doc_ref,
+      docTitle: row.doc_title,
+      verbatimVerdict: row.doc_verbatim_verdict,
+      rubricVersion: row.doc_rubric_version,
+    } : null,
   };
 }
 
@@ -153,18 +160,59 @@ export function validateReviewPrerequisites(claim, evidence, receipts, review) {
   return { ok: missing.length === 0, missing: [...new Set(missing)] };
 }
 
+export function validateDocReview(claim, evidence, decision) {
+  const missing = [];
+  for (const field of ["exact_quote", "source_url", "source_date", "atomic_proposition", "criteria", "as_of_date"]) {
+    if (!String(claim?.[field] ?? "").trim()) missing.push(field);
+  }
+  if (!CLAIM_TYPES.has(decision?.claimType)) missing.push("statement_type");
+  if (decision?.noveltyStatus !== "not_assessed") missing.push("doc_novelty_must_be_unassessed");
+  if (decision?.baselineProbability != null) missing.push("doc_baseline_must_be_empty");
+  if (decision?.priorReceiptId) missing.push("doc_prior_receipt_forbidden");
+  const citedIds = new Set(decision?.evidenceIds || []);
+  const cited = evidence.filter((item) => citedIds.has(item.evidence_id));
+  if (!citedIds.size || cited.length !== citedIds.size) missing.push("cited_evidence_scope");
+  const attestation = decision?.docAttestation || {};
+  if (!String(attestation.verbatimVerdict ?? "").trim()) missing.push("doc_verbatim_verdict");
+  if (!String(attestation.rubricVersion ?? "").trim()) missing.push("doc_rubric_version");
+  if (!String(attestation.docRef ?? "").trim()) missing.push("doc_ref");
+  return { ok: missing.length === 0, missing: [...new Set(missing)] };
+}
+
 export function evaluatePublication(claim, evidence, receipts, reviews) {
   if (reviews.length < 1) return { state: "needed" };
   const normalized = reviews.map(normalizedReviewRow);
   // A single authenticated human owns the final decision. Legacy claims can
   // contain several accepted reviews, so the newest accepted review wins.
   const decision = normalized.at(-1);
+  if (decision.docAttestation) {
+    const docGate = validateDocReview(claim, evidence, decision);
+    if (docGate.missing.length) return { state: "blocked", missing: docGate.missing };
+    return {
+      state: "published",
+      lane: "doc_review",
+      claimType: decision.claimType,
+      outcomeStatus: decision.outcomeStatus,
+      noveltyStatus: decision.noveltyStatus,
+      baselineProbability: decision.baselineProbability,
+      evidenceIds: decision.evidenceIds,
+      priorReceiptId: decision.priorReceiptId,
+      reviewerIds: [decision.reviewerId],
+      reviewerNames: [decision.reviewerName],
+      decisionFingerprint: decision.decisionFingerprint,
+      docRef: decision.docAttestation.docRef,
+      docTitle: decision.docAttestation.docTitle,
+      rubricVersion: decision.docAttestation.rubricVersion,
+      verbatimVerdict: decision.docAttestation.verbatimVerdict,
+    };
+  }
   const claimGate = validateClaimForPublication(claim, decision);
   const evidenceGate = validateReviewPrerequisites(claim, evidence, receipts, decision);
   const missing = [...claimGate.missing, ...evidenceGate.missing];
   if (missing.length) return { state: "blocked", missing: [...new Set(missing)] };
   return {
     state: "published",
+    lane: "interactive",
     claimType: decision.claimType,
     outcomeStatus: decision.outcomeStatus,
     noveltyStatus: decision.noveltyStatus,

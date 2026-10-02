@@ -37,6 +37,10 @@ function safeErrorField(value) {
   return typeof value === "string" && /^[A-Za-z0-9_.+-]{1,64}$/.test(value) ? value : null;
 }
 
+function safePathField(value) {
+  return typeof value === "string" && /^\/[A-Za-z0-9._~/-]{0,127}$/.test(value) ? value : null;
+}
+
 function pagesFailure(code, receipt, detail = {}) {
   const error = new Error(code);
   error.safeDetail = { source: "pages_propagation", contract: "pages-propagation-v1",
@@ -53,8 +57,14 @@ function validExpectedAssets(expectedAssets) {
 }
 
 async function readAttempt({ previewBase, stableBase, expectedAssets, fetcher, timeoutMs }) {
-  const get = async (base, path) => ({ path, result: await fetcher(
-    new URL(path, `${base}/`).href, timeoutMs) });
+  const get = async (base, path) => {
+    try {
+      return { path, result: await fetcher(new URL(path, `${base}/`).href, timeoutMs) };
+    } catch (error) {
+      if (error && typeof error === "object") error.fetchPath = path;
+      throw error;
+    }
+  };
   const [previewAssetsRaw, stableAssetsRaw, previewRoutesRaw, stableRoutesRaw, stableAccessRaw]
     = await Promise.all([
       Promise.all(expectedAssets.map((asset) => get(previewBase, asset.path))),
@@ -113,29 +123,43 @@ export async function pollPagesPropagation({ previewBase, stableBase, expectedAs
   }
   const startedAtMs = now(); const deadlineAtMs = startedAtMs + pollWindowMs;
   const attempts = [];
+  let fetchFailures = 0;
+  let lastFetchError = null;
   for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
     if (attempt > 1 && now() >= deadlineAtMs) break;
     let result;
-    try {
-      result = await readAttempt({ previewBase, stableBase, expectedAssets, fetcher,
-        timeoutMs: Math.min(fetchTimeoutMs, Math.max(1, deadlineAtMs - now())) });
-    } catch (error) {
-      const receipt = { contract: "pages-propagation-v1", status: "failed",
-        attemptCount: attempt, maxAttempts, pollWindowMs,
-        elapsedMs: Math.max(0, now() - startedAtMs), attempts };
-      throw pagesFailure("pages_propagation_fetch_failed", receipt,
-        { errorCode: safeErrorField(error?.code), errorName: safeErrorField(error?.name) });
+    let fetchError = null;
+    for (let fetchTry = 1; fetchTry <= 3; fetchTry += 1) {
+      try {
+        result = await readAttempt({ previewBase, stableBase, expectedAssets, fetcher,
+          timeoutMs: Math.min(fetchTimeoutMs, Math.max(1, deadlineAtMs - now())) });
+        fetchError = null;
+        break;
+      } catch (error) {
+        fetchError = error;
+        if (fetchTry < 3 && now() < deadlineAtMs) {
+          await sleep(Math.min(1000, Math.max(0, deadlineAtMs - now())));
+        }
+      }
     }
-    const valid = Object.values(result).every((rows) => rows.every((row) => row.reasonCode === null));
-    attempts.push({ attempt, ...result, valid });
-    if (valid) {
-      const receipt = { contract: "pages-propagation-v1", status: "completed",
-        attemptCount: attempt, maxAttempts, pollWindowMs,
-        elapsedMs: Math.max(0, now() - startedAtMs), attempts };
-      validatePagesPropagationReceipt(receipt, { expectedAssets });
-      return { receipt, deploymentAssets: result.previewAssets,
-        stableAliasAssets: result.stableAssets, deploymentPublicRoutes: result.previewRoutes,
-        publicRoutes: result.stableRoutes, stableAccess: result.stableAccess };
+    if (fetchError) {
+      // Transient read trouble (DNS, CDN, local network) must not fail the deploy: record
+      // it and keep polling like any other not-ready-yet attempt until the window ends.
+      fetchFailures += 1;
+      lastFetchError = { name: safeErrorField(fetchError?.name),
+        code: safeErrorField(fetchError?.code), path: safePathField(fetchError?.fetchPath) };
+    } else {
+      const valid = Object.values(result).every((rows) => rows.every((row) => row.reasonCode === null));
+      attempts.push({ attempt: attempts.length + 1, ...result, valid });
+      if (valid) {
+        const receipt = { contract: "pages-propagation-v1", status: "completed",
+          attemptCount: attempts.length, maxAttempts, pollWindowMs,
+          elapsedMs: Math.max(0, now() - startedAtMs), attempts, fetchFailures };
+        validatePagesPropagationReceipt(receipt, { expectedAssets });
+        return { receipt, deploymentAssets: result.previewAssets,
+          stableAliasAssets: result.stableAssets, deploymentPublicRoutes: result.previewRoutes,
+          publicRoutes: result.stableRoutes, stableAccess: result.stableAccess };
+      }
     }
     if (attempt === maxAttempts || now() >= deadlineAtMs) break;
     const delay = Math.min(intervalMs, Math.max(0, deadlineAtMs - now()));
@@ -143,9 +167,9 @@ export async function pollPagesPropagation({ previewBase, stableBase, expectedAs
   }
   const receipt = { contract: "pages-propagation-v1", status: "failed",
     attemptCount: attempts.length, maxAttempts, pollWindowMs,
-    elapsedMs: Math.max(0, now() - startedAtMs), attempts };
+    elapsedMs: Math.max(0, now() - startedAtMs), attempts, fetchFailures };
   throw pagesFailure("pages_propagation_timeout", receipt,
-    { finalAttempt: attempts.at(-1) || null });
+    { finalAttempt: attempts.at(-1) || null, fetchFailures, lastFetchError });
 }
 
 export function validatePagesPropagationReceipt(receipt, { expectedAssets }) {

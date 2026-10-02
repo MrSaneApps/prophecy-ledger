@@ -8,7 +8,7 @@ import { onRequestGet as personGet } from "../functions/api/people/[slug].js";
 import { onRequestGet as sourceGet } from "../functions/api/people/[slug]/sources.js";
 import { onRequestGet as claimGet } from "../functions/api/claims/[id].js";
 import { onRequestGet as reviewGet, onRequestPost as reviewPost } from "../functions/api/review/[id].js";
-import { onRequestGet as reviewQueueGet } from "../functions/api/review/queue.js";
+import { onRequestGet as reviewQueueGet, onRequestPost as reviewQueuePost } from "../functions/api/review/queue.js";
 import {
   onRequestGet as archiveQueueGet, onRequestPost as archiveQueuePost,
 } from "../functions/api/review/archive/queue.js";
@@ -50,13 +50,20 @@ function reviewContext(env, token, assignmentId, { method = "GET", body } = {}) 
   });
 }
 
-async function assign(env, token) {
+async function assign(env, token, claimId) {
   const response = await reviewQueueGet(context({
     env, url: "http://localhost/api/review/queue", headers: demoHeaders(token),
   }));
   assert.equal(response.status, 200);
   const body = await jsonBody(response);
-  return body.assignments.find((item) => item.status === "leased");
+  const leased = body.assignments.find((item) => item.status === "leased");
+  if (!claimId || leased?.claimId === claimId) return leased;
+  const switched = await reviewQueuePost(context({
+    env, url: "http://localhost/api/review/queue", method: "POST",
+    headers: demoHeaders(token), body: { leaseWorkItemId: `work_${claimId}` },
+  }));
+  assert.equal(switched.status, 201, await switched.clone().text());
+  return (await jsonBody(switched)).assignment;
 }
 
 async function assignArchive(env, token) {
@@ -203,9 +210,9 @@ test("public profile exposes neutral catalogue records but no draft verdict fiel
   const body = await jsonBody(response);
   assert.equal(response.status, 200);
   assert.match(body.completeness, /not a complete catalogue/i);
-  assert.equal(body.catalogueRecords.length, 2);
+  assert.equal(body.catalogueRecords.length, 152);
   assert.ok(body.catalogueRecords.every((record) => record.record_status === "provisional_not_adjudicated"));
-  assert.equal(body.researchRecords.length, 2);
+  assert.equal(body.researchRecords.length, 152);
   assert.ok(body.researchRecords.every((record) =>
     record.researchStatus === "provisional_research" &&
     record.finalAdjudicationStatus === "not_adjudicated"));
@@ -214,7 +221,12 @@ test("public profile exposes neutral catalogue records but no draft verdict fiel
   assert.match(oil.currentEvidenceSummary, /5\.06 million.*4\.86 million/i);
   assert.match(oil.currentEvidenceSummary, /timing wrong/i);
   assert.equal(oil.headline,
-    "The speaker's own record says the prediction did not happen in 2021");
+    "Archive admits 2021 miss, then refiles 2024 headlines as a delayed hit");
+  const preservedOilR3 = env.DB.db.prepare(
+    "SELECT headline FROM public_research_briefs WHERE brief_id='brief_oil_r3'"
+  ).get();
+  assert.equal(preservedOilR3.headline,
+    "Source found; the archive says the timing was wrong");
   assert.doesNotMatch(JSON.stringify(body.researchRecords),
     /automated passes|private transcript|atomic claim|Who, What, Why, Where, and When gate|novelty score|resubmitted for a rating|source-supported definition|two independent, verified reviewers/i);
   assert.match(russia.currentEvidenceSummary, /no legal change/i);
@@ -226,7 +238,7 @@ test("public profile exposes neutral catalogue records but no draft verdict fiel
   assert.deepEqual(body.corpusCoverage, {
     postsFound: 0, videosLinked: 0, transcriptsAvailable: 0, possibleClaimPosts: 0, specificClaimCandidates: 0,
     archiveClaimsCatalogued: 0, archiveOriginalVideos: 0, archiveSourceChecksCompleted: 0,
-    claimsCheckedByPeople: 0, finalRatings: 0, lastScanAt: null, scanStatus: "not_started", sources: [],
+    ledgerClaimsTotal: 152, claimsCheckedByPeople: 0, finalRatings: 0, lastScanAt: null, scanStatus: "not_started", sources: [],
   });
   assert.deepEqual(new Set(russia.supportingReferences.map((source) => source.role)),
     new Set(["original_statement", "speaker_archive", "independent_outcome", "prior_public_information"]));
@@ -356,7 +368,7 @@ test("resolved review fails closed without verified original and independent out
 test("body-supplied identity is rejected and one credential cannot become two reviewers", async () => {
   const env = makeEnv({ demo: true });
   seedPublicationEvidence(env);
-  const assignment = await assign(env, "alpha-token");
+  const assignment = await assign(env, "alpha-token", CLAIM_ID);
   const spoof = await reviewPost(reviewContext(env, "alpha-token", assignment.assignmentId, {
     method: "POST", body: { workType: "claim_adjudication", ...reviewBody({ reviewerId: "someone_else" }) },
   }));
@@ -375,7 +387,7 @@ test("body-supplied identity is rejected and one credential cannot become two re
 test("one credential-derived named principal publishes one immutable revision", async () => {
   const env = makeEnv({ demo: true });
   seedPublicationEvidence(env);
-  const alpha = await assign(env, "alpha-token");
+  const alpha = await assign(env, "alpha-token", CLAIM_ID);
   const first = await reviewPost(reviewContext(env, "alpha-token", alpha.assignmentId, {
     method: "POST", body: { workType: "claim_adjudication", ...reviewBody() },
   }));
