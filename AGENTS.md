@@ -71,3 +71,11 @@ Read this file before changing the project.
 - Keep maintainer-only research and handoff state in ignored `.codex/` and
   `SESSION_HANDOFF.md` paths. Durable public decisions belong in the standard
   project documentation without live run identifiers or private artifact paths.
+
+## Reviewer click tests
+
+Click-test `/review` only with `scripts/run-reviewer-click-e2e.sh`
+(`--mode local` for a fresh demo database, `--mode live` to reuse the existing
+signed-in browser session). See `docs/REVIEWER_CLICK_E2E.md`. Do not write
+ad-hoc login scrapers, login loops or throwaway browser profiles for this; the
+shared shell hooks block the known ones.
