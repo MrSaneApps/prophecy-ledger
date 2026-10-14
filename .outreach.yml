@@ -1,0 +1,15 @@
+product: Prophecy Ledger
+updated: "2026-10-13"
+positioning:
+  one_liner: "A neutral public record for prophecy claims: what was said, what happened, and what was already known. Check the evidence yourself."
+  status_note: "Live at https://prophecy-ledger.pages.dev and linked from the saneapps.com hub. This repo is Mini-only by design (no Air clone — see meta/PROJECT_MAP.md). GitHub main is production; there is no push-deploy CI."
+public_posting_policy:
+  approval_required: true
+  disclosure_required: "Always say 'I built Prophecy Ledger' when recommending it in public replies. The owner approves the exact draft of every public post before anything is posted."
+launch_calendar:
+  timezone: "America/New_York"
+  classification: "live_web_product"
+  current_release_state:
+    status: "live"
+    evidence: "Hub card on saneapps.com links https://prophecy-ledger.pages.dev (verified in source 2026-10-13)."
+  blockers: []
