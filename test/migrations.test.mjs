@@ -139,7 +139,7 @@ test("migration chain is contiguous and fresh replay exposes the recovered schem
   const files = readdirSync(join(ROOT, "migrations"))
     .filter((name) => /^\d{4}_.*\.sql$/.test(name)).sort();
   assert.deepEqual(files.map((name) => Number(name.slice(0, 4))),
-    Array.from({ length: 69 }, (_, index) => index + 1));
+    Array.from({ length: 70 }, (_, index) => index + 1));
 
   const env = makeEnv();
   const db = env.DB.db;

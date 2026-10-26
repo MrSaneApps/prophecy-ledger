@@ -83,6 +83,15 @@ analysis-generation lineage/dispositions, recovery of historical manual holds,
 provider-aware text-AI attempt receipts, and immutable Gemini generations through
 v13. Deployed generations and receipts are never edited or replayed; a repair
 must create an exact sparse successor under the next registered generation.
+Migration 0070 adds append-only `reviewer_notes` and `draft_review_entries`. It
+inserts Joshua Harris's October 23, 2026 assessments as labelled notes beside the
+existing decisions, nine date corrections that were each checked against the
+public YouTube upload date, one attributed overall view, and four draft entries
+that have no exact quotation. Like 0064-0069 it resolves Joshua's reviewer id
+inside the database and is a zero-row no-op without that attribution. It never
+writes an outcome, amendment, review, revision or claim row. A fresh replay
+matches 146 of the 148 live claims (the Moth word and the Russian barge word are
+created elsewhere); production matches all 148.
 
 ## Test coverage
 

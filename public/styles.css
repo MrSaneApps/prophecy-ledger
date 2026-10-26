@@ -621,3 +621,12 @@ footer { width: min(100% - 2rem, 1440px); margin: 3rem auto 0; padding: 2rem cla
 .profile-intro { max-width: 80ch; }
 .selected-heading h2 { font-size: clamp(1.3rem, 2.4vw, 1.75rem); }
 .selected-heading { margin-bottom: 1.25rem; }
+
+/* Reviewer notes sit beside a decision and never replace it. */
+.reviewer-notes { display: grid; gap: 0.75rem; margin-top: 1rem; }
+.reviewer-note { padding: 0.9rem 1rem; border-left: 3px solid var(--line); background: #081116; }
+.reviewer-note span { display: block; font-size: var(--label-size); text-transform: uppercase; letter-spacing: 0.04em; opacity: 0.8; }
+.reviewer-note strong { display: block; margin-top: 0.35rem; }
+.reviewer-note p { margin: 0.4rem 0 0; }
+.reviewer-note small { display: block; margin-top: 0.5rem; opacity: 0.8; }
+.reviewer-overall { margin-bottom: clamp(1.5rem, 3vw, 2.5rem); }

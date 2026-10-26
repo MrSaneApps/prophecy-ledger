@@ -199,6 +199,16 @@ only the newest revision and its linked references. The MVP does not yet promise
 an adjudication appeal path. Source loss changes availability without erasing the
 claim or inferring why it disappeared.
 
+Reviewer notes (migration 0070) add a second append-only layer beside a decision.
+A note is attributed to a named reviewer, labelled with the review it comes from,
+and shown next to the decision without changing the outcome, the novelty status,
+or the score. A corrected claim date is a note too: the stored claim row keeps its
+original date, and the profile projects the corrected date together with the
+earlier one and the public source it was checked against. Entries from an outside
+review that have no exact quotation are held in `draft_review_entries`; no public
+projection reads that table, and an entry leaves it only as a normal claim with a
+quotation found in the video itself.
+
 ## 8. Public PDF export
 
 `GET /api/people/:slug/report` builds a deterministic PDF with `pdf-lib` from the

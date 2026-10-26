@@ -23,6 +23,56 @@ function publicLanguage(value) {
       "Get one named human reviewer to make and publish the final decision");
 }
 
+
+function reviewerNotesMissing(error) {
+  return /no such table:\s*reviewer_notes/i.test(String(error?.message || error));
+}
+
+const LATEST_ATTRIBUTION = `JOIN reviewer_public_attributions attribution ON attribution.reviewer_id=n.reviewer_id
+      AND NOT EXISTS (SELECT 1 FROM reviewer_public_attributions newer
+        WHERE newer.reviewer_id=attribution.reviewer_id
+          AND (newer.created_at>attribution.created_at OR
+            (newer.created_at=attribution.created_at AND newer.attribution_id>attribution.attribution_id)))`;
+
+function publicNote(row) {
+  return {
+    reviewerName: row.reviewer_name,
+    reviewLabel: row.review_label,
+    rating: row.rating_label,
+    text: publicLanguage(row.body),
+    addedAt: row.created_at,
+  };
+}
+
+function publicDateCorrection(row) {
+  return {
+    previousDate: row.previous_date,
+    correctedDate: row.corrected_date,
+    verificationUrl: row.verification_url,
+    text: publicLanguage(row.body),
+    reviewerName: row.reviewer_name,
+    reviewLabel: row.review_label,
+    addedAt: row.created_at,
+  };
+}
+
+// Append-only reviewer notes sit beside a decision. They never change an
+// outcome, a score, or a stored claim row; a corrected date is shown with the
+// date it replaces.
+async function loadReviewerNotes(db, whereSql, bindValue) {
+  try {
+    return await all(db.prepare(
+      `SELECT n.claim_id,n.note_kind,n.review_label,n.rating_label,n.body,n.previous_date,
+        n.corrected_date,n.verification_url,n.created_at,attribution.display_name reviewer_name
+       FROM reviewer_notes n ${LATEST_ATTRIBUTION}
+       WHERE ${whereSql} ORDER BY n.created_at,n.note_id`
+    ).bind(bindValue));
+  } catch (error) {
+    if (!reviewerNotesMissing(error)) throw error;
+    return [];
+  }
+}
+
 export async function getPersonProfile(db, slug, asOf = new Date().toISOString().slice(0, 10)) {
   const person = await db.prepare(
     `SELECT person_id,slug,display_name,corpus_label,corpus_start,corpus_end,
@@ -162,6 +212,30 @@ export async function getPersonProfile(db, slug, asOf = new Date().toISOString()
     revision: record.revision_number,
     supportingReferences: referencesByClaim.get(record.claim_id) || [],
   }));
+  const noteRows = await loadReviewerNotes(db, "n.person_id=?1", person.person_id);
+  const notesByClaim = new Map();
+  const reviewerOverallNotes = [];
+  for (const row of noteRows) {
+    if (row.note_kind === "overall_view") { reviewerOverallNotes.push(publicNote(row)); continue; }
+    const list = notesByClaim.get(row.claim_id) || { notes: [], dateCorrection: null };
+    if (row.note_kind === "assessment") list.notes.push(publicNote(row));
+    if (row.note_kind === "date_correction") list.dateCorrection = publicDateCorrection(row);
+    notesByClaim.set(row.claim_id, list);
+  }
+  const applyDate = (item, key, entry) => {
+    if (entry?.dateCorrection) item[key] = entry.dateCorrection.correctedDate;
+  };
+  for (const claim of claims) applyDate(claim, "source_date", notesByClaim.get(claim.claim_id));
+  for (const record of catalogueRecords) applyDate(record, "source_date", notesByClaim.get(record.claim_id));
+  for (const record of researchRecords) {
+    const entry = notesByClaim.get(record.id);
+    if (!entry) continue;
+    if (entry.notes.length) record.reviewerNotes = entry.notes;
+    if (entry.dateCorrection) {
+      record.sourceDate = entry.dateCorrection.correctedDate;
+      record.dateCorrection = entry.dateCorrection;
+    }
+  }
   const corpusCoverage = await getCorpusCoverage(db, person.person_id);
   let archiveCatalog = [];
   try {
@@ -187,6 +261,7 @@ export async function getPersonProfile(db, slug, asOf = new Date().toISOString()
     catalogueRecords,
     archiveCatalog,
     researchRecords,
+    reviewerOverallNotes,
     corpusCoverage,
     claims,
     score: scoreClaims(claims, {
@@ -268,9 +343,16 @@ export async function getPublicClaim(db, claimId) {
     claim.novelty_status = latestAmendment.novelty_status;
     claim.baseline_probability = latestAmendment.baseline_probability;
   }
+  const noteRows = await loadReviewerNotes(db, "n.claim_id=?1", claimId);
+  const reviewerNotes = noteRows.filter((row) => row.note_kind === "assessment").map(publicNote);
+  const dateRow = noteRows.filter((row) => row.note_kind === "date_correction").at(-1);
+  const dateCorrection = dateRow ? publicDateCorrection(dateRow) : null;
+  if (dateCorrection) claim.source_date = dateCorrection.correctedDate;
   return {
     asOf: claim.as_of_date,
     claim,
+    reviewerNotes,
+    dateCorrection,
     corrections: amendments.map((item) => ({
       amendmentNumber: item.amendment_number, outcomeStatus: item.outcome_status,
       noveltyStatus: item.novelty_status, rationale: publicLanguage(item.rationale),

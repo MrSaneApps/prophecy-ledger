@@ -119,12 +119,28 @@ function researchBrief(record, index, slug = DEFAULT_PERSON_SLUG) {
         <div><span>What happened</span><p>${escapeHtml(record.currentEvidenceSummary)}</p></div>
         <div><span>What was already public</span><p>${escapeHtml(record.priorPublicInformationSummary)}</p></div>
       </div>
+      ${reviewerNotesHtml(record)}
       <p class="brief-source">${sourceLink(record.originalSourceUrl, "Watch original video ↗")} · ${escapeHtml(displayDate(record.sourceDate))}</p>
     </div>
     ${decision
       ? `<aside class="missing-gates"><span>Final decision</span><strong>${escapeHtml(outcomeLabel(decision.outcomeStatus))}</strong><p>${escapeHtml(decision.rationale)}</p><small>Decided by ${escapeHtml(decision.reviewerName)} on ${escapeHtml(displayDate(decision.decidedAt))}</small>${decision.correction ? `<small class="correction">Corrected ${escapeHtml(displayDate(decision.correction.correctedAt))}: ${escapeHtml(outcomeLabel(decision.correction.previousOutcomeStatus))} → ${escapeHtml(outcomeLabel(decision.outcomeStatus))}. ${escapeHtml(decision.correction.rationale)}</small>` : ""}<a href="/people/${encodeURIComponent(slug)}/claims/${encodeURIComponent(record.id)}">Read the evidence and decision <span aria-hidden="true">→</span></a></aside>`
       : `<aside class="missing-gates"><span>What still needs checking</span><ul>${gates.slice(0, 2).map((gate) => `<li>${escapeHtml(gate)}</li>`).join("")}</ul><a href="/people/${encodeURIComponent(slug)}/claims/${encodeURIComponent(record.id)}">Read the full claim review <span aria-hidden="true">→</span></a></aside>`}
   </article>`;
+}
+
+function reviewerNotesHtml(record) {
+  const notes = Array.isArray(record.reviewerNotes) ? record.reviewerNotes : [];
+  const correction = record.dateCorrection;
+  if (!notes.length && !correction) return "";
+  const noteBlocks = notes.map((note) => `<aside class="reviewer-note" aria-label="Note from ${escapeHtml(note.reviewerName)}"><span>${escapeHtml(note.reviewerName)}'s note · ${escapeHtml(note.reviewLabel)}</span>${note.rating ? `<strong>${escapeHtml(note.reviewerName)}'s rating: ${escapeHtml(note.rating)}</strong>` : ""}<p>${escapeHtml(note.text)}</p><small>This is ${escapeHtml(note.reviewerName)}'s view. It is shown beside the decision and does not change it.</small></aside>`).join("");
+  const dateBlock = correction ? `<aside class="reviewer-note" aria-label="Date correction"><span>Date corrected · ${escapeHtml(displayDate(correction.addedAt))}</span><p>${escapeHtml(correction.text)} ${sourceLink(correction.verificationUrl, "Check the upload date ↗")}</p></aside>` : "";
+  return `<div class="reviewer-notes">${dateBlock}${noteBlocks}</div>`;
+}
+
+function reviewerOverallHtml(profile) {
+  const notes = Array.isArray(profile?.reviewerOverallNotes) ? profile.reviewerOverallNotes : [];
+  if (!notes.length) return "";
+  return `<section class="reviewer-overall" aria-labelledby="reviewer-overall-title"><p class="eyebrow">Reviewer's overall view</p><h2 id="reviewer-overall-title">${escapeHtml(notes[0].reviewerName)}'s overall view of this archive</h2>${notes.map((note) => `<aside class="reviewer-note"><span>${escapeHtml(note.reviewerName)}'s note · ${escapeHtml(note.reviewLabel)}</span>${note.rating ? `<strong>Reliability of the predictions, in ${escapeHtml(note.reviewerName)}'s view: ${escapeHtml(note.rating)}</strong>` : ""}<p>${escapeHtml(note.text)}</p></aside>`).join("")}</section>`;
 }
 
 function firstDefined(object, keys, fallback = 0) {
@@ -376,6 +392,7 @@ function renderPerson(profile, slug, loadError = "") {
     <section class="section-wrap dossier" aria-labelledby="research-state-title">
       ${loadError ? `<aside class="load-warning" role="status"><strong>Claim details unavailable</strong><p>${escapeHtml(loadError)} Showing the basic source information instead.</p></aside>` : ""}
       <header class="section-heading selected-heading"><div><p class="eyebrow">Claims and decisions</p><h2 id="research-state-title">Every claim, with its evidence and decision.</h2></div><p>Search, filter by decision, and open any claim for its sources, decision, reviewer, and explanation.</p></header>
+      ${reviewerOverallHtml(profile)}
       ${claimsExplorer(researchRecords, slug)}
       ${(() => {
         const pending = undecidedCatalogue(profile, researchRecords);
@@ -516,6 +533,7 @@ function renderClaim(id, publicRecord, { slug = DEFAULT_PERSON_SLUG, displayName
     <section class="ledger-section" aria-labelledby="test-question"><div class="section-number">02 / THE TEST</div><div><h2 id="test-question">What would count as happening?</h2><p class="ledger-lede">${escapeHtml(record.testFraming)}</p></div></section>
     <section class="ledger-section evidence-finding" aria-labelledby="current-evidence"><div class="section-number">03 / WHAT HAPPENED</div><div><p class="eyebrow">Evidence after the claim</p><h2 id="current-evidence">What happened afterward</h2><p class="ledger-lede">${escapeHtml(record.currentEvidenceSummary)}</p></div></section>
     <section class="ledger-section prior-finding" aria-labelledby="prior-information"><div class="section-number">04 / WHAT WAS KNOWN</div><div><h2 id="prior-information">What was already public</h2><p class="ledger-lede">${escapeHtml(record.priorPublicInformationSummary)}</p>${decision ? "" : `<p class="warning"><strong>Still being checked:</strong> We are preserving the searches and sources used to show what was publicly known at the time.</p>`}</div></section>
+    ${record.reviewerNotes || record.dateCorrection ? `<section class="ledger-section" aria-labelledby="reviewer-notes-title"><div class="section-number">04B / REVIEWER NOTES</div><div><h2 id="reviewer-notes-title">Notes from the reviewer</h2>${reviewerNotesHtml(record)}</div></section>` : ""}
     <section class="ledger-section" aria-labelledby="sources"><div class="section-number">05 / SOURCES</div><div><h2 id="sources">Sources</h2><div class="evidence-register">${sourceCards}</div></div></section>
     ${decision ? `<section class="ledger-section" aria-labelledby="human-decision"><div class="section-number">06 / FINAL DECISION</div><div><h2 id="human-decision">${escapeHtml(outcomeLabel(decision.outcomeStatus))}</h2><p class="ledger-lede">${escapeHtml(decision.rationale)}</p><p><strong>Decided by ${escapeHtml(decision.reviewerName)}</strong> on ${escapeHtml(displayDate(decision.decidedAt))}. This reviewer owns this decision and explanation.</p>${decision.correction ? `<p class="correction"><strong>Correction ${escapeHtml(displayDate(decision.correction.correctedAt))}:</strong> ${escapeHtml(outcomeLabel(decision.correction.previousOutcomeStatus))} → ${escapeHtml(outcomeLabel(decision.outcomeStatus))}. ${escapeHtml(decision.correction.rationale)}</p>` : ""}</div></section>` : `<section class="ledger-section" aria-labelledby="required"><div class="section-number">06 / STILL TO CHECK</div><div><h2 id="required">What is needed before a final decision</h2><ul class="checklist">${gates.map((gate) => `<li>${escapeHtml(gate)}</li>`).join("")}</ul><div class="claim-actions"><a class="button-link button-primary" href="/api/people/${encodeURIComponent(slug)}/report">Download evidence report</a></div></div></section>`}
   </article>`;
